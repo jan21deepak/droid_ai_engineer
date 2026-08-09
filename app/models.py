@@ -47,7 +47,7 @@ class Repository(Base):
 
 
 class SyncedIssue(Base):
-    """Open GitHub issues pulled into the app for manual Devin assignment."""
+    """Open GitHub issues pulled into the app for manual Cursor assignment."""
 
     __tablename__ = "synced_issues"
     __table_args__ = (UniqueConstraint("repository", "issue_number", name="uq_repo_issue"),)
@@ -91,7 +91,8 @@ class Task(Base):
     issue_title: Mapped[str] = mapped_column(String(512), default="")
     issue_body: Mapped[str] = mapped_column(Text, default="")
     labels: Mapped[str] = mapped_column(Text, default="[]")
-    devin_session_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    cursor_agent_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    cursor_run_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
     status: Mapped[str] = mapped_column(String(32), default=TaskStatus.QUEUED, index=True)
     pull_request_url: Mapped[str | None] = mapped_column(String(512), nullable=True)
     # Refreshed from GitHub so delivery metrics don't depend on review rows existing.
@@ -110,16 +111,17 @@ class Task(Base):
 
     def to_dict(self) -> dict:
         session_url = None
-        if self.devin_session_id:
-            session_url = f"https://app.devin.ai/sessions/{self.devin_session_id}"
+        if self.cursor_agent_id:
+            session_url = f"https://cursor.com/agents/{self.cursor_agent_id}"
         return {
             "id": self.id,
             "repository": self.repository,
             "repository_url": self.repository_url,
             "issue_number": self.issue_number,
             "issue_title": self.issue_title,
-            "devin_session_id": self.devin_session_id,
-            "devin_session_url": session_url,
+            "cursor_agent_id": self.cursor_agent_id,
+            "cursor_run_id": self.cursor_run_id,
+            "cursor_agent_url": session_url,
             "status": self.status,
             "pull_request_url": self.pull_request_url,
             "pr_state": self.pr_state,
@@ -139,7 +141,7 @@ class Task(Base):
 
 
 class SyncedPullRequest(Base):
-    """Open, non-draft PRs available for Devin Review assignment."""
+    """Open, non-draft PRs available for Cursor Review assignment."""
 
     __tablename__ = "synced_pull_requests"
     __table_args__ = (UniqueConstraint("repository", "pr_number", name="uq_repo_pr"),)
@@ -176,7 +178,7 @@ class SyncedPullRequest(Base):
 
 
 class ReviewTask(Base):
-    """Tracks a Devin Review run against a pull request, including auto-merge."""
+    """Tracks a Cursor Cloud Agent review run against a pull request, including auto-merge."""
 
     __tablename__ = "review_tasks"
 
@@ -187,6 +189,8 @@ class ReviewTask(Base):
     pr_title: Mapped[str] = mapped_column(String(512), default="")
     pr_url: Mapped[str] = mapped_column(String(512), default="")
     commit_sha: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    cursor_agent_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    cursor_run_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
     status: Mapped[str] = mapped_column(String(32), default=TaskStatus.QUEUED, index=True)
     merged: Mapped[bool] = mapped_column(Boolean, default=False)
     auto_merge_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -200,10 +204,11 @@ class ReviewTask(Base):
     duration_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
 
     def to_dict(self) -> dict:
-        # Devin Review deep-link uses host-prefixed repo path from the Review API.
         review_url = None
-        if self.pr_url:
-            review_url = f"https://app.devin.ai/review?pr={self.pr_url}"
+        if self.cursor_agent_id:
+            review_url = f"https://cursor.com/agents/{self.cursor_agent_id}"
+        elif self.pr_url:
+            review_url = self.pr_url
         return {
             "id": self.id,
             "repository": self.repository,
@@ -212,6 +217,8 @@ class ReviewTask(Base):
             "pr_title": self.pr_title,
             "pr_url": self.pr_url,
             "commit_sha": self.commit_sha,
+            "cursor_agent_id": self.cursor_agent_id,
+            "cursor_run_id": self.cursor_run_id,
             "status": self.status,
             "merged": self.merged,
             "auto_merge_enabled": self.auto_merge_enabled,
@@ -223,6 +230,6 @@ class ReviewTask(Base):
             "completed_at": iso_sgt(self.completed_at),
             "completed_at_display": format_sgt(self.completed_at),
             "duration_seconds": self.duration_seconds,
-            "devin_session_url": review_url,
+            "cursor_agent_url": review_url,
             "kind": "review",
         }

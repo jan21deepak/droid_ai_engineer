@@ -1,4 +1,4 @@
-/* Devin Forge — neon dark theme */
+/* Cursor Forge — neon dark theme */
 
 :root {
     --nf-bg: #06060f;
@@ -351,7 +351,7 @@ body {
     color: var(--nf-red);
 }
 
-#assign-devin-btn:disabled,
+#assign-cursor-btn:disabled,
 #assign-review-btn:disabled {
     opacity: 0.4;
     box-shadow: none;

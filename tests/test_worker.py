@@ -8,25 +8,35 @@ from app.database import db_session
 from app.models import ReviewTask, Task, TaskStatus
 
 
-class StubDevin:
-    """Minimal DevinClient stand-in returning a fixed session payload."""
+class StubCursor:
+    """Minimal CursorClient stand-in returning a fixed run payload."""
 
     configured = True
 
-    def __init__(self, session_payload):
-        self.session_payload = session_payload
+    def __init__(self, run_payload, *, status=None, pr_url=None):
+        self.run_payload = run_payload
+        self._status = status
+        self._pr_url = pr_url
 
-    async def get_session(self, session_id):
-        return self.session_payload
+    async def get_agent_status(self, agent_id, run_id=None):
+        status = self._status
+        if status is None:
+            from app.cursor_client import map_run_status, extract_pull_request_url
 
-    async def get_session_messages(self, session_id):
-        return []
+            pr = self._pr_url or extract_pull_request_url(self.run_payload)
+            status = map_run_status(self.run_payload.get("status"), bool(pr))
+        pr_url = self._pr_url
+        if pr_url is None:
+            from app.cursor_client import extract_pull_request_url
 
-    async def get_session_summary(self, session_id):
-        return "Fixed the bug."
+            pr_url = extract_pull_request_url(self.run_payload)
+        return status, pr_url, self.run_payload
 
-    async def get_pr_review(self, pr_url, commit_sha=None):
-        raise AssertionError("review lookup not expected in this test")
+    async def get_run_summary(self, agent_id, run_id=None):
+        return self.run_payload.get("result") or "Fixed the bug."
+
+    async def create_review_agent(self, **kwargs):
+        raise AssertionError("review create not expected in this test")
 
 
 class StubGitHub:
@@ -51,7 +61,8 @@ def add_task(**overrides):
         repository_url="https://github.com/jan21deepak/omnigent",
         issue_number=2,
         issue_title="[Bug] cold start can call StartCascade",
-        devin_session_id="session-abc",
+        cursor_agent_id="bc-abc",
+        cursor_run_id="run-abc",
         status=TaskStatus.FAILED,
         created_at=datetime.now(timezone.utc),
         completed_at=datetime.now(timezone.utc),
@@ -65,24 +76,33 @@ def add_task(**overrides):
         return task.id
 
 
+async def _noop(*args, **kwargs):
+    return None
+
+
+async def _zero(*args, **kwargs):
+    return 0
+
+
 @pytest.mark.asyncio
 async def test_failed_task_is_recovered_when_pr_appears_later(client, monkeypatch):
-    """A session suspended for inactivity can still open a PR afterwards."""
+    """A failed agent can still open a PR afterwards — recover on recheck."""
     task_id = add_task()
     pr_url = "https://github.com/jan21deepak/omnigent/pull/7"
-    devin = StubDevin(
+    cursor = StubCursor(
         {
-            "status": "suspended",
-            "status_detail": "inactivity",
-            "pull_requests": [{"pr_url": pr_url, "pr_state": "open"}],
-            "acus_consumed": 0.0,
+            "id": "run-abc",
+            "status": "FINISHED",
+            "result": "Opened PR",
+            "durationMs": 12000,
+            "git": {"branches": [{"prUrl": pr_url}]},
         }
     )
     github = StubGitHub()
     monkeypatch.setattr(worker, "ensure_review_for_pr", _noop)
     monkeypatch.setattr(worker, "poll_reviews_once", _zero)
 
-    await worker.poll_once(devin=devin, github=github)
+    await worker.poll_once(cursor=cursor, github=github)
 
     with db_session() as session:
         task = session.get(Task, task_id)
@@ -94,14 +114,12 @@ async def test_failed_task_is_recovered_when_pr_appears_later(client, monkeypatc
 @pytest.mark.asyncio
 async def test_failed_task_without_pr_stays_failed(client, monkeypatch):
     task_id = add_task()
-    devin = StubDevin(
-        {"status": "suspended", "status_detail": "inactivity", "pull_requests": []}
-    )
+    cursor = StubCursor({"id": "run-abc", "status": "ERROR", "git": {"branches": []}})
     github = StubGitHub()
     monkeypatch.setattr(worker, "ensure_review_for_pr", _noop)
     monkeypatch.setattr(worker, "poll_reviews_once", _zero)
 
-    await worker.poll_once(devin=devin, github=github)
+    await worker.poll_once(cursor=cursor, github=github)
 
     with db_session() as session:
         assert session.get(Task, task_id).status == TaskStatus.FAILED
@@ -113,13 +131,13 @@ async def test_old_failed_tasks_are_not_rechecked(client, monkeypatch):
     stale = datetime.now(timezone.utc) - timedelta(days=worker.RECHECK_FAILED_DAYS + 1)
     task_id = add_task(created_at=stale, completed_at=stale)
 
-    class Exploding(StubDevin):
-        async def get_session(self, session_id):
+    class Exploding(StubCursor):
+        async def get_agent_status(self, agent_id, run_id=None):
             raise AssertionError("stale failed task should not be polled")
 
     monkeypatch.setattr(worker, "ensure_review_for_pr", _noop)
     monkeypatch.setattr(worker, "poll_reviews_once", _zero)
-    await worker.poll_once(devin=Exploding({}), github=StubGitHub())
+    await worker.poll_once(cursor=Exploding({}), github=StubGitHub())
 
     with db_session() as session:
         assert session.get(Task, task_id).status == TaskStatus.FAILED
@@ -171,11 +189,11 @@ async def test_refresh_pr_states_marks_open_pr(client):
         assert session.get(Task, task_id).pr_state == "open"
 
 
-class MissingReviewDevin(StubDevin):
-    """Devin no longer knows about the review it once reported (404)."""
+class MissingReviewCursor(StubCursor):
+    """Cursor no longer knows about the review agent (404)."""
 
-    async def get_pr_review(self, pr_url, commit_sha=None):
-        request = httpx.Request("GET", "https://api.devin.ai/v3/pr-reviews")
+    async def get_agent_status(self, agent_id, run_id=None):
+        request = httpx.Request("GET", "https://api.cursor.com/v1/agents/bc-x")
         raise httpx.HTTPStatusError(
             "not found",
             request=request,
@@ -190,6 +208,8 @@ def add_review(**overrides):
         pr_number=6,
         pr_title="[Bug] shell tool gates are inert",
         pr_url="https://github.com/jan21deepak/omnigent/pull/6",
+        cursor_agent_id="bc-review",
+        cursor_run_id="run-review",
         status=TaskStatus.QUEUED,
         created_at=datetime.now(timezone.utc)
         - timedelta(hours=worker.ABANDONED_REVIEW_HOURS + 1),
@@ -207,7 +227,7 @@ async def test_abandoned_review_without_github_evidence_is_discarded(client):
     review_id = add_review()
 
     updated = await worker.poll_reviews_once(
-        devin=MissingReviewDevin({}), github=StubGitHub()
+        cursor=MissingReviewCursor({}), github=StubGitHub()
     )
 
     assert updated == 1
@@ -216,24 +236,24 @@ async def test_abandoned_review_without_github_evidence_is_discarded(client):
 
 
 @pytest.mark.asyncio
-async def test_abandoned_review_completes_when_devin_bot_reviewed_on_github(client):
+async def test_abandoned_review_completes_when_cursor_bot_reviewed_on_github(client):
     review_id = add_review()
     github = StubGitHub(
         reviews={
             ("jan21deepak/omnigent", 6): [
                 {
-                    "user": {"login": "devin-ai-integration[bot]"},
+                    "user": {"login": "cursor[bot]"},
                     "submitted_at": "2026-08-02T14:00:00Z",
                 },
                 {
-                    "user": {"login": "devin-ai-integration[bot]"},
+                    "user": {"login": "cursor[bot]"},
                     "submitted_at": "2026-08-02T14:08:00Z",
                 },
             ]
         }
     )
 
-    await worker.poll_reviews_once(devin=MissingReviewDevin({}), github=github)
+    await worker.poll_reviews_once(cursor=MissingReviewCursor({}), github=github)
 
     with db_session() as session:
         review = session.get(ReviewTask, review_id)
@@ -247,17 +267,9 @@ async def test_recent_missing_review_is_left_alone(client):
     review_id = add_review(created_at=datetime.now(timezone.utc))
 
     updated = await worker.poll_reviews_once(
-        devin=MissingReviewDevin({}), github=StubGitHub()
+        cursor=MissingReviewCursor({}), github=StubGitHub()
     )
 
     assert updated == 0
     with db_session() as session:
         assert session.get(ReviewTask, review_id).status == TaskStatus.QUEUED
-
-
-async def _noop(*args, **kwargs):
-    return None
-
-
-async def _zero(*args, **kwargs):
-    return 0

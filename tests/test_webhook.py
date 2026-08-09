@@ -11,7 +11,7 @@ def sign(body: bytes, secret: str = SECRET) -> str:
     return "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
 
 
-def issue_payload(action="opened", labels=("Devin-complete",), label_added=None, number=42):
+def issue_payload(action="opened", labels=("Cursor-complete",), label_added=None, number=42):
     payload = {
         "action": action,
         "repository": {
@@ -53,7 +53,7 @@ class TestParsing:
         assert event.issue_number == 42
         assert event.issue_title == "Fix the chart legend"
         assert event.issue_body == "The legend overlaps the chart."
-        assert event.labels == ["Devin-complete"]
+        assert event.labels == ["Cursor-complete"]
 
     def test_parse_handles_null_body(self):
         payload = issue_payload()
@@ -63,23 +63,23 @@ class TestParsing:
 
 class TestTriggerRules:
     def test_opened_with_label_triggers(self):
-        assert should_trigger(parse_issue_event(issue_payload("opened")), "Devin-complete")
+        assert should_trigger(parse_issue_event(issue_payload("opened")), "Cursor-complete")
 
     def test_opened_without_label_does_not_trigger(self):
-        assert not should_trigger(parse_issue_event(issue_payload("opened", labels=())), "Devin-complete")
+        assert not should_trigger(parse_issue_event(issue_payload("opened", labels=())), "Cursor-complete")
 
     def test_labeled_with_trigger_label(self):
         event = parse_issue_event(
-            issue_payload("labeled", labels=("Devin-complete",), label_added="Devin-complete")
+            issue_payload("labeled", labels=("Cursor-complete",), label_added="Cursor-complete")
         )
-        assert should_trigger(event, "Devin-complete")
+        assert should_trigger(event, "Cursor-complete")
 
     def test_labeled_with_other_label(self):
         event = parse_issue_event(issue_payload("labeled", labels=("bug",), label_added="bug"))
-        assert not should_trigger(event, "Devin-complete")
+        assert not should_trigger(event, "Cursor-complete")
 
     def test_closed_does_not_trigger(self):
-        assert not should_trigger(parse_issue_event(issue_payload("closed")), "Devin-complete")
+        assert not should_trigger(parse_issue_event(issue_payload("closed")), "Cursor-complete")
 
 
 class TestWebhookEndpoint:

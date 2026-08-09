@@ -17,10 +17,12 @@ def _round(value: float | None, digits: int = 2) -> float:
 
 
 def task_cost_usd(task: Task, settings=None) -> float:
-    """Return cost derived only from Devin API-reported ACU usage."""
+    """Return cost from stored cost_usd or flat Cursor per-run estimate."""
     settings = settings or get_settings()
-    if task.acus_consumed is not None:
-        return float(task.acus_consumed) * settings.devin_acu_usd
+    if task.cost_usd is not None:
+        return float(task.cost_usd)
+    if task.status in (TaskStatus.COMPLETED, TaskStatus.FAILED):
+        return float(settings.cursor_usd_per_agent_run or 0.0)
     return 0.0
 
 
@@ -67,7 +69,7 @@ def _engineering_kpis(
     """
     cycle_hours: list[float] = []
     for task in completed_fixes:
-        # Average active Devin working time (idle / human waits already stripped
+        # Average active Cursor working time (idle / human waits already stripped
         # from duration_seconds). Prefer that over wall-clock assign→done, which
         # inflates badly when sessions sit waiting for a human.
         if task.duration_seconds is not None:
@@ -78,7 +80,7 @@ def _engineering_kpis(
         if start and end and end >= start:
             cycle_hours.append((end - start).total_seconds() / 3600.0)
 
-    # A PR counts as delivered once it exists, regardless of whether Devin's
+    # A PR counts as delivered once it exists, regardless of whether Cursor's
     # session later finished — sessions often stay open waiting for the user.
     cutoff = datetime.now(timezone.utc) - timedelta(days=7)
     pr_first_seen: dict[str, datetime | None] = {}
@@ -98,7 +100,7 @@ def _engineering_kpis(
     )
     prs = list(pr_first_seen)
 
-    # Merge rate is measured against every PR Devin opened, not just the ones
+    # Merge rate is measured against every PR Cursor opened, not just the ones
     # that happen to have a review row — otherwise unreviewed PRs are invisible
     # and the rate reads 100% while PRs sit unmerged.
     prs_merged = sum(1 for state in pr_state.values() if state == "merged")
@@ -106,7 +108,7 @@ def _engineering_kpis(
     prs_open = len(prs) - prs_merged - prs_closed
     merge_rate = round(prs_merged / len(prs) * 100, 2) if prs else 0.0
 
-    # Counted across every finished Devin run, fixes and reviews alike, so this
+    # Counted across every finished Cursor run, fixes and reviews alike, so this
     # agrees with the Failed status card. A fix-only rate reads 0% while failed
     # reviews are on screen.
     fixes_finished = len(finished_fixes)
@@ -142,8 +144,8 @@ def _engineering_kpis(
 
 def compute_metrics(session: Session) -> dict:
     settings = get_settings()
-    # Fix metrics: Devin sessions dispatched for repository issue fixes.
-    issue_tasks = session.query(Task).filter(Task.devin_session_id.isnot(None))
+    # Fix metrics: Cursor agents dispatched for repository issue fixes.
+    issue_tasks = session.query(Task).filter(Task.cursor_agent_id.isnot(None))
     fix_counts = dict(
         issue_tasks.with_entities(Task.status, func.count(Task.id))
         .group_by(Task.status)
@@ -172,7 +174,7 @@ def compute_metrics(session: Session) -> dict:
     fix_stats["total_runtime_seconds"] = _round(sum(fix_total_durations))
     fix_stats["total_runtime_minutes"] = _round(sum(fix_total_durations) / 60.0)
 
-    # Review metrics: Devin Review runs against pull requests (auto-triggered).
+    # Review metrics: Cursor review agents against pull requests (auto-triggered).
     review_q = session.query(ReviewTask)
     review_counts = dict(
         review_q.with_entities(ReviewTask.status, func.count(ReviewTask.id))
@@ -220,7 +222,7 @@ def compute_metrics(session: Session) -> dict:
     fix_cost = sum(task_cost_usd(t, settings) for t in all_finished_fixes)
     review_cost = sum(float(r.cost_usd or 0) for r in all_finished_reviews)
     total_acus = sum(float(t.acus_consumed or 0) for t in all_finished_fixes)
-    devin_cost = fix_cost + review_cost
+    cursor_cost = fix_cost + review_cost
 
     junior_hourly = settings.junior_swe_annual_cost_usd / 1920.0
     fix_completed = fix_stats["completed"]
@@ -230,7 +232,7 @@ def compute_metrics(session: Session) -> dict:
         review_completed * settings.junior_hours_per_review * junior_hourly
     )
     junior_cost = junior_fix_cost + junior_review_cost
-    productivity_gained = max(junior_cost - devin_cost, 0.0)
+    productivity_gained = max(junior_cost - cursor_cost, 0.0)
     cost_avoidance_pct = (
         round((productivity_gained / junior_cost) * 100, 2) if junior_cost else 0.0
     )
@@ -264,9 +266,9 @@ def compute_metrics(session: Session) -> dict:
         "review": review_stats,
         "engineering": engineering,
         "tokens_used": tokens_used,
-        "tokens_source": "not_reported_by_devin_api",
+        "tokens_source": "not_reported_by_cursor_api",
         "total_acus_consumed": _round(total_acus, 4),
-        "devin_cost_usd": _round(devin_cost),
+        "cursor_cost_usd": _round(cursor_cost),
         "junior_cost_usd": _round(junior_cost),
         "productivity_gained_usd": _round(productivity_gained),
         "cost_avoidance_percent": cost_avoidance_pct,
@@ -275,12 +277,12 @@ def compute_metrics(session: Session) -> dict:
             "junior_hourly_usd": _round(junior_hourly),
             "junior_hours_per_issue": settings.junior_hours_per_issue,
             "junior_hours_per_review": settings.junior_hours_per_review,
-            "devin_acu_usd": settings.devin_acu_usd,
+            "cursor_usd_per_agent_run": settings.cursor_usd_per_agent_run,
             "formula": (
                 "productivity_gained = "
                 "(completed_fixes × junior_hours_per_issue + "
                 "completed_reviews × junior_hours_per_review) × junior_hourly "
-                "− Devin cost"
+                "− Cursor cost"
             ),
         },
         "completed_with_pr": sum(1 for t in completed_fixes if t.pull_request_url),
@@ -317,7 +319,7 @@ def daily_activity(session: Session, days: int = 14) -> list[dict]:
             return None
         return buckets[day]
 
-    fixes = session.query(Task).filter(Task.devin_session_id.isnot(None)).all()
+    fixes = session.query(Task).filter(Task.cursor_agent_id.isnot(None)).all()
     seen_prs: set[str] = set()
     for task in fixes:
         finished = bucket_for(task.completed_at)
@@ -336,7 +338,7 @@ def daily_activity(session: Session, days: int = 14) -> list[dict]:
 
     for review in session.query(ReviewTask).all():
         # Reviews discovered already-finished have no observed completion time;
-        # fall back to when Devin started them so they still appear on the chart.
+        # fall back to when the review started so they still appear on the chart.
         finished = bucket_for(review.completed_at or review.created_at)
         if not finished:
             continue

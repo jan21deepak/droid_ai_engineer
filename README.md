@@ -1,6 +1,8 @@
-# Devin Forge — The AI Engineer That Delivers
+# Cursor Forge — The AI Engineer That Delivers
 
-A production-ready automation service that turns **GitHub Issues into merged Pull Requests** using [Devin](https://devin.ai), Cognition's autonomous AI software engineer. Label an issue, and the system dispatches Devin to implement the fix, run the tests, open a PR, review it, and report back on the issue — with full lifecycle tracking, metrics, and an operations dashboard.
+A production-ready automation service that turns **GitHub Issues into merged Pull Requests** using [Cursor Cloud Agents](https://cursor.com/docs/cloud-agent). Label an issue, and the system dispatches a Cursor agent to implement the fix, run the tests, open a PR, review it with a second Cursor agent, and report back on the issue — with full lifecycle tracking, metrics, and an operations dashboard.
+
+Migrated from the Devin-backed [devin-ai-engineer](https://github.com/jan21deepak/devin-ai-engineer) service; behaviour is the same, backends are Cursor APIs.
 
 Built for engineering teams evaluating autonomous software engineering workflows.
 
@@ -8,36 +10,36 @@ Built for engineering teams evaluating autonomous software engineering workflows
 
 ## Project Overview
 
-When a GitHub Issue is labeled `Devin-complete` in a configured repository (e.g. [`jan21deepak/superset`](https://github.com/jan21deepak/superset)), this service:
+When a GitHub Issue is labeled `Cursor-complete` in a configured repository (e.g. [`jan21deepak/superset`](https://github.com/jan21deepak/superset)), this service:
 
 1. Receives the webhook and validates its HMAC signature.
 2. Persists a **Task** record in SQLite.
-3. Creates a **Devin session** with a high-quality, scoped prompt.
-4. Polls the Devin API every 20 seconds in a background worker.
-5. On completion, stores the **pull request URL, summary, and runtime**, tracks **Devin Review**, and posts a ✅ comment back on the original issue.
+3. Creates a **Cursor Cloud Agent** (`POST /v1/agents`) with a high-quality, scoped prompt and `autoCreatePR: true`.
+4. Polls the Cursor Agents API every 20 seconds in a background worker.
+5. On completion, stores the **pull request URL, summary, and runtime**, starts a **Cursor review agent** on that PR, and posts a ✅ comment back on the original issue.
 6. Exposes a live **dashboard**, a **metrics endpoint**, and an orchestration-grade **health endpoint**.
 
 ## Architecture
 
-![Devin Forge architecture](docs/architecture.png)
+![Cursor Forge architecture](docs/architecture.png)
 
 ```mermaid
 flowchart LR
-    ISSUE["GitHub Issue<br/>labeled Devin-complete"]
-    WEBHOOK["Devin Forge FastAPI<br/>POST /webhook - validate HMAC"]
+    ISSUE["GitHub Issue<br/>labeled Cursor-complete"]
+    WEBHOOK["Cursor Forge FastAPI<br/>POST /webhook - validate HMAC"]
     DB[("SQLite<br/>Task store")]
-    API["Devin API v3<br/>api.devin.ai/v3"]
-    SESSION["Devin Session<br/>plan, code, test"]
-    WORKER["Background Worker<br/>polls sessions"]
+    API["Cursor Cloud Agents API<br/>api.cursor.com/v1"]
+    SESSION["Cursor Cloud Agent<br/>plan, code, test"]
+    WORKER["Background Worker<br/>polls agents/runs"]
     PR["Pull Request"]
-    REVIEW["Devin Review<br/>auto on PR"]
+    REVIEW["Cursor Review Agent<br/>on PR"]
     COMMENT["GitHub Comment<br/>issue + merge tracking"]
     DASH["Dashboard<br/>GET /dashboard"]
     METRICS["Metrics<br/>GET /metrics"]
 
     ISSUE -->|"webhook"| WEBHOOK
     WEBHOOK -->|"persist Task"| DB
-    WEBHOOK -->|"create session"| API
+    WEBHOOK -->|"create agent"| API
     API --> SESSION
     SESSION -->|"opens"| PR
     PR --> REVIEW
@@ -65,6 +67,7 @@ npx -p @mermaid-js/mermaid-cli mmdc \
 | Web framework | FastAPI + Uvicorn |
 | Persistence | SQLite + SQLAlchemy 2.x |
 | Background worker | asyncio task (in-process, 20s poll loop) |
+| Agent runtime | Cursor Cloud Agents REST API v1 (`api.cursor.com`) |
 | HTTP client | httpx (async) |
 | Config | pydantic-settings + python-dotenv |
 | UI | Jinja2 + Bootstrap 5 |
@@ -92,14 +95,14 @@ Install before you start:
 You will also need:
 
 1. A **GitHub personal access token** with permission to read repos, write issues/comments, and merge PRs on the target repository.
-2. A **Devin service-user API key** (`cog_…`) and your **organization ID** (`org-…`) from Devin → Settings → Service Users.
+2. A **Cursor API key** from [Cursor Dashboard → Integrations](https://cursor.com/dashboard/integrations) (or a team service-account key). The key must be allowed to launch Cloud Agents on the target GitHub repos (install the Cursor GitHub app on those repos).
 3. A **webhook secret** string of your choosing (any long random value).
 
 ### 1. Clone the repository
 
 ```bash
-git clone https://github.com/jan21deepak/devin-ai-engineer.git
-cd devin-ai-engineer
+git clone https://github.com/jan21deepak/cursor_ai_engineer.git
+cd cursor_ai_engineer
 ```
 
 ### 2. Configure environment variables
@@ -113,23 +116,18 @@ Edit `.env` and fill in at least:
 ```bash
 GITHUB_WEBHOOK_SECRET=some-long-random-secret
 GITHUB_TOKEN=<your-github-pat>
-DEVIN_API_KEY=<your-devin-service-user-key>
-DEVIN_ORG_ID=<your-org-id>
-TRIGGER_LABEL=Devin-complete
+CURSOR_API_KEY=<your-cursor-api-key>
+TRIGGER_LABEL=Cursor-complete
 ```
 
-Optional ROI knobs (dashboard Time-to-Dollar Savings) are documented in `.env.example`.
+Optional: `CURSOR_MODEL` (model id from `GET https://api.cursor.com/v1/models`), `CURSOR_STARTING_REF` (default `main`), `CURSOR_USD_PER_AGENT_RUN` for ROI estimates.
 
-**Session attribution.** A `cog_` service-user key has no human identity, so Devin
-stamps every session it creates with the `bot_apk` pseudo-user — which surfaces as an
-unknown user in the Devin UI and audit logs. Set `DEVIN_CREATE_AS_USER_ID` to your
-Devin user ID (Settings → Members, prefix `user-`) to have sessions created on behalf
-of a real member instead. This needs the service user to hold `ImpersonateOrgSessions`
-and the target user to be an org member with `UseDevinSessions`. Verify your
-credentials and see which identity they resolve to with:
+Verify the Cursor key:
 
 ```bash
-curl -s -H "Authorization: Bearer $DEVIN_API_KEY" https://api.devin.ai/v3/self
+curl -s -H "Authorization: Bearer $CURSOR_API_KEY" https://api.cursor.com/v1/me | python3 -m json.tool
+# or
+curl -s -H "Authorization: Bearer $CURSOR_API_KEY" https://api.cursor.com/v1/models | python3 -m json.tool
 ```
 
 ### 3. Run the service
@@ -140,7 +138,7 @@ curl -s -H "Authorization: Bearer $DEVIN_API_KEY" https://api.devin.ai/v3/self
 docker compose up --build
 ```
 
-This starts FastAPI on **http://localhost:8000**, initializes SQLite at `/data/tasks.db` inside the container, and persists it in the `devin_data` volume.
+This starts FastAPI on **http://localhost:8000**, initializes SQLite at `/data/tasks.db` inside the container, and persists it in the `cursor_data` volume.
 
 **Option B — Local Python**
 
@@ -148,7 +146,6 @@ This starts FastAPI on **http://localhost:8000**, initializes SQLite at `/data/t
 python3.12 -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
-# If your network uses a corporate PyPI proxy, pass --index-url <proxy>/simple
 
 mkdir -p data
 .venv/bin/uvicorn app.app:app --host 0.0.0.0 --port 8000
@@ -174,11 +171,11 @@ Healthy response looks like:
 {
   "status": "healthy",
   "application": "ok",
-  "checks": { "database": "ok", "github": "ok", "devin": "ok" }
+  "checks": { "database": "ok", "github": "ok", "cursor": "ok" }
 }
 ```
 
-If `github` or `devin` show as unreachable/unconfigured, the app still serves traffic (`degraded`) — fix the tokens in `.env` and restart.
+If `github` or `cursor` show as unreachable/unconfigured, the app still serves traffic (`degraded`) — fix the tokens in `.env` and restart.
 
 ### 5. Expose a public webhook URL
 
@@ -195,7 +192,7 @@ cloudflared tunnel --url http://localhost:8000
 
 ### 6. Point a GitHub webhook at your tunnel
 
-Replace `<owner>/<repo>` with the repository you want Devin to work on, and `<public-host>` with the tunnel host from step 5:
+Replace `<owner>/<repo>` with the repository you want Cursor to work on, and `<public-host>` with the tunnel host from step 5:
 
 ```bash
 gh auth login   # if needed — use the same account that owns the repo
@@ -215,41 +212,34 @@ Or in the GitHub UI: **Settings → Webhooks → Add webhook**
 - Secret: same value as `GITHUB_WEBHOOK_SECRET`
 - Events: **Issues** only
 
-> Free ngrok/cloudflared URLs change on restart. Patch the hook:
->
-> ```bash
-> gh api -X PATCH repos/<owner>/<repo>/hooks/<hook_id> \
->   -F "config[url]=https://<new-host>/webhook" \
->   -F "config[content_type]=json" \
->   -F "config[secret]=$GITHUB_WEBHOOK_SECRET"
-> ```
-
-### 7. Register the repo in the dashboard and trigger Devin
+### 7. Register the repo in the dashboard and trigger Cursor
 
 1. Open **http://localhost:8000/dashboard** → **Repositories** tab.
 2. Paste `https://github.com/<owner>/<repo>` and click **Add repository**.
 3. Click **Add Issues** (imports open issues from a parent fork when applicable) or **Sync**.
-4. On the **Issues** tab, select issues → **Assign to Devin**.
+4. On the **Issues** tab, select issues → **Assign to Cursor**.
 
 **Or trigger via the webhook label:**
 
 ```bash
 # Create the label once
-gh label create Devin-complete --repo <owner>/<repo> \
-  --color 0E8A16 --description "Trigger Devin Forge automation" || true
+gh label create Cursor-complete --repo <owner>/<repo> \
+  --color 0E8A16 --description "Trigger Cursor Forge automation" || true
 
 # Open / label an issue
 gh issue create --repo <owner>/<repo> \
   --title "Fix: example bug" \
   --body "Describe the change." \
-  --label Devin-complete
+  --label Cursor-complete
 ```
 
 ### 8. Watch the result
 
 - **Dashboard** tab: fix + review stats, engineering KPIs, daily activity chart (times in **SGT**).
-- Original GitHub issue: ✅ completion comment with session ID, PR URL, runtime, summary.
-- Devin opens a PR; Devin Review is tracked automatically; merge state is refreshed from GitHub.
+- Original GitHub issue: ✅ completion comment with agent ID, PR URL, runtime, summary.
+- Cursor opens a PR (`autoCreatePR`); a review Cloud Agent is started against that PR; merge state is refreshed from GitHub.
+
+Deep links open in the Cursor UI: `https://cursor.com/agents/{agentId}`.
 
 ---
 
@@ -260,13 +250,13 @@ gh issue create --repo <owner>/<repo> \
 1. GitHub delivers an `issues` event to `POST /webhook`.
 2. The service verifies `X-Hub-Signature-256` with the shared secret (constant-time HMAC compare). Invalid → **401**.
 3. Non-issue events are acknowledged and ignored (**200**).
-4. Trigger rule: issue `opened` with the `Devin-complete` label, or the `Devin-complete` label being added (`labeled`). Anything else is ignored.
+4. Trigger rule: issue `opened` with the `Cursor-complete` label, or the `Cursor-complete` label being added (`labeled`). Anything else is ignored.
 5. Duplicate protection: an active or completed task for the same repo + issue is not recreated.
-6. A `Task` row is written to SQLite, and a Devin session is created (**202**).
+6. A `Task` row is written to SQLite, and a Cursor Cloud Agent is created (**202**).
 
-### Devin Workflow
+### Cursor Cloud Agent Workflow
 
-The session prompt includes the repository URL, issue title, and issue body, and instructs Devin to:
+The agent prompt includes the repository URL, issue title, and issue body, and instructs Cursor to:
 
 - make only the requested changes,
 - run the project's test suite,
@@ -274,7 +264,27 @@ The session prompt includes the repository URL, issue title, and issue body, and
 - create a pull request,
 - summarize the completed work.
 
-The background worker polls every 20 seconds, maps Devin session status to `queued → running → completed/failed`, recovers sessions that later open a PR after inactivity, tracks Devin Review, and on success posts a comment to the issue containing the session ID, PR URL, runtime and summary.
+Create call (simplified):
+
+```http
+POST https://api.cursor.com/v1/agents
+Authorization: Bearer $CURSOR_API_KEY
+{
+  "prompt": { "text": "..." },
+  "repos": [{ "url": "https://github.com/owner/repo", "startingRef": "main" }],
+  "autoCreatePR": true,
+  "skipReviewerRequest": true
+}
+```
+
+The background worker polls every 20 seconds:
+
+- `GET /v1/agents/{id}` → `latestRunId`
+- `GET /v1/agents/{id}/runs/{runId}` → status, `result`, `durationMs`, `git.branches[].prUrl`
+
+Status map: `CREATING`/`RUNNING` → queued/running; `FINISHED` → completed; `ERROR`/`CANCELLED`/`EXPIRED` → failed.
+
+On success it posts a comment to the issue and starts a **review agent** with `repos[0].prUrl` and `autoCreatePR: false`. When that review finishes, the worker attempts squash-merge (or enables GitHub auto-merge).
 
 ## Environment Variables
 
@@ -282,19 +292,19 @@ The background worker polls every 20 seconds, maps Devin session status to `queu
 |---|---|---|
 | `GITHUB_WEBHOOK_SECRET` | Shared secret for webhook HMAC validation | — |
 | `GITHUB_TOKEN` | PAT used to post comments / merge PRs | — |
-| `DEVIN_API_KEY` | Devin service-user key (`cog_…`) | — |
-| `DEVIN_API_BASE` | Devin API base URL | `https://api.devin.ai/v3` |
-| `DEVIN_ORG_ID` | Devin organization ID (`org-…`) | — |
-| `DEVIN_CREATE_AS_USER_ID` | Devin user (`user-…`) to attribute sessions to; blank leaves them on the service user | — |
-| `DEVIN_SESSION_TAG` | Tag applied to every session this app creates | `devin-forge` |
+| `CURSOR_API_KEY` | Cursor user or service-account API key | — |
+| `CURSOR_API_BASE` | Cursor API base URL | `https://api.cursor.com` |
+| `CURSOR_MODEL` | Optional model id (`GET /v1/models`) | (account default) |
+| `CURSOR_NAME_PREFIX` | Prefix for agent display names | `cursor-forge` |
+| `CURSOR_STARTING_REF` | Default git ref for fix agents | `main` |
 | `DATABASE_URL` | SQLAlchemy URL | `sqlite:///./data/tasks.db` |
 | `POLL_INTERVAL_SECONDS` | Worker poll interval | `20` |
-| `TRIGGER_LABEL` | Issue label that triggers automation | `Devin-complete` |
+| `TRIGGER_LABEL` | Issue label that triggers automation | `Cursor-complete` |
 | `LOG_LEVEL` | Logging level | `INFO` |
 | `JUNIOR_SWE_ANNUAL_COST_USD` | Assumed junior SWE fully-loaded cost | `150000` |
 | `JUNIOR_HOURS_PER_ISSUE` | Hours a junior would spend per fix | `4.0` |
 | `JUNIOR_HOURS_PER_REVIEW` | Hours a junior would spend per review | `1.0` |
-| `DEVIN_ACU_USD` | USD per Devin ACU | `2.25` |
+| `CURSOR_USD_PER_AGENT_RUN` | Flat USD attributed per completed agent run | `0` |
 
 Time-to-Dollar Savings divides annual cost by **1,920** working hours/year. The service boots without API keys, logs warnings, and reports `degraded` on `/health`.
 
@@ -303,14 +313,14 @@ Time-to-Dollar Savings divides annual cost by **1,920** working hours/year. The 
 `GET /dashboard` — neon dark UI, auto-refreshes every 15 seconds while the Dashboard tab is active:
 
 - Repositories / Issues / Dashboard tabs
-- Fix + Review time stats (active Devin work only; idle waits excluded)
+- Fix + Review time stats (active Cursor work)
 - Engineering KPIs (avg PR cycle time, PRs delivered, merge rate, change failure rate)
 - Daily activity bar chart (last 14 days, SGT)
-- Recent activity with Devin Session / Devin Review deep links
+- Recent activity with Cursor Agent / Cursor Review deep links
 
 ## Metrics Endpoint
 
-`GET /metrics` — computed live from SQLite (fix/review buckets, engineering KPIs, daily series, ROI assumptions).
+`GET /metrics` — computed live from SQLite (fix/review buckets, engineering KPIs, daily series, ROI assumptions). Cost uses stored `cost_usd` / `CURSOR_USD_PER_AGENT_RUN`.
 
 ## Health Endpoint
 
@@ -320,7 +330,7 @@ Time-to-Dollar Savings divides annual cost by **1,920** working hours/year. The 
 {
   "status": "healthy",
   "application": "ok",
-  "checks": { "database": "ok", "github": "ok", "devin": "ok" }
+  "checks": { "database": "ok", "github": "ok", "cursor": "ok" }
 }
 ```
 
@@ -329,17 +339,31 @@ Time-to-Dollar Savings divides annual cost by **1,920** working hours/year. The 
 
 ## Observability
 
-Structured single-line logs with ISO-8601 **SGT** timestamps and key=value context, covering: webhook received, Devin session created, polling started/completed, task status changes, task completed/failed, GitHub comment posted, and database updates.
+Structured single-line logs with ISO-8601 **SGT** timestamps and key=value context, covering: webhook received, Cursor agent created, polling started/completed, task status changes, task completed/failed, GitHub comment posted, and database updates.
 
 ```
-2026-08-03T11:30:00.123+08:00 | INFO | app.worker | task.completed | task_id=7 session_id=… pr=https://github.com/… runtime_seconds=734
+2026-08-03T11:30:00.123+08:00 | INFO | app.worker | task.completed | task_id=7 agent_id=bc-… pr=https://github.com/… runtime_seconds=734
 ```
+
+## API mapping (Devin → Cursor)
+
+| Former Devin concept | Cursor Forge |
+|---|---|
+| Session | Cloud Agent (`bc-…`) + Run (`run-…`) |
+| `POST …/sessions` | `POST /v1/agents` |
+| Poll session | `GET /v1/agents/{id}/runs/{runId}` |
+| Devin Review API | Second Cloud Agent with `prUrl` |
+| `app.devin.ai/sessions/…` | `https://cursor.com/agents/{id}` |
+| Trigger label `Devin-complete` | `Cursor-complete` |
+
+Canonical docs: [Cloud Agents API endpoints](https://cursor.com/docs/cloud-agent/api/endpoints).
 
 ## Future Improvements
 
 - **Queue-based dispatch** (Celery / Redis) for horizontal scaling beyond the in-process worker
 - **Postgres** backend for multi-replica deployments
-- **Devin webhook callbacks** instead of polling, when available
+- **Cursor webhook callbacks** instead of polling, when available on v1
 - **Slack / Teams notifications** on task completion
 - **Auth (OIDC)** on the dashboard and metrics endpoints
 - **Multi-repo configuration** with per-repo trigger labels and prompt templates
+- **SDK option** (`cursor-sdk` / `@cursor/sdk`) alongside the REST client

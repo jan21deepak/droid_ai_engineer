@@ -1,4 +1,4 @@
-"""Background worker that polls active Devin sessions/reviews and updates the database."""
+"""Background worker that polls active Cursor agents/reviews and updates the database."""
 
 import asyncio
 import logging
@@ -7,8 +7,8 @@ from datetime import datetime, timedelta, timezone
 import httpx
 
 from app.config import get_settings
+from app.cursor_client import CursorClient
 from app.database import db_session
-from app.devin import DevinClient, extract_pull_request_url, map_status, session_has_merged_pr
 from app.github import GitHubClient
 from app.logging_conf import log_event
 from app.models import ReviewTask, Task, TaskStatus
@@ -16,12 +16,9 @@ from app.timeutil import format_sgt
 
 logger = logging.getLogger("app.worker")
 
-# How long a failed session stays eligible for re-checking for a late PR.
 RECHECK_FAILED_DAYS = 7
-
-# Grace period before an unstarted review that Devin no longer knows about is
-# discarded. Devin occasionally reports a queued review and then drops it.
 ABANDONED_REVIEW_HOURS = 6
+IDLE_GAP_SECONDS = 15 * 60
 
 
 def _format_runtime(seconds: float | None) -> str:
@@ -39,7 +36,7 @@ def _format_runtime(seconds: float | None) -> str:
 def build_completion_comment(task: Task) -> str:
     return (
         "✅ **Task completed**\n\n"
-        f"- **Devin session ID:** `{task.devin_session_id}`\n"
+        f"- **Cursor agent ID:** `{task.cursor_agent_id}`\n"
         f"- **Pull Request:** {task.pull_request_url or 'n/a'}\n"
         f"- **Runtime:** {_format_runtime(task.duration_seconds)}\n"
         f"- **Completed at:** {format_sgt(task.completed_at) or 'n/a'}\n\n"
@@ -48,36 +45,23 @@ def build_completion_comment(task: Task) -> str:
 
 
 def _parse_message_timestamp(value) -> float | None:
-    """Normalize Devin message timestamps to unix seconds."""
     try:
         ts = float(value)
     except (TypeError, ValueError):
         return None
-    # Some payloads return milliseconds.
     if ts >= 1e12:
         ts /= 1000.0
     return ts
 
 
-# Gaps longer than this are treated as idle (waiting for a human / suspended),
-# not as Devin actively working the issue.
-IDLE_GAP_SECONDS = 15 * 60
-
-
 def session_active_runtime_seconds(messages: list[dict]) -> float | None:
-    """Active Devin fix time from the session transcript.
-
-    Wall-clock span from first→last message overcounts badly: sessions often sit
-    idle waiting for a human ("Done, try now") or get resumed hours later. This
-    sums only the gaps where Devin is the next speaker and the gap is short
-    enough to be continuous work.
-    """
+    """Active agent work time from a conversation transcript (best-effort)."""
     stamps: list[tuple[float, str]] = []
     for message in messages:
         ts = _parse_message_timestamp(message.get("created_at") or message.get("timestamp"))
         if ts is None:
             continue
-        source = (message.get("source") or message.get("role") or "").lower()
+        source = (message.get("source") or message.get("role") or message.get("type") or "").lower()
         stamps.append((ts, source))
     if len(stamps) < 2:
         return None
@@ -88,7 +72,6 @@ def session_active_runtime_seconds(messages: list[dict]) -> float | None:
         gap = ts - prev_ts
         if gap <= 0:
             continue
-        # Next speaker is the human → this gap was waiting on them, not Devin.
         if source in ("user", "human"):
             continue
         if gap > IDLE_GAP_SECONDS:
@@ -97,7 +80,6 @@ def session_active_runtime_seconds(messages: list[dict]) -> float | None:
     return active if active > 0 else None
 
 
-# Backwards-compatible name used by older call sites / tests.
 def _session_runtime_seconds(messages: list[dict]) -> float | None:
     return session_active_runtime_seconds(messages)
 
@@ -112,7 +94,6 @@ def _parse_iso(value: str | None) -> datetime | None:
 
 
 def _parse_pr_number(pr_url: str) -> int | None:
-    # https://github.com/owner/repo/pull/123
     try:
         parts = pr_url.rstrip("/").split("/")
         if "pull" in parts:
@@ -126,18 +107,11 @@ def review_runtime_from_github_reviews(
     reviews: list[dict],
     review_created_at: datetime | None = None,
 ) -> float | None:
-    """Active Devin Review time from GitHub PR review submissions.
-
-    The Devin Review API only returns ``created_at`` with no completion timestamp,
-    so a review discovered already-finished would otherwise get duration=None and
-    vanish from the stats. We measure engagement as the span of Devin bot review
-    comments on the PR, falling back to created_at → first comment when there is
-    only a single submission.
-    """
+    """Active review time from GitHub PR review submissions by Cursor-related bots."""
     bot_times: list[datetime] = []
     for item in reviews:
         login = ((item.get("user") or {}).get("login") or "").lower()
-        if "devin" not in login:
+        if "cursor" not in login and "bugbot" not in login:
             continue
         stamp = _parse_iso(item.get("submitted_at"))
         if stamp is None:
@@ -154,7 +128,6 @@ def review_runtime_from_github_reviews(
         created = review_created_at
         if created.tzinfo is None:
             created = created.replace(tzinfo=timezone.utc)
-        # Prefer the earlier of API created_at and first comment as the start.
         if created <= end:
             start = min(start, created)
     duration = (end - start).total_seconds()
@@ -184,10 +157,10 @@ async def compute_review_runtime(
 
 async def ensure_review_for_pr(
     task: Task,
-    devin: DevinClient,
+    cursor: CursorClient,
     github: GitHubClient | None = None,
 ) -> None:
-    """Track the auto-triggered Devin Review for a completed fix's PR."""
+    """Start a Cursor review agent for a completed fix's PR (once)."""
     pr_url = task.pull_request_url
     if not pr_url:
         return
@@ -207,44 +180,28 @@ async def ensure_review_for_pr(
         if existing:
             return
 
-    status = TaskStatus.QUEUED
-    commit_sha = None
-    created_at = None
-    try:
-        data = await devin.get_pr_review(pr_url)
-        status = DevinClient.map_review_status(data.get("status"))
-        commit_sha = data.get("commit_sha")
-        created_at = _parse_iso(data.get("created_at"))
-    except httpx.HTTPStatusError as exc:
-        if exc.response.status_code != 404:
-            log_event(
-                logger,
-                logging.WARNING,
-                "review.discover_failed",
-                pr_url=pr_url,
-                error=str(exc),
-            )
-        # Devin hasn't published a review for this commit yet. Don't record a
-        # phantom row; discovery re-runs on the next poll.
+    if not cursor.configured:
         return
+
+    try:
+        created = await cursor.create_review_agent(
+            repository_url=task.repository_url or f"https://github.com/{task.repository}",
+            pr_url=pr_url,
+            name=f"Review {task.repository}#{pr_number}",
+        )
     except Exception as exc:
         log_event(
             logger,
             logging.WARNING,
-            "review.discover_failed",
+            "review.create_failed",
             pr_url=pr_url,
             error=str(exc),
         )
         return
 
-    duration = None
-    completed_at = None
-    if status == TaskStatus.COMPLETED:
-        github = github or GitHubClient()
-        duration = await compute_review_runtime(
-            github, task.repository, pr_number, created_at
-        )
-        completed_at = datetime.now(timezone.utc)
+    agent_id = created.get("agent_id")
+    run_id = created.get("run_id")
+    settings = get_settings()
 
     with db_session() as session:
         again = (
@@ -263,14 +220,12 @@ async def ensure_review_for_pr(
             pr_number=pr_number,
             pr_title=task.issue_title or f"PR #{pr_number}",
             pr_url=pr_url,
-            commit_sha=commit_sha,
-            status=status,
-            summary="Tracking auto-triggered Devin Review",
-            duration_seconds=duration,
-            completed_at=completed_at,
+            cursor_agent_id=agent_id,
+            cursor_run_id=run_id,
+            status=TaskStatus.RUNNING,
+            summary="Tracking Cursor Cloud Agent review",
+            cost_usd=settings.cursor_usd_per_agent_run or None,
         )
-        if created_at:
-            row.created_at = created_at
         session.add(row)
     log_event(
         logger,
@@ -278,16 +233,13 @@ async def ensure_review_for_pr(
         "review.tracked",
         repo=task.repository,
         pr=pr_number,
-        status=status,
-        duration_seconds=duration,
+        agent_id=agent_id,
+        run_id=run_id,
     )
 
 
 async def _attempt_auto_merge(github: GitHubClient, review: ReviewTask) -> tuple[bool, bool, str | None]:
-    """Try to merge immediately; fall back to enabling GitHub auto-merge.
-
-    Returns (merged, auto_merge_enabled, error_message).
-    """
+    """Try to merge immediately; fall back to enabling GitHub auto-merge."""
     try:
         await github.merge_pull_request(
             review.repository,
@@ -302,7 +254,6 @@ async def _attempt_auto_merge(github: GitHubClient, review: ReviewTask) -> tuple
             detail = exc.response.json().get("message") or ""
         except Exception:
             detail = str(exc)
-        # Not mergeable yet (checks / reviews) — enable auto-merge so it lands later.
         if exc.response.status_code in (405, 409, 422):
             enabled = await github.enable_auto_merge(review.repository, review.pr_number)
             if enabled:
@@ -314,13 +265,7 @@ async def _attempt_auto_merge(github: GitHubClient, review: ReviewTask) -> tuple
 
 
 async def _discard_abandoned_review(github: GitHubClient, review: ReviewTask) -> bool:
-    """Resolve a review row that Devin's API no longer knows about (404).
-
-    Devin sometimes reports a queued review and then drops it, leaving a row that
-    counts as active forever. GitHub is the tiebreaker: if the bot did post a
-    review the work happened and we complete the row, otherwise the row is a
-    phantom and gets removed after a grace period.
-    """
+    """Resolve a review row whose Cursor agent is gone / never started."""
     if review.status not in (TaskStatus.QUEUED, TaskStatus.RUNNING):
         return False
 
@@ -343,7 +288,7 @@ async def _discard_abandoned_review(github: GitHubClient, review: ReviewTask) ->
             db_review.status = TaskStatus.COMPLETED
             db_review.duration_seconds = duration
             db_review.completed_at = db_review.completed_at or datetime.now(timezone.utc)
-            db_review.summary = f"Devin Review completed for {review.pr_url}"
+            db_review.summary = f"Cursor review completed for {review.pr_url}"
             resolution = "completed_from_github"
         else:
             session.delete(db_review)
@@ -361,30 +306,23 @@ async def _discard_abandoned_review(github: GitHubClient, review: ReviewTask) ->
 
 
 async def poll_reviews_once(
-    devin: DevinClient | None = None, github: GitHubClient | None = None
+    cursor: CursorClient | None = None, github: GitHubClient | None = None
 ) -> int:
-    """Poll active Devin Review jobs and auto-merge when the review completes."""
-    devin = devin or DevinClient()
+    """Poll active Cursor review agents and auto-merge when the review completes."""
+    cursor = cursor or CursorClient()
     github = github or GitHubClient()
-    if not devin.configured:
+    if not cursor.configured:
         return 0
 
     with db_session() as session:
         active = (
             session.query(ReviewTask)
             .filter(
-                ReviewTask.status.in_(
-                    (
-                        TaskStatus.QUEUED,
-                        TaskStatus.RUNNING,
-                        # Keep watching completed-but-not-yet-merged with auto-merge on
-                    )
-                )
+                ReviewTask.status.in_((TaskStatus.QUEUED, TaskStatus.RUNNING)),
+                ReviewTask.cursor_agent_id.isnot(None),
             )
             .all()
         )
-        # Any finished review whose PR hasn't been recorded as merged: the PR
-        # may have landed outside this app, so re-check GitHub as source of truth.
         pending_merge = (
             session.query(ReviewTask)
             .filter(
@@ -395,10 +333,13 @@ async def poll_reviews_once(
         )
 
     updated = 0
+    settings = get_settings()
 
     for review in active:
         try:
-            data = await devin.get_pr_review(review.pr_url, review.commit_sha)
+            status, _, run_data = await cursor.get_agent_status(
+                review.cursor_agent_id, review.cursor_run_id
+            )
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code == 404:
                 if await _discard_abandoned_review(github, review):
@@ -422,9 +363,9 @@ async def poll_reviews_once(
             )
             continue
 
-        new_status = DevinClient.map_review_status(data.get("status"))
-        commit_sha = data.get("commit_sha") or review.commit_sha
-        if new_status == review.status and commit_sha == review.commit_sha:
+        new_status = status
+        run_id = run_data.get("id") or review.cursor_run_id
+        if new_status == review.status and run_id == review.cursor_run_id:
             continue
 
         completed_at = None
@@ -433,26 +374,20 @@ async def poll_reviews_once(
         auto_merge = False
         error = None
         summary = None
+        cost_usd = None
 
         if new_status in (TaskStatus.COMPLETED, TaskStatus.FAILED):
             completed_at = datetime.now(timezone.utc)
-            started = _parse_iso(data.get("created_at")) or review.created_at
-            if started and started.tzinfo is None:
-                started = started.replace(tzinfo=timezone.utc)
-            observed = None
-            if started:
-                observed = max((completed_at - started).total_seconds(), 0.0)
-            # Prefer GitHub's Devin-bot review span — wall-clock from our poll
-            # only captures the last few seconds when we discover an already-done review.
+            duration = CursorClient.run_duration_seconds(run_data)
             github_duration = await compute_review_runtime(
-                github, review.repository, review.pr_number, started
+                github, review.repository, review.pr_number, review.created_at
             )
-            duration = github_duration or observed
+            duration = github_duration or duration
             if new_status == TaskStatus.COMPLETED:
-                summary = f"Devin Review completed for {review.pr_url}"
+                summary = run_data.get("result") or f"Cursor review completed for {review.pr_url}"
+                cost_usd = settings.cursor_usd_per_agent_run or None
                 merged, auto_merge, error = await _attempt_auto_merge(github, review)
                 if error and not merged and not auto_merge:
-                    # Review itself succeeded; merge is a secondary step.
                     log_event(
                         logger,
                         logging.WARNING,
@@ -462,14 +397,14 @@ async def poll_reviews_once(
                     )
                     error = None
             else:
-                error = f"Devin Review status: {data.get('status')}"
+                error = f"Cursor review status: {run_data.get('status')}"
 
         with db_session() as session:
             db_review = session.get(ReviewTask, review.id)
             old_status = db_review.status
             db_review.status = new_status
-            if commit_sha:
-                db_review.commit_sha = commit_sha
+            if run_id:
+                db_review.cursor_run_id = run_id
             if completed_at:
                 db_review.completed_at = completed_at
                 db_review.duration_seconds = duration
@@ -477,6 +412,8 @@ async def poll_reviews_once(
                 db_review.summary = summary
             if error:
                 db_review.error = error
+            if cost_usd is not None:
+                db_review.cost_usd = cost_usd
             if merged:
                 db_review.merged = True
             if auto_merge:
@@ -494,7 +431,6 @@ async def poll_reviews_once(
             auto_merge=auto_merge,
         )
 
-    # Poll GitHub for PRs that have auto-merge enabled but aren't merged yet.
     for review in pending_merge:
         try:
             pr = await github.get_pull_request(review.repository, review.pr_number)
@@ -522,10 +458,8 @@ async def poll_reviews_once(
                 pr=review.pr_url,
             )
         elif pr.get("state") == "closed" and not pr.get("merged"):
-            # Closed without merge — leave as completed but not merged.
             continue
         else:
-            # Still open: retry a direct merge in case checks just passed.
             merged, auto_merge, _ = await _attempt_auto_merge(github, review)
             if merged or auto_merge:
                 with db_session() as session:
@@ -542,11 +476,7 @@ async def poll_reviews_once(
 
 
 async def refresh_pr_states(github: GitHubClient, tasks: list[Task]) -> int:
-    """Sync each Devin-opened PR's open/closed/merged state from GitHub.
-
-    Delivery metrics read this instead of review rows, so a PR still counts
-    correctly even when Devin never published a review for it.
-    """
+    """Sync each Cursor-opened PR's open/closed/merged state from GitHub."""
     updated = 0
     for task in tasks:
         if task.pr_state == "merged":
@@ -581,8 +511,6 @@ async def refresh_pr_states(github: GitHubClient, tasks: list[Task]) -> int:
             db_task = session.get(Task, task.id)
             db_task.pr_state = state
             db_task.pr_merged_at = merged_at
-            # A merged PR means the fix delivered — don't leave the task "running"
-            # just because Devin is still waiting_for_user on the session.
             if state == "merged" and db_task.status in TaskStatus.ACTIVE:
                 db_task.status = TaskStatus.COMPLETED
                 if not db_task.completed_at:
@@ -627,34 +555,37 @@ async def finalize_merged_running_tasks() -> int:
 
 
 async def backfill_durations(
-    devin: DevinClient,
+    cursor: CursorClient,
     github: GitHubClient,
 ) -> int:
-    """Recompute fix/review durations that are missing or still include idle time.
-
-    Safe to call every poll — only writes when the corrected value differs.
-    """
+    """Fill missing durations from Cursor run durationMs / GitHub reviews."""
     updated = 0
 
     with db_session() as session:
         fixes = (
             session.query(Task)
             .filter(
-                Task.devin_session_id.isnot(None),
+                Task.cursor_agent_id.isnot(None),
                 Task.status.in_((TaskStatus.COMPLETED, TaskStatus.FAILED)),
+                Task.duration_seconds.is_(None),
             )
             .all()
         )
         reviews = (
             session.query(ReviewTask)
-            .filter(ReviewTask.status == TaskStatus.COMPLETED)
+            .filter(
+                ReviewTask.status == TaskStatus.COMPLETED,
+                ReviewTask.duration_seconds.is_(None),
+            )
             .all()
         )
 
     for task in fixes:
         try:
-            messages = await devin.get_session_messages(task.devin_session_id)
-            duration = session_active_runtime_seconds(messages)
+            _, _, run_data = await cursor.get_agent_status(
+                task.cursor_agent_id, task.cursor_run_id
+            )
+            duration = CursorClient.run_duration_seconds(run_data)
         except Exception as exc:
             log_event(
                 logger,
@@ -666,9 +597,6 @@ async def backfill_durations(
             continue
         if duration is None:
             continue
-        current = float(task.duration_seconds) if task.duration_seconds is not None else None
-        if current is not None and abs(current - duration) < 1.0:
-            continue
         with db_session() as session:
             db_task = session.get(Task, task.id)
             db_task.duration_seconds = duration
@@ -678,7 +606,6 @@ async def backfill_durations(
             logging.INFO,
             "duration.fix_corrected",
             task_id=task.id,
-            old=current,
             new=duration,
         )
 
@@ -686,10 +613,15 @@ async def backfill_durations(
         duration = await compute_review_runtime(
             github, review.repository, review.pr_number, review.created_at
         )
+        if duration is None and review.cursor_agent_id:
+            try:
+                _, _, run_data = await cursor.get_agent_status(
+                    review.cursor_agent_id, review.cursor_run_id
+                )
+                duration = CursorClient.run_duration_seconds(run_data)
+            except Exception:
+                duration = None
         if duration is None:
-            continue
-        current = float(review.duration_seconds) if review.duration_seconds is not None else None
-        if current is not None and abs(current - duration) < 1.0:
             continue
         with db_session() as session:
             db_review = session.get(ReviewTask, review.id)
@@ -702,35 +634,32 @@ async def backfill_durations(
             logging.INFO,
             "duration.review_corrected",
             review_id=review.id,
-            old=current,
             new=duration,
         )
 
     return updated
 
 
-async def poll_once(devin: DevinClient | None = None, github: GitHubClient | None = None) -> int:
-    """Poll all active sessions once. Returns number of tasks updated."""
-    devin = devin or DevinClient()
+async def poll_once(cursor: CursorClient | None = None, github: GitHubClient | None = None) -> int:
+    """Poll all active agents once. Returns number of tasks updated."""
+    cursor = cursor or CursorClient()
     github = github or GitHubClient()
-    if not devin.configured:
+    if not cursor.configured:
         return 0
 
     recheck_cutoff = datetime.now(timezone.utc) - timedelta(days=RECHECK_FAILED_DAYS)
     with db_session() as session:
         active = (
             session.query(Task)
-            .filter(Task.status.in_(TaskStatus.ACTIVE), Task.devin_session_id.isnot(None))
+            .filter(Task.status.in_(TaskStatus.ACTIVE), Task.cursor_agent_id.isnot(None))
             .all()
         )
-        # A session suspended for inactivity can still open a PR afterwards, so
-        # recently-failed tasks without one are re-checked rather than written off.
         recoverable = (
             session.query(Task)
             .filter(
                 Task.status == TaskStatus.FAILED,
                 Task.pull_request_url.is_(None),
-                Task.devin_session_id.isnot(None),
+                Task.cursor_agent_id.isnot(None),
                 Task.created_at >= recheck_cutoff,
             )
             .all()
@@ -738,57 +667,68 @@ async def poll_once(devin: DevinClient | None = None, github: GitHubClient | Non
         active = active + recoverable
 
     updated = 0
+    settings = get_settings()
     if active:
         log_event(logger, logging.INFO, "polling.started", active_sessions=len(active))
         for task in active:
             try:
-                session_data = await devin.get_session(task.devin_session_id)
-                pr_url = extract_pull_request_url(session_data)
-                status_value = session_data.get("status") or session_data.get("status_enum")
-                pr_merged = session_has_merged_pr(session_data) or task.pr_state == "merged"
-                new_status = map_status(
-                    status_value,
-                    bool(pr_url) or bool(task.pull_request_url),
-                    session_data.get("status_detail"),
-                    pr_merged=pr_merged,
+                new_status, pr_url, run_data = await cursor.get_agent_status(
+                    task.cursor_agent_id, task.cursor_run_id
                 )
-                acus = session_data.get("acus_consumed")
                 if pr_url is None:
                     pr_url = task.pull_request_url
+                # Prefer FINISHED semantics; if PR merged on GitHub, complete early.
+                if task.pr_state == "merged":
+                    new_status = TaskStatus.COMPLETED
+                run_id = run_data.get("id") or task.cursor_run_id
             except Exception as exc:
-                log_event(logger, logging.ERROR, "polling.session_error",
-                          task_id=task.id, session_id=task.devin_session_id, error=str(exc))
+                log_event(
+                    logger,
+                    logging.ERROR,
+                    "polling.session_error",
+                    task_id=task.id,
+                    agent_id=task.cursor_agent_id,
+                    error=str(exc),
+                )
                 continue
 
-            acus_changed = (
-                acus is not None
-                and (task.acus_consumed is None or float(acus) != float(task.acus_consumed))
-            )
-            if new_status == task.status and pr_url == task.pull_request_url and not acus_changed:
+            if (
+                new_status == task.status
+                and pr_url == task.pull_request_url
+                and run_id == task.cursor_run_id
+            ):
                 continue
 
             summary = None
             completed_at = None
             duration = None
             cost_usd = None
-            settings = get_settings()
             if new_status in (TaskStatus.COMPLETED, TaskStatus.FAILED):
                 completed_at = datetime.now(timezone.utc)
-                messages = await devin.get_session_messages(task.devin_session_id)
-                duration = _session_runtime_seconds(messages)
+                duration = CursorClient.run_duration_seconds(run_data)
                 if new_status == TaskStatus.COMPLETED:
-                    try:
-                        summary = await devin.get_session_summary(task.devin_session_id)
-                    except Exception as exc:
-                        log_event(logger, logging.WARNING, "polling.summary_error",
-                                  task_id=task.id, error=str(exc))
-                if acus is not None:
-                    cost_usd = float(acus) * settings.devin_acu_usd
+                    summary = run_data.get("result")
+                    if not summary:
+                        try:
+                            summary = await cursor.get_run_summary(
+                                task.cursor_agent_id, run_id
+                            )
+                        except Exception as exc:
+                            log_event(
+                                logger,
+                                logging.WARNING,
+                                "polling.summary_error",
+                                task_id=task.id,
+                                error=str(exc),
+                            )
+                    cost_usd = settings.cursor_usd_per_agent_run or None
 
             with db_session() as session:
                 db_task = session.get(Task, task.id)
                 old_status = db_task.status
                 db_task.status = new_status
+                if run_id:
+                    db_task.cursor_run_id = run_id
                 if pr_url:
                     db_task.pull_request_url = pr_url
                 if summary:
@@ -796,59 +736,70 @@ async def poll_once(devin: DevinClient | None = None, github: GitHubClient | Non
                 if completed_at:
                     db_task.completed_at = completed_at
                     db_task.duration_seconds = duration
-                if acus is not None:
-                    db_task.acus_consumed = float(acus)
                 if cost_usd is not None:
                     db_task.cost_usd = cost_usd
-                # Devin v3 does not report tokens. Keep this explicitly unknown.
                 db_task.estimated_tokens = None
                 session.flush()
                 refreshed = db_task
 
             updated += 1
-            log_event(logger, logging.INFO, "task.status_changed", task_id=task.id,
-                      session_id=task.devin_session_id, old=old_status, new=new_status)
+            log_event(
+                logger,
+                logging.INFO,
+                "task.status_changed",
+                task_id=task.id,
+                agent_id=task.cursor_agent_id,
+                old=old_status,
+                new=new_status,
+            )
             log_event(logger, logging.INFO, "db.updated", task_id=task.id, status=new_status)
 
             if new_status == TaskStatus.COMPLETED:
-                log_event(logger, logging.INFO, "task.completed", task_id=task.id,
-                          session_id=task.devin_session_id, pr=refreshed.pull_request_url,
-                          runtime_seconds=refreshed.duration_seconds)
+                log_event(
+                    logger,
+                    logging.INFO,
+                    "task.completed",
+                    task_id=task.id,
+                    agent_id=task.cursor_agent_id,
+                    pr=refreshed.pull_request_url,
+                    runtime_seconds=refreshed.duration_seconds,
+                )
                 await github.post_issue_comment(
-                    refreshed.repository, refreshed.issue_number, build_completion_comment(refreshed)
+                    refreshed.repository,
+                    refreshed.issue_number,
+                    build_completion_comment(refreshed),
                 )
                 if refreshed.pull_request_url:
-                    await ensure_review_for_pr(refreshed, devin, github)
+                    await ensure_review_for_pr(refreshed, cursor, github)
             elif new_status == TaskStatus.FAILED:
-                log_event(logger, logging.WARNING, "task.failed", task_id=task.id,
-                          session_id=task.devin_session_id)
+                log_event(
+                    logger,
+                    logging.WARNING,
+                    "task.failed",
+                    task_id=task.id,
+                    agent_id=task.cursor_agent_id,
+                )
 
         log_event(logger, logging.INFO, "polling.completed", updated=updated)
 
-    # Discover auto-triggered reviews for every fix that has opened a PR. Devin
-    # reviews the PR as soon as it exists, which is often long before the
-    # session itself leaves the running state.
     with db_session() as session:
         tasks_with_pr = (
             session.query(Task)
             .filter(
                 Task.pull_request_url.isnot(None),
-                Task.devin_session_id.isnot(None),
+                Task.cursor_agent_id.isnot(None),
             )
             .all()
         )
     for task in tasks_with_pr:
-        await ensure_review_for_pr(task, devin, github)
+        # Only auto-start review once the fix agent finished (or PR already merged).
+        if task.status == TaskStatus.COMPLETED or task.pr_state == "merged":
+            await ensure_review_for_pr(task, cursor, github)
 
-    review_updated = await poll_reviews_once(devin, github)
-
-    # Runs last so merges performed by the review pass are picked up in the
-    # same cycle rather than showing as still-open until the next one.
+    review_updated = await poll_reviews_once(cursor, github)
     updated += await refresh_pr_states(github, tasks_with_pr)
     updated += await finalize_merged_running_tasks()
-
-    # Recompute any durations still inflated by idle waits or left blank.
-    updated += await backfill_durations(devin, github)
+    updated += await backfill_durations(cursor, github)
 
     return updated + review_updated
 
@@ -860,7 +811,7 @@ async def worker_loop(stop_event: asyncio.Event) -> None:
     while not stop_event.is_set():
         try:
             await poll_once()
-        except Exception as exc:  # never let the loop die
+        except Exception as exc:
             log_event(logger, logging.ERROR, "worker.iteration_error", error=str(exc))
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=interval)

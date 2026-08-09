@@ -7,15 +7,16 @@ from app.repos import parse_repository_ref
 from app.timeutil import now_sgt
 
 
-def add_task(session, status, duration=None, acus=None, pr_url=None, pr_state=None):
+def add_task(session, status, duration=None, acus_consumed=None, cost_usd=None, pr_url=None, pr_state=None):
     task = Task(
         repository="jan21deepak/superset",
         issue_number=1,
         issue_title="t",
-        devin_session_id=f"session-{status}-{duration}",
+        cursor_agent_id=f"session-{status}-{duration}",
         status=status,
         duration_seconds=duration,
-        acus_consumed=acus,
+        acus_consumed=acus_consumed,
+        cost_usd=cost_usd,
         pull_request_url=pr_url,
         pr_state=pr_state,
         completed_at=datetime.now(timezone.utc) if duration else None,
@@ -54,7 +55,7 @@ def test_metrics_empty(client):
     assert data["engineering"]["pr_cycle_time_hours"] == 0
     assert data["engineering"]["prs_last_7_days"] == 0
     assert data["tokens_used"] is None
-    assert data["devin_cost_usd"] == 0
+    assert data["cursor_cost_usd"] == 0
     assert data["productivity_gained_usd"] == 0
 
 
@@ -62,8 +63,8 @@ def test_metrics_with_tasks(client):
     with db_session() as session:
         add_task(session, TaskStatus.RUNNING)
         add_task(session, TaskStatus.QUEUED)
-        add_task(session, TaskStatus.COMPLETED, duration=100, acus=2.0)
-        add_task(session, TaskStatus.COMPLETED, duration=200, acus=1.0)
+        add_task(session, TaskStatus.COMPLETED, duration=100, cost_usd=4.5)
+        add_task(session, TaskStatus.COMPLETED, duration=200, cost_usd=2.25)
         add_task(session, TaskStatus.FAILED)
         add_review(session, TaskStatus.COMPLETED, duration=60, merged=True)
         add_review(session, TaskStatus.RUNNING)
@@ -80,10 +81,8 @@ def test_metrics_with_tasks(client):
     assert data["review"]["average_runtime_minutes"] == 1.0
     assert data["review"]["total_runtime_minutes"] == 1.0
     assert data["review"]["merged"] == 1
-    # 3 ACUs × $2.25 default
-    assert data["devin_cost_usd"] == 6.75
+    assert data["cursor_cost_usd"] == 6.75
     assert data["tokens_used"] is None
-    assert data["total_acus_consumed"] == 3.0
     # (2 fixes × 4h + 1 review × 1h) × (150000/1920) − 6.75
     assert data["productivity_gained_usd"] > 0
     assert "assumptions" in data
@@ -97,9 +96,9 @@ def test_dashboard_renders(client):
     resp = client.get("/dashboard")
     assert resp.status_code == 200
     assert "Repositories" in resp.text
-    assert "Assign to Devin" in resp.text
+    assert "Assign to Cursor" in resp.text
     assert "Review ready PRs" not in resp.text
-    assert "Assign to Devin Review" not in resp.text
+    assert "Assign to Cursor Review" not in resp.text
     assert "Fix Time Stats" in resp.text
     assert "Review Time Stats" in resp.text
     assert "Engineering KPIs" in resp.text
@@ -109,8 +108,8 @@ def test_dashboard_renders(client):
     assert "Lead Time to PR" not in resp.text
     assert "Change Failure Rate" in resp.text
     assert "Time-to-Dollar Savings" in resp.text
-    assert "Devin Session" in resp.text
-    assert "Devin Forge" in resp.text
+    assert "Cursor Agent" in resp.text
+    assert "Cursor Forge" in resp.text
     assert "The AI Engineer That Delivers" in resp.text
     assert "Autonomous Issue Resolution" not in resp.text
     assert 'data-bs-theme="dark"' in resp.text
@@ -119,12 +118,12 @@ def test_dashboard_renders(client):
     assert "last 14 days · SGT" in resp.text
     # Status cards, KPIs, ROI figure and the daily chart all carry explanations
     assert resp.text.count('class="metric-info"') == 12
-    assert "Devin Runs Completed" in resp.text
+    assert "Cursor Runs Completed" in resp.text
     assert "PRs merged" in resp.text
     assert "Tokens Used" not in resp.text
     assert "Algorithm:" not in resp.text
-    assert "Devin Cost" not in resp.text
-    assert "API-reported ACUs" not in resp.text
+    assert "Cursor Cost" not in resp.text
+    assert "ZZZ-gone" not in resp.text
     assert "Recent Activity" in resp.text
     assert 'id="activity-pager"' in resp.text
     assert 'id="activity-pagination"' in resp.text
@@ -201,7 +200,7 @@ def test_metrics_include_engineering_kpis(client):
             session,
             TaskStatus.COMPLETED,
             duration=3600,
-            acus=1.0,
+            acus_consumed=1.0,
             pr_url="https://github.com/jan21deepak/superset/pull/3",
             pr_state="merged",
         )
@@ -235,7 +234,7 @@ def test_prs_outside_seven_day_window_excluded(client):
             repository="jan21deepak/superset",
             issue_number=9,
             issue_title="old fix",
-            devin_session_id="session-old",
+            cursor_agent_id="session-old",
             status=TaskStatus.COMPLETED,
             duration_seconds=1200,
             pull_request_url="https://github.com/jan21deepak/superset/pull/9",
@@ -249,7 +248,7 @@ def test_prs_outside_seven_day_window_excluded(client):
 
 
 def test_prs_counted_for_still_running_sessions(client):
-    """Devin often leaves a session running (waiting_for_user) after opening a
+    """Cursor often leaves a session running (waiting_for_user) after opening a
     PR. The PR is still delivered work and must be counted."""
     with db_session() as session:
         add_task(
@@ -269,7 +268,7 @@ def test_prs_counted_for_still_running_sessions(client):
 
 
 def test_merge_rate_counts_unreviewed_prs(client):
-    """An unmerged PR must drag the merge rate down even when no Devin Review
+    """An unmerged PR must drag the merge rate down even when no Cursor Review
     row exists for it — otherwise the rate reads 100% while PRs sit open."""
     with db_session() as session:
         add_task(
@@ -344,7 +343,7 @@ def test_timestamps_are_rendered_in_sgt(client):
                 repository="jan21deepak/superset",
                 issue_number=1,
                 issue_title="t",
-                devin_session_id="sgt-session",
+                cursor_agent_id="sgt-session",
                 status=TaskStatus.COMPLETED,
                 duration_seconds=600,
                 created_at=stamp,
@@ -365,7 +364,7 @@ def test_daily_activity_buckets_by_sgt_day(client):
                 repository="jan21deepak/superset",
                 issue_number=1,
                 issue_title="t",
-                devin_session_id="daily-session",
+                cursor_agent_id="daily-session",
                 status=TaskStatus.COMPLETED,
                 duration_seconds=600,
                 pull_request_url="https://github.com/jan21deepak/superset/pull/20",
@@ -491,7 +490,7 @@ def test_add_issues_imports_five_from_parent_and_syncs(client, monkeypatch):
     assert len(grouped[0]["issues"]) == 5
 
 
-def test_list_and_assign_pulls_to_devin_review(client, monkeypatch):
+def test_list_and_assign_pulls_to_cursor_review(client, monkeypatch):
     with db_session() as session:
         repo = Repository(
             full_name="jan21deepak/superset",
@@ -508,26 +507,25 @@ def test_list_and_assign_pulls_to_devin_review(client, monkeypatch):
                 "html_url": f"https://github.com/{full_name}/pull/3",
                 "draft": False,
                 "state": "open",
-                "user": {"login": "devin-ai"},
+                "user": {"login": "cursor-bot"},
                 "head": {"sha": "abc123"},
             }
         ]
 
-    async def fake_create_pr_review(self, pr_url):
+    async def fake_create_review_agent(self, **kwargs):
         return {
-            "status": "pending",
-            "repo_path": "github.com/jan21deepak/superset",
-            "pr_number": 3,
-            "commit_sha": "abc123",
-            "created_at": "2026-08-02T14:00:00Z",
+            "agent_id": "bc-review",
+            "run_id": "run-review",
+            "url": "https://cursor.com/agents/bc-review",
         }
 
     monkeypatch.setattr(
         "app.github.GitHubClient.list_open_pull_requests", fake_list_open_pull_requests
     )
-    monkeypatch.setattr("app.devin.DevinClient.create_pr_review", fake_create_pr_review)
-    monkeypatch.setenv("DEVIN_API_KEY", "cog_test")
-    monkeypatch.setenv("DEVIN_ORG_ID", "org-test")
+    monkeypatch.setattr(
+        "app.cursor_client.CursorClient.create_review_agent", fake_create_review_agent
+    )
+    monkeypatch.setenv("CURSOR_API_KEY", "cursor_test")
     get_settings.cache_clear()
 
     listed = client.get("/api/pulls").json()
@@ -545,4 +543,4 @@ def test_list_and_assign_pulls_to_devin_review(client, monkeypatch):
         reviews = session.query(ReviewTask).all()
         assert len(reviews) == 1
         assert reviews[0].pr_number == 3
-        assert reviews[0].status == TaskStatus.QUEUED
+        assert reviews[0].status == TaskStatus.RUNNING

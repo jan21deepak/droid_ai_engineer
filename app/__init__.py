@@ -1,3 +1,3 @@
-"""devin-ai-engineer: GitHub Issue -> Devin automation service."""
+"""cursor-ai-engineer: GitHub Issue -> Cursor Cloud Agent automation service."""
 
 __version__ = "1.0.0"

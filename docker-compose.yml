@@ -8,8 +8,8 @@ services:
     environment:
       DATABASE_URL: sqlite:////data/tasks.db
     volumes:
-      - devin_data:/data
+      - cursor_data:/data
     restart: unless-stopped
 
 volumes:
-  devin_data:
+  cursor_data:

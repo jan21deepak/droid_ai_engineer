@@ -1,39 +1,27 @@
 flowchart LR
-    ISSUE["GitHub Issue<br/>labeled Devin-complete"]
-    WEBHOOK["Devin Forge (FastAPI)<br/>POST /webhook - validate HMAC"]
+    ISSUE["GitHub Issue<br/>labeled Cursor-complete"]
+    WEBHOOK["Cursor Forge FastAPI<br/>POST /webhook - validate HMAC"]
     DB[("SQLite<br/>Task store")]
-    API["Devin API v3<br/>api.devin.ai/v3<br/>create session"]
-    SESSION["Devin Session<br/>plan, code, test"]
-    WORKER["Background Worker<br/>polls sessions"]
+    API["Cursor Cloud Agents API<br/>api.cursor.com/v1"]
+    SESSION["Cursor Cloud Agent<br/>plan, code, test"]
+    WORKER["Background Worker<br/>polls agents/runs"]
     PR["Pull Request"]
-    REVIEW["Devin Review<br/>auto on PR"]
-    COMMENT["GitHub Comment<br/>on issue + merge tracking"]
+    REVIEW["Cursor Review Agent<br/>on PR"]
+    COMMENT["GitHub Comment<br/>issue + merge tracking"]
     DASH["Dashboard<br/>GET /dashboard"]
     METRICS["Metrics<br/>GET /metrics"]
 
     ISSUE -->|"webhook"| WEBHOOK
     WEBHOOK -->|"persist Task"| DB
-    WEBHOOK -->|"create session"| API
+    WEBHOOK -->|"create agent"| API
     API --> SESSION
     SESSION -->|"opens"| PR
     PR --> REVIEW
     SESSION -->|"on complete"| COMMENT
-
     WORKER -->|"poll status"| API
     WORKER -->|"update"| DB
     DB -.-> DASH
     DB -.-> METRICS
 
-    classDef github fill:#1e293b,stroke:#64748b,color:#e2e8f0,stroke-width:1.5px;
-    classDef forge fill:#0e7490,stroke:#67e8f9,color:#ecfeff,stroke-width:1.5px;
-    classDef devin fill:#0d9488,stroke:#5eead4,color:#f0fdfa,stroke-width:1.5px;
-    classDef store fill:#b45309,stroke:#fbbf24,color:#fffbeb,stroke-width:1.5px;
-    classDef read fill:#334155,stroke:#94a3b8,color:#f1f5f9,stroke-width:1.5px;
-
-    class ISSUE,PR,REVIEW,COMMENT github;
-    class WEBHOOK,WORKER forge;
-    class API,SESSION devin;
-    class DB store;
-    class DASH,METRICS read;
-
-    linkStyle default stroke:#94a3b8,stroke-width:1.5px;
+    classDef cursor fill:#0ea5e9,stroke:#0369a1,color:#fff
+    class API,SESSION,REVIEW cursor

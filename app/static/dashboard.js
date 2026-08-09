@@ -179,9 +179,9 @@
   // ---- Issues ----
   function updateAssignButton() {
     const selected = $$(".issue-check:checked:not(:disabled)");
-    $("#assign-devin-btn").disabled = selected.length === 0;
-    $("#assign-devin-btn").textContent =
-      selected.length > 0 ? `Assign to Devin (${selected.length})` : "Assign to Devin";
+    $("#assign-cursor-btn").disabled = selected.length === 0;
+    $("#assign-cursor-btn").textContent =
+      selected.length > 0 ? `Assign to Cursor (${selected.length})` : "Assign to Cursor";
   }
 
   async function loadIssues() {
@@ -256,12 +256,12 @@
 
   $("#refresh-issues").addEventListener("click", loadIssues);
 
-  $("#assign-devin-btn").addEventListener("click", async () => {
+  $("#assign-cursor-btn").addEventListener("click", async () => {
     const alert = $("#issues-alert");
     hideAlert(alert);
     const ids = $$(".issue-check:checked:not(:disabled)").map((cb) => Number(cb.value));
     if (!ids.length) return;
-    const btn = $("#assign-devin-btn");
+    const btn = $("#assign-cursor-btn");
     btn.disabled = true;
     btn.textContent = "Assigning…";
     try {
@@ -272,7 +272,7 @@
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.detail || "Assignment failed");
-      showAlert(alert, `Assigned ${data.accepted} issue(s) to Devin.`, "success");
+      showAlert(alert, `Assigned ${data.accepted} issue(s) to Cursor.`, "success");
       await loadIssues();
       await refreshMetrics();
       const tab = new bootstrap.Tab($("#metrics-tab"));
@@ -332,7 +332,7 @@
     }));
     datasets.push({
       type: "line",
-      label: "Devin runtime (min)",
+      label: "Cursor runtime (min)",
       data: rows.map((d) => d.runtime_minutes || 0),
       borderColor: NEON.amber,
       backgroundColor: NEON.amber,
@@ -493,8 +493,8 @@
         if (t.status === "completed" && t.merged) {
           statusLabel = `<span class="badge text-bg-success">Completed · Merged</span>`;
         }
-        const sessionBtn = t.devin_session_url
-          ? `<a class="btn btn-sm btn-outline-dark" href="${t.devin_session_url}" target="_blank" rel="noopener">${isReview ? "Devin Review" : "Devin Session"}</a>`
+        const sessionBtn = t.cursor_agent_url
+          ? `<a class="btn btn-sm btn-outline-dark" href="${t.cursor_agent_url}" target="_blank" rel="noopener">${isReview ? "Cursor Review" : "Cursor Agent"}</a>`
           : `<span class="text-muted">—</span>`;
         return `
           <tr>

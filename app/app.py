@@ -17,7 +17,7 @@ from pydantic import BaseModel, Field
 from app import __version__
 from app.config import get_settings
 from app.database import check_db_connectivity, db_session, init_db
-from app.devin import DevinClient
+from app.cursor_client import CursorClient
 from app.github import GitHubClient, parse_issue_event, should_trigger, verify_signature
 from app.logging_conf import log_event, setup_logging
 from app.metrics import compute_metrics, recent_activity
@@ -59,7 +59,7 @@ async def lifespan(app: FastAPI):
     await worker_task
 
 
-app = FastAPI(title="devin-ai-engineer", version=__version__, lifespan=lifespan)
+app = FastAPI(title="cursor-ai-engineer", version=__version__, lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
 
 
@@ -78,10 +78,10 @@ class AssignPullsRequest(BaseModel):
 @app.get("/")
 async def root():
     return {
-        "service": "devin-ai-engineer",
-        "name": "Devin Forge — The AI Engineer That Delivers",
+        "service": "cursor-ai-engineer",
+        "name": "Cursor Forge — The AI Engineer That Delivers",
         "version": __version__,
-        "description": "GitHub Issue -> Devin autonomous engineering automation",
+        "description": "GitHub Issue -> Cursor Cloud Agent autonomous engineering automation",
         "links": {"dashboard": "/dashboard", "metrics": "/metrics", "health": "/health"},
     }
 
@@ -91,12 +91,12 @@ async def health():
     settings = get_settings()
     db_ok = check_db_connectivity()
     github_ok = await GitHubClient().check_connectivity()
-    devin_ok = await DevinClient().check_connectivity()
+    cursor_ok = await CursorClient().check_connectivity()
 
     if not db_ok:
         overall = "unhealthy"
         status_code = 503
-    elif not github_ok or not devin_ok:
+    elif not github_ok or not cursor_ok:
         overall = "degraded"
         status_code = 200
     else:
@@ -112,7 +112,7 @@ async def health():
             "checks": {
                 "database": "ok" if db_ok else "error",
                 "github": "ok" if github_ok else ("unconfigured" if not settings.github_token else "error"),
-                "devin": "ok" if devin_ok else ("unconfigured" if not settings.devin_api_key else "error"),
+                "cursor": "ok" if cursor_ok else ("unconfigured" if not settings.cursor_api_key else "error"),
             },
         },
     )
@@ -467,7 +467,7 @@ async def list_synced_issues():
 
 
 @app.post("/api/issues/assign")
-async def assign_issues_to_devin(payload: AssignIssuesRequest):
+async def assign_issues_to_cursor(payload: AssignIssuesRequest):
     settings = get_settings()
     github = GitHubClient()
 
@@ -562,13 +562,13 @@ async def list_synced_pulls():
 
 
 @app.post("/api/pulls/assign")
-async def assign_pulls_to_devin_review(payload: AssignPullsRequest):
-    """Kick off Devin Review for selected PRs and queue auto-merge on completion."""
-    devin = DevinClient()
-    if not devin.configured:
+async def assign_pulls_to_cursor_review(payload: AssignPullsRequest):
+    """Kick off a Cursor Cloud Agent review for selected PRs and queue auto-merge on completion."""
+    cursor = CursorClient()
+    if not cursor.configured:
         return JSONResponse(
             status_code=503,
-            content={"detail": "Devin API is not configured"},
+            content={"detail": "Cursor API is not configured"},
         )
 
     with db_session() as session:
@@ -602,9 +602,9 @@ async def assign_pulls_to_devin_review(payload: AssignPullsRequest):
             continue
 
         try:
-            review = await devin.create_pr_review(pull["html_url"])
+            review = await cursor.create_review_agent(repository_url=pull["repository_url"] or f"https://github.com/{pull['repository']}", pr_url=pull["html_url"], name=f"Review {pull['repository']}#{pull['pr_number']}")
         except httpx.HTTPStatusError as exc:
-            detail = "Devin Review rejected the request"
+            detail = "Cursor review agent rejected the request"
             try:
                 detail = exc.response.json().get("detail") or detail
             except Exception:
@@ -654,9 +654,11 @@ async def assign_pulls_to_devin_review(payload: AssignPullsRequest):
                 pr_number=pull["pr_number"],
                 pr_title=pull["title"],
                 pr_url=pull["html_url"],
-                commit_sha=review.get("commit_sha") or pull.get("head_sha"),
-                status=DevinClient.map_review_status(review.get("status")),
-                summary="Devin Review queued; auto-merge will run on completion.",
+                commit_sha=pull.get("head_sha"),
+                cursor_agent_id=review.get("agent_id"),
+                cursor_run_id=review.get("run_id"),
+                status="running",
+                summary="Cursor review queued; auto-merge will run on completion.",
             )
             session.add(row)
             session.flush()
@@ -667,8 +669,9 @@ async def assign_pulls_to_devin_review(payload: AssignPullsRequest):
                 "pull_id": pull["id"],
                 "ok": True,
                 "review_id": review_id,
-                "status": review.get("status"),
-                "commit_sha": review.get("commit_sha"),
+                "status": "running",
+                "agent_id": review.get("agent_id"),
+                "run_id": review.get("run_id"),
             }
         )
         log_event(
