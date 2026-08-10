@@ -2,8 +2,6 @@
 
 A production-ready automation service that turns **GitHub Issues into merged Pull Requests** using the official [Cursor SDK](https://cursor.com/docs/sdk/python) (`cursor-sdk`) against [Cursor Cloud Agents](https://cursor.com/docs/cloud-agent). Label an issue, and the system dispatches a Cursor agent to implement the fix, run the tests, open a PR, review it with a second Cursor agent, and report back on the issue — with full lifecycle tracking, metrics, and an operations dashboard.
 
-Built for **fintech / digital-banking** engineering teams evaluating autonomous remediation on business-critical codebases (demo target: a fork of [`apache/fineract`](https://github.com/apache/fineract)).
-
 ---
 
 ## Project Overview
