@@ -42,3 +42,4 @@ BODY
 )"
 
 echo "Created issues with label: $LABEL"
+

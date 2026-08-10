@@ -124,3 +124,5 @@ class TestWebhookEndpoint:
     def test_malformed_payload_422(self, client):
         resp = self.post(client, {"action": "opened", "issue": {}, "repository": {}})
         assert resp.status_code == 422
+
+

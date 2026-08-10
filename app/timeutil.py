@@ -41,3 +41,5 @@ def sgt_date(value: datetime | None) -> date | None:
 
 def now_sgt() -> datetime:
     return datetime.now(SGT)
+
+

@@ -91,3 +91,5 @@ def test_review_runtime_ignores_non_cursor_reviews():
         {"user": {"login": "bob"}, "submitted_at": "2026-08-02T15:00:00Z"},
     ]
     assert review_runtime_from_github_reviews(reviews) is None
+
+

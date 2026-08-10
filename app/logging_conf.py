@@ -35,3 +35,5 @@ def setup_logging(level: str = "INFO") -> None:
 def log_event(logger: logging.Logger, level: int, event: str, **ctx) -> None:
     """Log a named event with structured context fields."""
     logger.log(level, event, extra={"ctx": ctx})
+
+

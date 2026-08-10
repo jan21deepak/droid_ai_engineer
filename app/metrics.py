@@ -399,3 +399,5 @@ def recent_activity(
         "total": total,
         "total_pages": total_pages,
     }
+
+
