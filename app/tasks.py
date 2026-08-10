@@ -7,6 +7,7 @@ from app.cursor_client import CursorClient, build_prompt
 from app.database import db_session
 from app.logging_conf import log_event
 from app.models import Task, TaskStatus
+from app.repos import resolve_agent_launch_config
 
 logger = logging.getLogger("app.tasks")
 
@@ -75,13 +76,18 @@ async def create_and_dispatch_task(
         log_event(logger, logging.WARNING, "cursor.not_configured", task_id=task_id)
         return {"task_id": task_id, "agent_id": None, "run_id": None, "status": status}
 
+    launch = resolve_agent_launch_config(repository=repository, repository_url=repository_url)
     prompt = build_prompt(repository_url, issue_number, issue_title, issue_body or "")
     try:
         result = await cursor.create_agent(
             prompt,
             repository_url=repository_url,
             name=f"{repository}#{issue_number}: {issue_title}"[:80],
-            auto_create_pr=True,
+            # Forge opens same-repo PRs via PAT. Cursor autoCreatePR on forks
+            # often targets the upstream parent and fails permissions.
+            auto_create_pr=False,
+            environment=launch.get("environment"),
+            starting_ref=launch.get("starting_ref"),
         )
         agent_id = result.get("agent_id")
         run_id = result.get("run_id")
@@ -94,6 +100,7 @@ async def create_and_dispatch_task(
         log_event(
             logger, logging.INFO, "cursor.agent_linked",
             task_id=task_id, agent_id=agent_id, run_id=run_id,
+            environment=launch.get("environment"),
         )
     except Exception as exc:
         with db_session() as session:
@@ -103,6 +110,7 @@ async def create_and_dispatch_task(
         log_event(
             logger, logging.ERROR, "cursor.agent_create_failed",
             task_id=task_id, error=str(exc),
+            environment=launch.get("environment"),
         )
         raise TaskCreateError(
             "Cursor agent creation failed",
@@ -110,4 +118,10 @@ async def create_and_dispatch_task(
             task_id=task_id,
         ) from exc
 
-    return {"task_id": task_id, "agent_id": agent_id, "run_id": run_id, "status": status}
+    return {
+        "task_id": task_id,
+        "agent_id": agent_id,
+        "run_id": run_id,
+        "status": status,
+        "environment": launch.get("environment"),
+    }

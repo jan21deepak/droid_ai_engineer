@@ -10,6 +10,7 @@ from app.cursor_client import (
     build_follow_up_prompt,
     build_prompt,
     build_review_prompt,
+    extract_agent_branch,
     extract_pull_request_url,
     map_run_status,
     _run_to_dict,
@@ -25,6 +26,7 @@ class TestPrompt:
         assert "Fix bug" in prompt
         assert "Details here" in prompt
         assert "pull request" in prompt.lower()
+        assert "upstream" in prompt.lower()
         assert "test" in prompt.lower()
 
     def test_prompt_empty_body(self):
@@ -91,6 +93,38 @@ class TestExtractPr:
         }
         assert extract_pull_request_url(run) == "https://github.com/org/repo/pull/9"
 
+    def test_extract_branch_from_git(self):
+        run = {
+            "git": {
+                "branches": [
+                    {
+                        "repoUrl": "github.com/org/repo",
+                        "branch": "cursor/android-switcher-height-0e0c",
+                        "prUrl": "",
+                    }
+                ]
+            }
+        }
+        assert extract_agent_branch(run) == "cursor/android-switcher-height-0e0c"
+
+    def test_extract_branch_from_result_text(self):
+        run = {
+            "result": (
+                "Branch cursor/android-switcher-height-0e0c is pushed, but PR "
+                "creation failed due to repository permissions (must be a collaborator)."
+            )
+        }
+        assert extract_agent_branch(run) == "cursor/android-switcher-height-0e0c"
+
+    def test_extract_branch_from_manual_pull_new_link(self):
+        run = {
+            "result": (
+                "PR creation failed due to repository permissions. Open it manually:\n"
+                "https://github.com/jan21deepak/omnigent/pull/new/cursor/fix-project-hover-new-session-5c45"
+            )
+        }
+        assert extract_agent_branch(run) == "cursor/fix-project-hover-new-session-5c45"
+
     def test_run_to_dict_from_sdk_objects(self):
         branch = SimpleNamespace(
             repo_url="github.com/org/repo",
@@ -151,6 +185,113 @@ class TestClientSdk:
         assert create_kwargs["api_key"] == "crsr_test"
         assert create_kwargs["model"] == "composer-2.5"
         assert create_kwargs["cloud"].auto_create_pr is True
+        assert create_kwargs["cloud"].env is None
+        assert create_kwargs["cloud"].repos[0].url == "https://github.com/org/repo"
+
+    @pytest.mark.asyncio
+    async def test_create_agent_uses_named_environment(self, monkeypatch):
+        fake_run = SimpleNamespace(
+            id="run-2",
+            agent_id="bc-env",
+            status="running",
+            result="",
+            duration_ms=0,
+            git=None,
+            created_at=None,
+        )
+        fake_agent = MagicMock()
+        fake_agent.agent_id = "bc-env"
+        fake_agent.send.return_value = fake_run
+        create_mock = MagicMock(return_value=fake_agent)
+        monkeypatch.setattr("app.cursor_client.Agent.create", create_mock)
+
+        client = CursorClient(api_key="crsr_test", model="composer-2.5")
+        result = await client.create_agent(
+            "do the thing",
+            repository_url="https://github.com/jan21deepak/omnigent",
+            name="omnigent-fix",
+            environment="omnigent",
+        )
+        assert result["agent_id"] == "bc-env"
+        assert result["environment"] == "omnigent"
+        cloud = create_mock.call_args.kwargs["cloud"]
+        assert cloud.env is not None
+        assert cloud.env.type == "cloud"
+        assert cloud.env.name == "omnigent"
+        assert cloud.repos is None
+
+    @pytest.mark.asyncio
+    async def test_review_agent_keeps_repos_even_with_environment(self, monkeypatch):
+        fake_run = SimpleNamespace(
+            id="run-3",
+            agent_id="bc-rev",
+            status="running",
+            result="",
+            duration_ms=0,
+            git=None,
+            created_at=None,
+        )
+        fake_agent = MagicMock()
+        fake_agent.agent_id = "bc-rev"
+        fake_agent.send.return_value = fake_run
+        create_mock = MagicMock(return_value=fake_agent)
+        monkeypatch.setattr("app.cursor_client.Agent.create", create_mock)
+
+        client = CursorClient(api_key="crsr_test")
+        await client.create_review_agent(
+            repository_url="https://github.com/jan21deepak/omnigent",
+            pr_url="https://github.com/jan21deepak/omnigent/pull/9",
+            environment="omnigent",
+        )
+        cloud = create_mock.call_args.kwargs["cloud"]
+        assert cloud.env is None
+        assert cloud.repos[0].pr_url.endswith("/pull/9")
+        assert cloud.auto_create_pr is False
+
+    @pytest.mark.asyncio
+    async def test_list_environments_dedupes_named_envs(self, monkeypatch):
+        class FakeResponse:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {
+                    "items": [
+                        {
+                            "env": {"type": "cloud", "name": "omnigent"},
+                            "repos": [{"url": "https://github.com/jan21deepak/omnigent"}],
+                        },
+                        {
+                            "env": {"type": "cloud", "name": "superset"},
+                            "repos": [{"url": "https://github.com/jan21deepak/superset"}],
+                        },
+                        {
+                            "env": {"type": "cloud", "name": "omnigent"},
+                            "repos": [{"url": "https://github.com/jan21deepak/omnigent"}],
+                        },
+                        {"env": {"type": "cloud"}},
+                    ]
+                }
+
+        class FakeClient:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def get(self, *args, **kwargs):
+                return FakeResponse()
+
+        monkeypatch.setattr("app.cursor_client.httpx.Client", FakeClient)
+        client = CursorClient(api_key="crsr_test")
+        envs = await client.list_environments()
+        assert [e["name"] for e in envs] == ["omnigent", "superset"]
+        assert envs[0]["repositories"] == ["https://github.com/jan21deepak/omnigent"]
+
 
     @pytest.mark.asyncio
     async def test_get_agent_status_from_sdk_run(self, monkeypatch):

@@ -29,6 +29,12 @@ class Settings(BaseSettings):
     poll_interval_seconds: int = 20
     trigger_label: str = "Cursor-complete"
 
+    # When True, forge squash-merges (or enables GitHub auto-merge) after the
+    # Cursor review agent finishes. Leave False so Bugbot / humans can review.
+    review_auto_merge: bool = False
+    # Comment ``bugbot run`` on each forge-opened PR so Cursor Bugbot picks it up.
+    bugbot_trigger_on_pr: bool = True
+
     # ROI / productivity assumptions (leadership dashboard)
     junior_swe_annual_cost_usd: float = 150_000.0
     junior_hours_per_issue: float = 4.0

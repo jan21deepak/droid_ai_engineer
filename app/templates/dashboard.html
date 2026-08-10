@@ -43,8 +43,10 @@
             <div class="card shadow-sm border-0 mb-4">
                 <div class="card-body">
                     <h5 class="card-title mb-3">Add GitHub repository</h5>
-                    <form id="add-repo-form" class="row g-2 align-items-center">
+                    <p class="text-muted small">After adding, set the Cursor environment on the repository row below (starting ref defaults to <code>main</code>).</p>
+                    <form id="add-repo-form" class="row g-2 align-items-end">
                         <div class="col-md-9">
+                            <label class="form-label small text-muted mb-1" for="repo-url">Repository</label>
                             <input type="text" class="form-control" id="repo-url" required
                                    placeholder="https://github.com/owner/repo or owner/repo">
                         </div>
@@ -66,7 +68,7 @@
                         <thead>
                         <tr>
                             <th>Repository</th>
-                            <th>Description</th>
+                            <th>Cursor environment</th>
                             <th>Added</th>
                             <th class="text-end">Actions</th>
                         </tr>

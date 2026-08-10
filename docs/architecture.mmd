@@ -1,19 +1,22 @@
 flowchart LR
     ISSUE["GitHub Issue<br/>labeled Cursor-complete"]
-    WEBHOOK["Cursor Forge FastAPI<br/>POST /webhook - validate HMAC"]
-    DB[("SQLite<br/>Task store")]
-    API["Cursor SDK<br/>cursor-sdk Cloud Agents"]
-    SESSION["Cursor Cloud Agent<br/>plan, code, test"]
+    WEBHOOK["Cursor Forge FastAPI<br/>POST /webhook / Assign"]
+    DB[("SQLite<br/>Task + Repo store<br/>cursor_environment per repo")]
+    ENV["Per-repo Cursor Environment<br/>Omnigent / Superset / …"]
+    API["Cursor SDK<br/>CloudEnvironment + Agent.create"]
+    SESSION["Cursor Cloud Agent<br/>plan, code, test<br/>in that repo's env"]
     WORKER["Background Worker<br/>polls SDK runs"]
-    PR["Pull Request"]
+    PR["Pull Request<br/>autoCreatePR or PAT fallback"]
     REVIEW["Cursor Review Agent<br/>on PR"]
     COMMENT["GitHub Comment<br/>issue + merge tracking"]
     DASH["Dashboard<br/>GET /dashboard"]
     METRICS["Metrics<br/>GET /metrics"]
 
-    ISSUE -->|"webhook"| WEBHOOK
+    ISSUE -->|"webhook / assign"| WEBHOOK
     WEBHOOK -->|"persist Task"| DB
+    DB -->|"lookup cursor_environment"| ENV
     WEBHOOK -->|"Agent.create + send"| API
+    ENV -->|"CloudEnvironment name"| API
     API --> SESSION
     SESSION -->|"opens"| PR
     PR --> REVIEW
@@ -24,4 +27,6 @@ flowchart LR
     DB -.-> METRICS
 
     classDef cursor fill:#0ea5e9,stroke:#0369a1,color:#fff
+    classDef env fill:#10b981,stroke:#047857,color:#fff
     class API,SESSION,REVIEW cursor
+    class ENV env

@@ -9,7 +9,7 @@ from pathlib import Path
 
 import httpx
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
@@ -21,8 +21,8 @@ from app.cursor_client import CursorClient
 from app.github import GitHubClient, parse_issue_event, should_trigger, verify_signature
 from app.logging_conf import log_event, setup_logging
 from app.metrics import compute_metrics, recent_activity
-from app.models import Repository, ReviewTask, SyncedIssue, SyncedPullRequest, Task, TaskStatus
-from app.repos import parse_repository_ref
+from app.models import Repository, SyncedIssue, SyncedPullRequest, Task, TaskStatus
+from app.repos import parse_repository_ref, resolve_agent_launch_config
 from app.tasks import TaskCreateError, create_and_dispatch_task
 from app.worker import worker_loop
 
@@ -66,6 +66,25 @@ app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="stat
 
 class AddRepositoryRequest(BaseModel):
     url: str = Field(..., description="GitHub repository URL or owner/repo slug")
+    cursor_environment: str = Field(
+        default="",
+        description="Named Cursor Cloud Agent environment for this repository",
+    )
+    starting_ref: str = Field(
+        default="",
+        description="Optional git ref used when no named environment is set",
+    )
+
+
+class UpdateRepositoryRequest(BaseModel):
+    cursor_environment: str | None = Field(
+        default=None,
+        description="Named Cursor Cloud Agent environment for this repository",
+    )
+    starting_ref: str | None = Field(
+        default=None,
+        description="Optional git ref used when no named environment is set",
+    )
 
 
 class AssignIssuesRequest(BaseModel):
@@ -86,17 +105,8 @@ class FollowUpRequest(BaseModel):
 
 @app.get("/")
 async def root():
-    return {
-        "service": "cursor-ai-engineer",
-        "name": "Cursor Forge — The AI Engineer That Delivers",
-        "version": __version__,
-        "description": (
-            "GitHub Issue -> Cursor SDK Cloud Agent (fix + review) automation "
-            "with engineering KPI dashboard"
-        ),
-        "agent_runtime": "cursor-sdk",
-        "links": {"dashboard": "/dashboard", "metrics": "/metrics", "health": "/health"},
-    }
+    """Send browsers to the dashboard UI (JSON API discovery lives under /health)."""
+    return RedirectResponse(url="/dashboard", status_code=307)
 
 
 @app.get("/health")
@@ -198,6 +208,45 @@ async def list_repositories():
         return {"repositories": [r.to_dict() for r in repos]}
 
 
+@app.get("/api/cursor/environments")
+async def list_cursor_environments():
+    """Named Cursor Cloud Agent environments for the dashboard dropdown.
+
+    Cursor has no public list-environments API, so names are discovered from
+    recent agents plus any values already saved on registered repositories.
+    """
+    cursor = CursorClient()
+    discovered = await cursor.list_environments() if cursor.configured else []
+    by_name: dict[str, dict] = {
+        item["name"]: {
+            "name": item["name"],
+            "repositories": list(item.get("repositories") or []),
+            "source": item.get("source") or "cursor",
+        }
+        for item in discovered
+        if item.get("name")
+    }
+
+    with db_session() as session:
+        for repo in session.query(Repository).all():
+            name = (repo.cursor_environment or "").strip()
+            if not name:
+                continue
+            entry = by_name.setdefault(
+                name,
+                {"name": name, "repositories": [], "source": "saved"},
+            )
+            if repo.url and repo.url not in entry["repositories"]:
+                entry["repositories"].append(repo.url)
+            if repo.full_name:
+                full = f"https://github.com/{repo.full_name}"
+                if full not in entry["repositories"] and repo.full_name not in entry["repositories"]:
+                    entry["repositories"].append(repo.full_name)
+
+    environments = sorted(by_name.values(), key=lambda row: row["name"].lower())
+    return {"environments": environments, "count": len(environments)}
+
+
 @app.post("/api/repositories")
 async def add_repository(payload: AddRepositoryRequest):
     full_name = parse_repository_ref(payload.url)
@@ -221,11 +270,44 @@ async def add_repository(payload: AddRepositoryRequest):
             full_name=meta.get("full_name") or full_name,
             url=meta.get("html_url") or f"https://github.com/{full_name}",
             description=(meta.get("description") or "")[:2000],
+            cursor_environment=(payload.cursor_environment or "").strip(),
+            starting_ref=(payload.starting_ref or "").strip()
+            or (meta.get("default_branch") or "main")
+            or "main",
         )
         session.add(repo)
         session.flush()
-        log_event(logger, logging.INFO, "repository.added", repo=repo.full_name)
+        log_event(
+            logger,
+            logging.INFO,
+            "repository.added",
+            repo=repo.full_name,
+            environment=repo.cursor_environment or None,
+        )
         return JSONResponse(status_code=201, content={"repository": repo.to_dict()})
+
+
+@app.patch("/api/repositories/{repo_id}")
+async def update_repository(repo_id: int, payload: UpdateRepositoryRequest):
+    """Update Cursor environment / starting ref for a registered repository."""
+    with db_session() as session:
+        repo = session.get(Repository, repo_id)
+        if not repo:
+            return JSONResponse(status_code=404, content={"detail": "not found"})
+        if payload.cursor_environment is not None:
+            repo.cursor_environment = payload.cursor_environment.strip()
+        if payload.starting_ref is not None:
+            repo.starting_ref = payload.starting_ref.strip()
+        session.flush()
+        log_event(
+            logger,
+            logging.INFO,
+            "repository.updated",
+            repo=repo.full_name,
+            environment=repo.cursor_environment or None,
+            starting_ref=repo.starting_ref or None,
+        )
+        return {"repository": repo.to_dict()}
 
 
 @app.delete("/api/repositories/{repo_id}")
@@ -554,18 +636,11 @@ async def list_synced_pulls():
             .order_by(SyncedPullRequest.repository.asc(), SyncedPullRequest.pr_number.desc())
             .all()
         )
-        active_keys = {
-            (r.repository, r.pr_number)
-            for r in session.query(ReviewTask).filter(
-                ReviewTask.status.in_(
-                    (TaskStatus.QUEUED, TaskStatus.RUNNING, TaskStatus.COMPLETED)
-                )
-            )
-        }
         grouped: dict[str, list] = {}
         for pull in pulls:
             payload = pull.to_dict()
-            payload["assigned"] = (pull.repository, pull.pr_number) in active_keys
+            # Legacy field: previously meant "Cursor review agent active".
+            payload["assigned"] = False
             grouped.setdefault(pull.repository, []).append(payload)
         return {
             "repositories": [
@@ -575,15 +650,11 @@ async def list_synced_pulls():
 
 
 @app.post("/api/pulls/assign")
-async def assign_pulls_to_cursor_review(payload: AssignPullsRequest):
-    """Kick off a Cursor Cloud Agent review for selected PRs and queue auto-merge on completion."""
-    cursor = CursorClient()
-    if not cursor.configured:
-        return JSONResponse(
-            status_code=503,
-            content={"detail": "Cursor API is not configured"},
-        )
+async def assign_pulls_to_bugbot(payload: AssignPullsRequest):
+    """Trigger Cursor Bugbot on selected PRs (comment ``bugbot run``).
 
+    Forge no longer starts Cursor Cloud review agents.
+    """
     with db_session() as session:
         pulls = (
             session.query(SyncedPullRequest)
@@ -591,46 +662,42 @@ async def assign_pulls_to_cursor_review(payload: AssignPullsRequest):
             .all()
         )
         snapshots = [p.to_dict() for p in pulls]
-        active = {
-            (r.repository, r.pr_number)
-            for r in session.query(ReviewTask).filter(
-                ReviewTask.status.in_((TaskStatus.QUEUED, TaskStatus.RUNNING))
-            )
-        }
 
     if not snapshots:
         return JSONResponse(status_code=404, content={"detail": "no matching pull requests"})
 
+    github = GitHubClient()
     results = []
     for pull in snapshots:
-        key = (pull["repository"], pull["pr_number"])
-        if key in active:
+        try:
+            requested = await github.request_bugbot_review(
+                pull["repository"], pull["pr_number"]
+            )
             results.append(
                 {
                     "pull_id": pull["id"],
                     "ok": True,
-                    "detail": "already_running",
+                    "detail": "bugbot_requested" if requested else "bugbot_already_requested",
+                    "pr_number": pull["pr_number"],
                 }
             )
-            continue
-
-        try:
-            review = await cursor.create_review_agent(repository_url=pull["repository_url"] or f"https://github.com/{pull['repository']}", pr_url=pull["html_url"], name=f"Review {pull['repository']}#{pull['pr_number']}")
-        except httpx.HTTPStatusError as exc:
-            detail = "Cursor review agent rejected the request"
-            try:
-                detail = exc.response.json().get("detail") or detail
-            except Exception:
-                pass
-            results.append(
-                {
-                    "pull_id": pull["id"],
-                    "ok": False,
-                    "detail": detail,
-                }
+            log_event(
+                logger,
+                logging.INFO,
+                "bugbot.assigned",
+                repo=pull["repository"],
+                pr=pull["pr_number"],
+                requested=requested,
             )
-            continue
-        except httpx.HTTPError as exc:
+        except Exception as exc:
+            log_event(
+                logger,
+                logging.WARNING,
+                "github.bugbot_trigger_failed",
+                repo=pull["repository"],
+                pr=pull["pr_number"],
+                error=str(exc),
+            )
             results.append(
                 {
                     "pull_id": pull["id"],
@@ -638,63 +705,6 @@ async def assign_pulls_to_cursor_review(payload: AssignPullsRequest):
                     "detail": str(exc),
                 }
             )
-            continue
-
-        with db_session() as session:
-            existing = (
-                session.query(ReviewTask)
-                .filter(
-                    ReviewTask.repository == pull["repository"],
-                    ReviewTask.pr_number == pull["pr_number"],
-                    ReviewTask.status.in_((TaskStatus.QUEUED, TaskStatus.RUNNING)),
-                )
-                .first()
-            )
-            if existing:
-                results.append(
-                    {
-                        "pull_id": pull["id"],
-                        "ok": True,
-                        "detail": "already_running",
-                        "review_id": existing.id,
-                    }
-                )
-                continue
-
-            row = ReviewTask(
-                repository=pull["repository"],
-                repository_url=pull["repository_url"],
-                pr_number=pull["pr_number"],
-                pr_title=pull["title"],
-                pr_url=pull["html_url"],
-                commit_sha=pull.get("head_sha"),
-                cursor_agent_id=review.get("agent_id"),
-                cursor_run_id=review.get("run_id"),
-                status="running",
-                summary="Cursor review queued; auto-merge will run on completion.",
-            )
-            session.add(row)
-            session.flush()
-            review_id = row.id
-
-        results.append(
-            {
-                "pull_id": pull["id"],
-                "ok": True,
-                "review_id": review_id,
-                "status": "running",
-                "agent_id": review.get("agent_id"),
-                "run_id": review.get("run_id"),
-            }
-        )
-        log_event(
-            logger,
-            logging.INFO,
-            "review.assigned",
-            review_id=review_id,
-            repo=pull["repository"],
-            pr=pull["pr_number"],
-        )
 
     accepted = sum(1 for r in results if r.get("ok"))
     return {"detail": "processed", "accepted": accepted, "results": results}

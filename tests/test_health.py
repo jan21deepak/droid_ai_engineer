@@ -1,9 +1,14 @@
 def test_root(client):
-    resp = client.get("/")
+    resp = client.get("/", follow_redirects=False)
+    assert resp.status_code == 307
+    assert resp.headers.get("location") == "/dashboard"
+
+
+def test_dashboard_html(client):
+    resp = client.get("/dashboard")
     assert resp.status_code == 200
-    data = resp.json()
-    assert data["service"] == "cursor-ai-engineer"
-    assert "links" in data
+    assert "text/html" in resp.headers.get("content-type", "")
+    assert b"Cursor Forge" in resp.content
 
 
 def test_health_reports_components(client):

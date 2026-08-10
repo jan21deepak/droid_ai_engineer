@@ -31,6 +31,12 @@ class Repository(Base):
     full_name: Mapped[str] = mapped_column(String(255), unique=True, index=True)
     url: Mapped[str] = mapped_column(String(512), default="")
     description: Mapped[str] = mapped_column(Text, default="")
+    # Named Cursor Cloud Agent environment for this repo (dashboard → Cloud Agents).
+    # When set, fix agents launch with CloudEnvironment(name=...) instead of a bare
+    # repos=[] clone, so Omnigent issues use the Omnigent env, etc.
+    cursor_environment: Mapped[str] = mapped_column(String(255), default="")
+    # Optional starting git ref for agents when not using a named environment.
+    starting_ref: Mapped[str] = mapped_column(String(255), default="")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )
@@ -41,6 +47,8 @@ class Repository(Base):
             "full_name": self.full_name,
             "url": self.url,
             "description": self.description,
+            "cursor_environment": self.cursor_environment or "",
+            "starting_ref": self.starting_ref or "",
             "created_at": iso_sgt(self.created_at),
             "created_at_display": format_sgt(self.created_at),
         }

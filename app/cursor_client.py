@@ -8,12 +8,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from typing import Any
 
+import httpx
 from cursor_sdk import (
     Agent,
     AgentOptions,
     CloudAgentOptions,
+    CloudEnvironment,
     CloudRepository,
     Cursor,
     CursorAgentError,
@@ -39,8 +42,9 @@ Requirements:
 - Make only the requested changes described in the issue.
 - Run the project's test suite (or the closest relevant subset if the full suite is impractical).
 - Fix any failures introduced by your changes.
-- Create a pull request with a clear title and description referencing issue #{issue_number}.
-- Summarize the completed work at the end.
+- Push your work to a new branch on THIS repository ({repository_url}).
+- Do NOT open a pull request against an upstream / parent repository. If this repo is a fork, keep all branches and PRs inside the fork only (base = this fork's default branch). Prefer leaving PR creation to automation when unsure.
+- Summarize the completed work and the branch name at the end.
 """
 
 REVIEW_PROMPT_TEMPLATE = """Review the pull request at {pr_url} in repository {repository_url}.
@@ -140,6 +144,40 @@ def extract_pull_request_url(run_or_agent: dict) -> str | None:
     return None
 
 
+def extract_agent_branch(run_or_agent: dict) -> str | None:
+    """Return the first agent branch name from a normalized run dict."""
+    git = run_or_agent.get("git") or {}
+    branches = git.get("branches") or []
+    for item in branches:
+        if isinstance(item, dict):
+            branch = item.get("branch") or ""
+            if branch:
+                return branch
+    for key in ("run", "latestRun", "latest_run"):
+        nested = run_or_agent.get(key)
+        if isinstance(nested, dict):
+            found = extract_agent_branch(nested)
+            if found:
+                return found
+    # Fallback: Cursor often writes the branch into the run result when PR create fails.
+    result = run_or_agent.get("result") or ""
+    if isinstance(result, str) and result:
+        match = re.search(r"\bBranch\s+(cursor/[A-Za-z0-9._/-]+)\b", result)
+        if match:
+            return match.group(1)
+        # Manual compare links: .../pull/new/cursor/branch-name
+        match = re.search(
+            r"github\.com/[^/\s]+/[^/\s]+/pull/new/(cursor/[A-Za-z0-9._/-]+)",
+            result,
+        )
+        if match:
+            return match.group(1)
+        match = re.search(r"\b(cursor/[A-Za-z0-9._/-]+)\b", result)
+        if match:
+            return match.group(1)
+    return None
+
+
 def agent_web_url(agent_id: str | None, agent_url: str | None = None) -> str | None:
     if agent_url:
         return agent_url
@@ -216,7 +254,27 @@ class CursorClient:
         starting_ref: str | None,
         auto_create_pr: bool,
         pr_url: str | None,
+        environment: str | None,
     ) -> CloudAgentOptions:
+        """Build CloudAgentOptions for the target OSS repo.
+
+        Named Cursor environments (``env.name``) already bind a repository +
+        install/snapshot config. The Cloud Agents API treats a named cloud
+        environment as mutually exclusive with an explicit ``repos`` list, so
+        when ``environment`` is set we select that env and omit ``repos``.
+
+        PR review agents still need ``repos[].pr_url`` to attach to the pull
+        request branch, so reviews keep the ``repos`` path even when a named
+        environment exists for the repo.
+        """
+        env_name = (environment or "").strip() or None
+        if env_name and not pr_url:
+            return CloudAgentOptions(
+                env=CloudEnvironment(type="cloud", name=env_name),
+                auto_create_pr=auto_create_pr,
+                skip_reviewer_request=True,
+            )
+
         repo = CloudRepository(
             url=repository_url,
             starting_ref=None if pr_url else (starting_ref or self._default_starting_ref()),
@@ -240,23 +298,27 @@ class CursorClient:
         starting_ref: str | None,
         auto_create_pr: bool,
         pr_url: str | None,
+        environment: str | None,
     ) -> dict:
+        cloud = self._cloud_options(
+            repository_url=repository_url,
+            starting_ref=starting_ref,
+            auto_create_pr=auto_create_pr,
+            pr_url=pr_url,
+            environment=environment,
+        )
         agent = Agent.create(
             model=self.model,
             api_key=self.api_key,
             name=self._display_name(name),
-            cloud=self._cloud_options(
-                repository_url=repository_url,
-                starting_ref=starting_ref,
-                auto_create_pr=auto_create_pr,
-                pr_url=pr_url,
-            ),
+            cloud=cloud,
         )
         try:
             run = agent.send(prompt)
             agent_id = agent.agent_id
             run_id = run.id
             url = agent_web_url(agent_id)
+            env_name = (environment or "").strip() or None
             log_event(
                 logger,
                 logging.INFO,
@@ -265,12 +327,15 @@ class CursorClient:
                 run_id=run_id,
                 url=url,
                 auto_create_pr=auto_create_pr,
+                environment=env_name,
+                repository_url=repository_url,
                 sdk="cursor-sdk",
             )
             return {
                 "agent_id": agent_id,
                 "run_id": run_id,
                 "url": url,
+                "environment": env_name,
                 "agent": {"id": agent_id, "url": url},
                 "run": _run_to_dict(run),
                 "raw": {"sdk": True},
@@ -290,8 +355,14 @@ class CursorClient:
         starting_ref: str | None = None,
         auto_create_pr: bool = True,
         pr_url: str | None = None,
+        environment: str | None = None,
     ) -> dict:
-        """Create a Cloud Agent via the SDK and enqueue the first run (no wait)."""
+        """Create a Cloud Agent via the SDK and enqueue the first run (no wait).
+
+        Pass ``environment`` (Cursor Cloud Agents dashboard env name) so the
+        agent boots the OSS repo's configured environment rather than a bare
+        clone / the forge app's own environment.
+        """
         try:
             return await asyncio.to_thread(
                 self._create_agent_sync,
@@ -301,6 +372,7 @@ class CursorClient:
                 starting_ref=starting_ref,
                 auto_create_pr=auto_create_pr,
                 pr_url=pr_url,
+                environment=environment,
             )
         except CursorAgentError as exc:
             log_event(
@@ -309,6 +381,8 @@ class CursorClient:
                 "cursor.agent_create_failed",
                 error=str(exc),
                 retryable=getattr(exc, "is_retryable", None),
+                environment=(environment or "").strip() or None,
+                repository_url=repository_url,
             )
             raise
 
@@ -318,6 +392,8 @@ class CursorClient:
         repository_url: str,
         pr_url: str,
         name: str | None = None,
+        environment: str | None = None,
+        starting_ref: str | None = None,
     ) -> dict:
         prompt = build_review_prompt(repository_url, pr_url)
         return await self.create_agent(
@@ -326,6 +402,10 @@ class CursorClient:
             name=name or f"Review {pr_url}",
             auto_create_pr=False,
             pr_url=pr_url,
+            # Reviews keep repos+pr_url for branch targeting; environment is
+            # accepted for API symmetry but not applied while pr_url is set.
+            environment=environment,
+            starting_ref=starting_ref,
         )
 
     def _get_run_sync(self, agent_id: str, run_id: str):
@@ -437,6 +517,74 @@ class CursorClient:
         if not self.configured:
             return False
         return await asyncio.to_thread(self._check_connectivity_sync)
+
+    def _list_environments_sync(self, *, limit: int = 50) -> list[dict]:
+        """Discover named cloud environments from recent Cloud Agents.
+
+        Cursor does not expose a public list-environments endpoint yet, so we
+        collect distinct ``env.name`` values from agents the API key can see.
+        """
+        if not self.api_key:
+            return []
+
+        names: dict[str, dict] = {}
+        try:
+            with httpx.Client(timeout=30.0) as client:
+                resp = client.get(
+                    f"{self.api_base.rstrip('/')}/v1/agents",
+                    params={"limit": max(1, min(limit, 100))},
+                    auth=(self.api_key, ""),
+                )
+                resp.raise_for_status()
+                payload = resp.json() or {}
+        except Exception as exc:
+            log_event(
+                logger,
+                logging.WARNING,
+                "cursor.environments_list_failed",
+                error=str(exc),
+            )
+            return []
+
+        items = payload.get("items") or payload.get("agents") or []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            env = item.get("env") or {}
+            name = (env.get("name") or "").strip() if isinstance(env, dict) else ""
+            if not name:
+                continue
+            repos = item.get("repos") or []
+            repo_url = ""
+            if repos and isinstance(repos[0], dict):
+                repo_url = repos[0].get("url") or ""
+            source = item.get("source") or {}
+            if not repo_url and isinstance(source, dict):
+                repo_url = source.get("repository") or ""
+            entry = names.setdefault(
+                name,
+                {"name": name, "repositories": set(), "source": "cursor"},
+            )
+            if repo_url:
+                entry["repositories"].add(repo_url)
+
+        result = []
+        for name in sorted(names, key=str.lower):
+            entry = names[name]
+            result.append(
+                {
+                    "name": name,
+                    "repositories": sorted(entry["repositories"]),
+                    "source": "cursor",
+                }
+            )
+        return result
+
+    async def list_environments(self, *, limit: int = 50) -> list[dict]:
+        """Return named Cursor Cloud Agent environments visible to this API key."""
+        if not self.configured:
+            return []
+        return await asyncio.to_thread(self._list_environments_sync, limit=limit)
 
     @staticmethod
     def shutdown() -> None:

@@ -490,7 +490,7 @@ def test_add_issues_imports_five_from_parent_and_syncs(client, monkeypatch):
     assert len(grouped[0]["issues"]) == 5
 
 
-def test_list_and_assign_pulls_to_cursor_review(client, monkeypatch):
+def test_list_and_assign_pulls_triggers_bugbot(client, monkeypatch):
     with db_session() as session:
         repo = Repository(
             full_name="jan21deepak/superset",
@@ -512,21 +512,18 @@ def test_list_and_assign_pulls_to_cursor_review(client, monkeypatch):
             }
         ]
 
-    async def fake_create_review_agent(self, **kwargs):
-        return {
-            "agent_id": "bc-review",
-            "run_id": "run-review",
-            "url": "https://cursor.com/agents/bc-review",
-        }
+    bugbot_calls = []
+
+    async def fake_request_bugbot(self, repository, pr_number):
+        bugbot_calls.append((repository, pr_number))
+        return True
 
     monkeypatch.setattr(
         "app.github.GitHubClient.list_open_pull_requests", fake_list_open_pull_requests
     )
     monkeypatch.setattr(
-        "app.cursor_client.CursorClient.create_review_agent", fake_create_review_agent
+        "app.github.GitHubClient.request_bugbot_review", fake_request_bugbot
     )
-    monkeypatch.setenv("CURSOR_API_KEY", "cursor_test")
-    get_settings.cache_clear()
 
     listed = client.get("/api/pulls").json()
     assert len(listed["repositories"]) == 1
@@ -538,9 +535,5 @@ def test_list_and_assign_pulls_to_cursor_review(client, monkeypatch):
     body = assigned.json()
     assert body["accepted"] == 1
     assert body["results"][0]["ok"] is True
-
-    with db_session() as session:
-        reviews = session.query(ReviewTask).all()
-        assert len(reviews) == 1
-        assert reviews[0].pr_number == 3
-        assert reviews[0].status == TaskStatus.RUNNING
+    assert body["results"][0]["detail"] == "bugbot_requested"
+    assert bugbot_calls == [("jan21deepak/superset", 3)]

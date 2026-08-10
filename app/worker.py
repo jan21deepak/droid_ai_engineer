@@ -7,11 +7,12 @@ from datetime import datetime, timedelta, timezone
 import httpx
 
 from app.config import get_settings
-from app.cursor_client import CursorClient
+from app.cursor_client import CursorClient, extract_agent_branch
 from app.database import db_session
 from app.github import GitHubClient
 from app.logging_conf import log_event
 from app.models import ReviewTask, Task, TaskStatus
+from app.repos import resolve_agent_launch_config
 from app.timeutil import format_sgt
 
 logger = logging.getLogger("app.worker")
@@ -103,6 +104,112 @@ def _parse_pr_number(pr_url: str) -> int | None:
     return None
 
 
+async def ensure_pull_request_for_task(
+    task: Task,
+    run_data: dict,
+    github: GitHubClient,
+) -> str | None:
+    """Open a same-repo PR with the forge GitHub token after the agent pushes a branch.
+
+    Issue-fix agents run with ``auto_create_pr=False`` so Cursor does not try
+    to open a PR against an upstream parent of a fork. The forge PAT opens the
+    PR *within* ``task.repository`` (``head=owner:branch``, base = fork default /
+    starting_ref) so review + merge tracking can continue.
+    """
+    if task.pull_request_url:
+        return task.pull_request_url
+
+    branch = extract_agent_branch(run_data)
+    if not branch:
+        return None
+
+    repository = task.repository
+    existing = await github.find_open_pull_request_for_head(repository, branch)
+    if existing and existing.get("html_url"):
+        log_event(
+            logger,
+            logging.INFO,
+            "github.pr_reused",
+            task_id=task.id,
+            repo=repository,
+            branch=branch,
+            url=existing.get("html_url"),
+        )
+        pr_number = int(existing.get("number") or 0) or _parse_pr_number(existing["html_url"])
+        if pr_number:
+            await github.request_bugbot_review(repository, pr_number)
+        return existing["html_url"]
+
+    launch = resolve_agent_launch_config(
+        repository=repository,
+        repository_url=task.repository_url,
+    )
+    base = launch.get("starting_ref")
+    if not base:
+        try:
+            meta = await github.get_repository(repository)
+            base = meta.get("default_branch") or "main"
+        except Exception:
+            base = get_settings().cursor_starting_ref or "main"
+
+    title = task.issue_title or f"Fix #{task.issue_number}"
+    if task.issue_number and f"#{task.issue_number}" not in title:
+        title = f"{title} (#{task.issue_number})"
+    body_parts = [
+        f"Opened automatically by Cursor Forge as a **same-repo** PR on `{repository}`",
+        f"after the Cloud Agent pushed `{branch}` (not against an upstream parent).",
+        "",
+        f"Fixes #{task.issue_number}." if task.issue_number else "",
+        "",
+        f"Cursor agent: `{task.cursor_agent_id}`",
+    ]
+    body = "\n".join(part for part in body_parts if part is not None).strip()
+
+    try:
+        pr = await github.create_pull_request(
+            repository,
+            title=title[:250],
+            head=branch,
+            base=base,
+            body=body,
+            same_repo=True,
+        )
+    except httpx.HTTPStatusError as exc:
+        # Race: PR may have been created between find and create.
+        if exc.response.status_code == 422:
+            existing = await github.find_open_pull_request_for_head(repository, branch)
+            if existing and existing.get("html_url"):
+                return existing["html_url"]
+        log_event(
+            logger,
+            logging.WARNING,
+            "github.pr_fallback_failed",
+            task_id=task.id,
+            repo=repository,
+            branch=branch,
+            base=base,
+            error=str(exc),
+        )
+        return None
+    except Exception as exc:
+        log_event(
+            logger,
+            logging.WARNING,
+            "github.pr_fallback_failed",
+            task_id=task.id,
+            repo=repository,
+            branch=branch,
+            error=str(exc),
+        )
+        return None
+
+    pr_url = pr.get("html_url")
+    pr_number = int(pr.get("number") or 0) or _parse_pr_number(pr_url or "")
+    if pr_number:
+        await github.request_bugbot_review(repository, pr_number)
+    return pr_url
+
+
 def review_runtime_from_github_reviews(
     reviews: list[dict],
     review_created_at: datetime | None = None,
@@ -160,86 +267,22 @@ async def ensure_review_for_pr(
     cursor: CursorClient,
     github: GitHubClient | None = None,
 ) -> None:
-    """Start a Cursor review agent for a completed fix's PR (once)."""
-    pr_url = task.pull_request_url
-    if not pr_url:
-        return
-    pr_number = _parse_pr_number(pr_url)
-    if not pr_number:
-        return
+    """Deprecated: forge no longer starts Cursor review agents.
 
-    with db_session() as session:
-        existing = (
-            session.query(ReviewTask)
-            .filter(
-                ReviewTask.repository == task.repository,
-                ReviewTask.pr_number == pr_number,
-            )
-            .first()
-        )
-        if existing:
-            return
-
-    if not cursor.configured:
-        return
-
-    try:
-        created = await cursor.create_review_agent(
-            repository_url=task.repository_url or f"https://github.com/{task.repository}",
-            pr_url=pr_url,
-            name=f"Review {task.repository}#{pr_number}",
-        )
-    except Exception as exc:
-        log_event(
-            logger,
-            logging.WARNING,
-            "review.create_failed",
-            pr_url=pr_url,
-            error=str(exc),
-        )
-        return
-
-    agent_id = created.get("agent_id")
-    run_id = created.get("run_id")
-    settings = get_settings()
-
-    with db_session() as session:
-        again = (
-            session.query(ReviewTask)
-            .filter(
-                ReviewTask.repository == task.repository,
-                ReviewTask.pr_number == pr_number,
-            )
-            .first()
-        )
-        if again:
-            return
-        row = ReviewTask(
-            repository=task.repository,
-            repository_url=task.repository_url,
-            pr_number=pr_number,
-            pr_title=task.issue_title or f"PR #{pr_number}",
-            pr_url=pr_url,
-            cursor_agent_id=agent_id,
-            cursor_run_id=run_id,
-            status=TaskStatus.RUNNING,
-            summary="Tracking Cursor Cloud Agent review",
-            cost_usd=settings.cursor_usd_per_agent_run or None,
-        )
-        session.add(row)
-    log_event(
-        logger,
-        logging.INFO,
-        "review.tracked",
-        repo=task.repository,
-        pr=pr_number,
-        agent_id=agent_id,
-        run_id=run_id,
-    )
+    PR review is handled by Cursor Bugbot via ``request_bugbot_review``.
+    Kept as a no-op so older callers/tests that monkeypatch this name still work.
+    """
+    return
 
 
 async def _attempt_auto_merge(github: GitHubClient, review: ReviewTask) -> tuple[bool, bool, str | None]:
-    """Try to merge immediately; fall back to enabling GitHub auto-merge."""
+    """Try to merge immediately; fall back to enabling GitHub auto-merge.
+
+    No-op when ``Settings.review_auto_merge`` is False (default) so Bugbot /
+    humans can review before merge.
+    """
+    if not get_settings().review_auto_merge:
+        return False, False, None
     try:
         await github.merge_pull_request(
             review.repository,
@@ -386,16 +429,17 @@ async def poll_reviews_once(
             if new_status == TaskStatus.COMPLETED:
                 summary = run_data.get("result") or f"Cursor review completed for {review.pr_url}"
                 cost_usd = settings.cursor_usd_per_agent_run or None
-                merged, auto_merge, error = await _attempt_auto_merge(github, review)
-                if error and not merged and not auto_merge:
-                    log_event(
-                        logger,
-                        logging.WARNING,
-                        "review.merge_deferred",
-                        review_id=review.id,
-                        error=error,
-                    )
-                    error = None
+                if settings.review_auto_merge:
+                    merged, auto_merge, error = await _attempt_auto_merge(github, review)
+                    if error and not merged and not auto_merge:
+                        log_event(
+                            logger,
+                            logging.WARNING,
+                            "review.merge_deferred",
+                            review_id=review.id,
+                            error=error,
+                        )
+                        error = None
             else:
                 error = f"Cursor review status: {run_data.get('status')}"
 
@@ -459,7 +503,7 @@ async def poll_reviews_once(
             )
         elif pr.get("state") == "closed" and not pr.get("merged"):
             continue
-        else:
+        elif get_settings().review_auto_merge:
             merged, auto_merge, _ = await _attempt_auto_merge(github, review)
             if merged or auto_merge:
                 with db_session() as session:
@@ -677,6 +721,25 @@ async def poll_once(cursor: CursorClient | None = None, github: GitHubClient | N
                 )
                 if pr_url is None:
                     pr_url = task.pull_request_url
+                # Cursor often pushes the branch but fails PR create (GitHub App
+                # collaborator / scope). Fall back to the forge PAT.
+                if (
+                    not pr_url
+                    and new_status in (TaskStatus.COMPLETED, TaskStatus.FAILED)
+                ):
+                    try:
+                        pr_url = await ensure_pull_request_for_task(task, run_data, github)
+                        if pr_url and new_status == TaskStatus.FAILED:
+                            # Branch + PR means the fix landed; recover the task.
+                            new_status = TaskStatus.COMPLETED
+                    except Exception as exc:
+                        log_event(
+                            logger,
+                            logging.WARNING,
+                            "polling.pr_fallback_error",
+                            task_id=task.id,
+                            error=str(exc),
+                        )
                 # Prefer FINISHED semantics; if PR merged on GitHub, complete early.
                 if task.pr_state == "merged":
                     new_status = TaskStatus.COMPLETED
@@ -770,7 +833,11 @@ async def poll_once(cursor: CursorClient | None = None, github: GitHubClient | N
                     build_completion_comment(refreshed),
                 )
                 if refreshed.pull_request_url:
-                    await ensure_review_for_pr(refreshed, cursor, github)
+                    pr_number = _parse_pr_number(refreshed.pull_request_url)
+                    if pr_number:
+                        await github.request_bugbot_review(
+                            refreshed.repository, pr_number
+                        )
             elif new_status == TaskStatus.FAILED:
                 log_event(
                     logger,
@@ -791,17 +858,13 @@ async def poll_once(cursor: CursorClient | None = None, github: GitHubClient | N
             )
             .all()
         )
-    for task in tasks_with_pr:
-        # Only auto-start review once the fix agent finished (or PR already merged).
-        if task.status == TaskStatus.COMPLETED or task.pr_state == "merged":
-            await ensure_review_for_pr(task, cursor, github)
-
-    review_updated = await poll_reviews_once(cursor, github)
+    # PR review is Bugbot-only (comment ``bugbot run``); forge no longer starts
+    # Cursor Cloud review agents or auto-merges.
     updated += await refresh_pr_states(github, tasks_with_pr)
     updated += await finalize_merged_running_tasks()
     updated += await backfill_durations(cursor, github)
 
-    return updated + review_updated
+    return updated
 
 
 async def worker_loop(stop_event: asyncio.Event) -> None:

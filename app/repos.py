@@ -1,6 +1,9 @@
-"""Helpers for parsing GitHub repository URLs / slugs."""
+"""Helpers for parsing GitHub repository URLs / slugs and agent launch config."""
 
 import re
+
+from app.database import db_session
+from app.models import Repository
 
 _GITHUB_REPO_RE = re.compile(
     r"^(?:https?://)?(?:www\.)?github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?/?$"
@@ -18,3 +21,40 @@ def parse_repository_ref(value: str) -> str | None:
     if re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", raw):
         return raw
     return None
+
+
+def resolve_agent_launch_config(
+    repository: str | None = None,
+    repository_url: str | None = None,
+) -> dict[str, str | None]:
+    """Look up the Cursor environment / starting ref for a registered repo.
+
+    Returns ``{"environment": str|None, "starting_ref": str|None}``. Missing
+    registrations yield empty config so callers fall back to bare ``repos``.
+    """
+    full_name = parse_repository_ref(repository or "") or parse_repository_ref(
+        repository_url or ""
+    )
+    if not full_name and repository and "/" in repository:
+        full_name = repository.strip()
+    if not full_name:
+        return {"environment": None, "starting_ref": None}
+
+    with db_session() as session:
+        row = (
+            session.query(Repository)
+            .filter(Repository.full_name == full_name)
+            .first()
+        )
+        if not row:
+            # Case-insensitive fallback (GitHub full_name is usually canonical).
+            row = (
+                session.query(Repository)
+                .filter(Repository.full_name.ilike(full_name))
+                .first()
+            )
+        if not row:
+            return {"environment": None, "starting_ref": None}
+        environment = (row.cursor_environment or "").strip() or None
+        starting_ref = (row.starting_ref or "").strip() or "main"
+        return {"environment": environment, "starting_ref": starting_ref}

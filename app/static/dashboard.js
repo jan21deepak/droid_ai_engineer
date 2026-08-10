@@ -59,6 +59,37 @@
   }
 
   // ---- Repositories ----
+  let cursorEnvironments = [];
+
+  function environmentOptionsHtml(selected) {
+    const current = (selected || "").trim();
+    const names = cursorEnvironments.map((e) => e.name);
+    const options = ['<option value="">None (bare clone)</option>'];
+    if (current && !names.includes(current)) {
+      options.push(
+        `<option value="${escapeHtml(current)}" selected>${escapeHtml(current)} (saved)</option>`
+      );
+    }
+    for (const env of cursorEnvironments) {
+      const selectedAttr = env.name === current ? " selected" : "";
+      options.push(
+        `<option value="${escapeHtml(env.name)}"${selectedAttr}>${escapeHtml(env.name)}</option>`
+      );
+    }
+    return options.join("");
+  }
+
+  async function loadCursorEnvironments() {
+    try {
+      const res = await fetch("/api/cursor/environments");
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || "Failed to load environments");
+      cursorEnvironments = data.environments || [];
+    } catch (err) {
+      cursorEnvironments = [];
+    }
+  }
+
   async function loadRepos() {
     const tbody = $("#repos-tbody");
     tbody.innerHTML = `<tr><td colspan="4" class="text-center text-muted py-4">Loading…</td></tr>`;
@@ -75,15 +106,21 @@
           (r) => `
         <tr data-repo-id="${r.id}">
           <td>
-            <a href="${r.url}" target="_blank" rel="noopener">${r.full_name}</a>
+            <a href="${r.url}" target="_blank" rel="noopener">${escapeHtml(r.full_name)}</a>
+            <div class="text-muted small text-truncate" style="max-width:280px">${escapeHtml(r.description || "")}</div>
           </td>
-          <td class="text-muted small text-truncate" style="max-width:280px">${r.description || "—"}</td>
+          <td style="min-width:180px">
+            <select class="form-select form-select-sm repo-env-input" data-id="${r.id}"
+                    title="Cursor Cloud Agents environment name">
+              ${environmentOptionsHtml(r.cursor_environment || "")}
+            </select>
+          </td>
           <td class="text-muted small">${r.created_at_display || formatSgt(r.created_at)}</td>
-          <td class="text-end">
+          <td class="text-end text-nowrap">
+            <button class="btn btn-sm btn-outline-primary me-1 save-repo-btn"
+                    data-id="${r.id}">Save</button>
             <button class="btn btn-sm btn-primary me-1 create-issues-open"
-                    data-id="${r.id}" data-repo="${r.full_name}">Add Issues</button>
-            <button class="btn btn-sm btn-outline-secondary me-1 sync-issues-btn"
-                    data-id="${r.id}">Sync</button>
+                    data-id="${r.id}" data-repo="${escapeHtml(r.full_name)}">Add Issues</button>
             <button class="btn btn-sm btn-outline-danger remove-repo-btn" data-id="${r.id}">Remove</button>
           </td>
         </tr>`
@@ -109,7 +146,7 @@
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.detail || "Failed to add repository");
-      showAlert(alert, data.detail === "already registered" ? "Repository already registered." : "Repository added.", "success");
+      showAlert(alert, data.detail === "already registered" ? "Repository already registered." : "Repository added. Set environment on the row below if needed.", "success");
       $("#repo-url").value = "";
       await loadRepos();
     } catch (err) {
@@ -121,9 +158,40 @@
 
   $("#repos-tbody").addEventListener("click", async (e) => {
     const createBtn = e.target.closest(".create-issues-open");
-    const syncBtn = e.target.closest(".sync-issues-btn");
     const removeBtn = e.target.closest(".remove-repo-btn");
+    const saveBtn = e.target.closest(".save-repo-btn");
     const alert = $("#repo-alert");
+    if (saveBtn) {
+      const id = saveBtn.dataset.id;
+      const row = saveBtn.closest("tr");
+      const cursor_environment = row.querySelector(".repo-env-input")?.value.trim() || "";
+      hideAlert(alert);
+      saveBtn.disabled = true;
+      saveBtn.textContent = "Saving…";
+      try {
+        const res = await fetch(`/api/repositories/${id}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ cursor_environment }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || "Failed to update repository");
+        const env = data.repository?.cursor_environment;
+        showAlert(
+          alert,
+          env
+            ? `Saved environment "${env}" for ${data.repository.full_name}.`
+            : `Cleared environment for ${data.repository.full_name}; agents will use a bare repo clone.`,
+          "success"
+        );
+      } catch (err) {
+        showAlert(alert, err.message, "danger");
+      } finally {
+        saveBtn.disabled = false;
+        saveBtn.textContent = "Save";
+      }
+      return;
+    }
     if (createBtn) {
       hideAlert(alert);
       createBtn.disabled = true;
@@ -148,23 +216,6 @@
       }
       return;
     }
-    if (syncBtn) {
-      const id = syncBtn.dataset.id;
-      syncBtn.disabled = true;
-      syncBtn.textContent = "Syncing…";
-      try {
-        const res = await fetch(`/api/repositories/${id}/sync-issues`, { method: "POST" });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.detail || "Sync failed");
-        showAlert(alert, `Synced ${data.count} open issue(s) from ${data.repository}.`, "success");
-        await loadIssues();
-      } catch (err) {
-        showAlert(alert, err.message, "danger");
-      } finally {
-        syncBtn.disabled = false;
-        syncBtn.textContent = "Sync";
-      }
-    }
     if (removeBtn) {
       const id = removeBtn.dataset.id;
       if (!confirm("Remove this repository and its synced issues?")) return;
@@ -174,14 +225,96 @@
     }
   });
 
-  $("#refresh-repos").addEventListener("click", loadRepos);
+  $("#refresh-repos").addEventListener("click", () => {
+    loadCursorEnvironments().then(() => loadRepos());
+  });
 
   // ---- Issues ----
+  const ISSUES_PAGE_SIZE = 10;
+  /** @type {Record<string, number>} */
+  let issuePages = {};
+  /** @type {Array<{repository: string, issues: Array}>} */
+  let issueGroups = [];
+
   function updateAssignButton() {
     const selected = $$(".issue-check:checked:not(:disabled)");
     $("#assign-cursor-btn").disabled = selected.length === 0;
     $("#assign-cursor-btn").textContent =
       selected.length > 0 ? `Assign to Cursor (${selected.length})` : "Assign to Cursor";
+  }
+
+  function renderIssueRow(issue) {
+    const disabled = issue.assigned ? "disabled" : "";
+    const badge = issue.assigned
+      ? `<span class="badge text-bg-secondary badge-assigned">Already assigned</span>`
+      : "";
+    return `
+      <div class="issue-row d-flex align-items-start gap-3 px-3 py-2 border-bottom">
+        <input class="form-check-input mt-1 issue-check" type="checkbox"
+               value="${issue.id}" ${disabled}
+               data-repo="${issue.repository}" data-number="${issue.issue_number}">
+        <div class="flex-grow-1">
+          <div class="d-flex justify-content-between gap-2 flex-wrap">
+            <div>
+              <a href="${issue.html_url}" target="_blank" rel="noopener" class="fw-semibold text-decoration-none">
+                #${issue.issue_number} ${escapeHtml(issue.title)}
+              </a>
+              ${badge}
+            </div>
+          </div>
+          <div class="text-muted small text-truncate" style="max-width:720px">${escapeHtml((issue.body || "").slice(0, 140))}</div>
+        </div>
+      </div>`;
+  }
+
+  function renderIssueGroup(group) {
+    const issues = group.issues || [];
+    const total = issues.length;
+    const pages = Math.max(1, Math.ceil(total / ISSUES_PAGE_SIZE));
+    let page = issuePages[group.repository] || 1;
+    if (page > pages) page = pages;
+    issuePages[group.repository] = page;
+    const start = (page - 1) * ISSUES_PAGE_SIZE;
+    const slice = issues.slice(start, start + ISSUES_PAGE_SIZE);
+    const rows = slice.map(renderIssueRow).join("");
+    const from = total === 0 ? 0 : start + 1;
+    const to = Math.min(start + ISSUES_PAGE_SIZE, total);
+    const pager =
+      total > ISSUES_PAGE_SIZE
+        ? `<div class="d-flex justify-content-between align-items-center gap-2 px-3 py-2 border-top">
+            <span class="text-muted small">${from}–${to} of ${total}</span>
+            <div class="btn-group btn-group-sm" role="group" aria-label="Issue pages">
+              <button type="button" class="btn btn-outline-secondary issues-page-btn"
+                      data-repo="${escapeHtml(group.repository)}" data-page="${page - 1}"
+                      ${page <= 1 ? "disabled" : ""}>Prev</button>
+              <button type="button" class="btn btn-outline-secondary" disabled>${page} / ${pages}</button>
+              <button type="button" class="btn btn-outline-secondary issues-page-btn"
+                      data-repo="${escapeHtml(group.repository)}" data-page="${page + 1}"
+                      ${page >= pages ? "disabled" : ""}>Next</button>
+            </div>
+          </div>`
+        : "";
+    return `
+      <div class="issue-group" data-repo="${escapeHtml(group.repository)}">
+        <div class="issue-group-header d-flex justify-content-between align-items-center">
+          <span>${escapeHtml(group.repository)}</span>
+          <button type="button" class="btn btn-sm btn-outline-secondary select-repo-btn"
+                  data-repo="${escapeHtml(group.repository)}">Select all open</button>
+        </div>
+        ${rows || `<div class="text-muted small p-3">No open issues</div>`}
+        ${pager}
+      </div>`;
+  }
+
+  function renderIssues() {
+    const container = $("#issues-container");
+    if (!issueGroups.length) {
+      container.innerHTML = `<div class="text-center text-muted py-5">No issues yet. Add a repository and click <strong>Add Issues</strong>.</div>`;
+      updateAssignButton();
+      return;
+    }
+    container.innerHTML = issueGroups.map(renderIssueGroup).join("");
+    updateAssignButton();
   }
 
   async function loadIssues() {
@@ -190,51 +323,8 @@
     try {
       const res = await fetch("/api/issues");
       const data = await res.json();
-      const groups = data.repositories || [];
-      if (!groups.length) {
-        container.innerHTML = `<div class="text-center text-muted py-5">No issues yet. Add a repository and click <strong>Add Issues</strong>.</div>`;
-        updateAssignButton();
-        return;
-      }
-      container.innerHTML = groups
-        .map((group) => {
-          const rows = group.issues
-            .map((issue) => {
-              const disabled = issue.assigned ? "disabled" : "";
-              const badge = issue.assigned
-                ? `<span class="badge text-bg-secondary badge-assigned">Already assigned</span>`
-                : "";
-              return `
-              <div class="issue-row d-flex align-items-start gap-3 px-3 py-2 border-bottom">
-                <input class="form-check-input mt-1 issue-check" type="checkbox"
-                       value="${issue.id}" ${disabled}
-                       data-repo="${issue.repository}" data-number="${issue.issue_number}">
-                <div class="flex-grow-1">
-                  <div class="d-flex justify-content-between gap-2 flex-wrap">
-                    <div>
-                      <a href="${issue.html_url}" target="_blank" rel="noopener" class="fw-semibold text-decoration-none">
-                        #${issue.issue_number} ${escapeHtml(issue.title)}
-                      </a>
-                      ${badge}
-                    </div>
-                  </div>
-                  <div class="text-muted small text-truncate" style="max-width:720px">${escapeHtml((issue.body || "").slice(0, 140))}</div>
-                </div>
-              </div>`;
-            })
-            .join("");
-          return `
-            <div class="issue-group">
-              <div class="issue-group-header d-flex justify-content-between align-items-center">
-                <span>${group.repository}</span>
-                <button type="button" class="btn btn-sm btn-outline-secondary select-repo-btn"
-                        data-repo="${group.repository}">Select all open</button>
-              </div>
-              ${rows || `<div class="text-muted small p-3">No open issues</div>`}
-            </div>`;
-        })
-        .join("");
-      updateAssignButton();
+      issueGroups = data.repositories || [];
+      renderIssues();
     } catch (err) {
       container.innerHTML = `<div class="text-center text-danger py-5">Failed to load issues</div>`;
     }
@@ -245,10 +335,19 @@
   });
 
   $("#issues-container").addEventListener("click", (e) => {
+    const pageBtn = e.target.closest(".issues-page-btn");
+    if (pageBtn) {
+      const repo = pageBtn.dataset.repo;
+      const page = Number(pageBtn.dataset.page);
+      if (!repo || !page || page < 1) return;
+      issuePages[repo] = page;
+      renderIssues();
+      return;
+    }
     const btn = e.target.closest(".select-repo-btn");
     if (!btn) return;
     const repo = btn.dataset.repo;
-    $$(`.issue-check[data-repo="${repo}"]:not(:disabled)`).forEach((cb) => {
+    $$(`.issue-check[data-repo="${CSS.escape(repo)}"]:not(:disabled)`).forEach((cb) => {
       cb.checked = true;
     });
     updateAssignButton();
@@ -614,7 +713,7 @@
   }
 
   // Initial load
-  loadRepos();
+  loadCursorEnvironments().then(() => loadRepos());
   loadIssues();
   initTooltips();
   refreshMetrics();
