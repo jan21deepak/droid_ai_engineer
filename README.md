@@ -2,8 +2,6 @@
 
 A production-ready automation service that turns **GitHub Issues into merged Pull Requests** using [Cursor Cloud Agents](https://cursor.com/docs/cloud-agent). Label an issue, and the system dispatches a Cursor agent to implement the fix, run the tests, open a PR, review it with a second Cursor agent, and report back on the issue — with full lifecycle tracking, metrics, and an operations dashboard.
 
-Migrated from the Devin-backed [devin-ai-engineer](https://github.com/jan21deepak/devin-ai-engineer) service; behaviour is the same, backends are Cursor APIs.
-
 Built for engineering teams evaluating autonomous software engineering workflows.
 
 ---
@@ -345,16 +343,18 @@ Structured single-line logs with ISO-8601 **SGT** timestamps and key=value conte
 2026-08-03T11:30:00.123+08:00 | INFO | app.worker | task.completed | task_id=7 agent_id=bc-… pr=https://github.com/… runtime_seconds=734
 ```
 
-## API mapping (Devin → Cursor)
+## Cursor Cloud Agents API
 
-| Former Devin concept | Cursor Forge |
+| Concept | Cursor Forge usage |
 |---|---|
-| Session | Cloud Agent (`bc-…`) + Run (`run-…`) |
-| `POST …/sessions` | `POST /v1/agents` |
-| Poll session | `GET /v1/agents/{id}/runs/{runId}` |
-| Devin Review API | Second Cloud Agent with `prUrl` |
-| `app.devin.ai/sessions/…` | `https://cursor.com/agents/{id}` |
-| Trigger label `Devin-complete` | `Cursor-complete` |
+| Cloud Agent | Durable agent id (`bc-…`) |
+| Run | Per-prompt execution (`run-…`) |
+| Create | `POST /v1/agents` with `autoCreatePR: true` |
+| Poll | `GET /v1/agents/{id}/runs/{runId}` |
+| PR URL | `run.git.branches[].prUrl` |
+| Review | Second Cloud Agent with `repos[0].prUrl` |
+| UI deep link | `https://cursor.com/agents/{id}` |
+| Trigger label | `Cursor-complete` |
 
 Canonical docs: [Cloud Agents API endpoints](https://cursor.com/docs/cloud-agent/api/endpoints).
 
