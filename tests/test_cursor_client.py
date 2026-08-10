@@ -1,30 +1,20 @@
-"""Tests for the Cursor Cloud Agents client."""
+"""Tests for the Cursor SDK-backed client."""
+
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
-import respx
-from httpx import Response
 
 from app.cursor_client import (
     CursorClient,
+    build_follow_up_prompt,
     build_prompt,
     build_review_prompt,
     extract_pull_request_url,
     map_run_status,
+    _run_to_dict,
 )
 from app.models import TaskStatus
-
-API = "https://api.cursor.test"
-
-
-@pytest.fixture
-def cursor():
-    return CursorClient(
-        api_key="cursor_test_key",
-        api_base=API,
-        model="",
-        name_prefix="cursor-forge",
-        max_retries=1,
-    )
 
 
 class TestPrompt:
@@ -48,19 +38,27 @@ class TestPrompt:
         assert "pull/3" in prompt
         assert "review" in prompt.lower()
 
+    def test_follow_up_prompt(self):
+        prompt = build_follow_up_prompt("Fix failing CI")
+        assert "Fix failing CI" in prompt
+
 
 class TestStatusMapping:
     def test_creating_maps_to_queued(self):
         assert map_run_status("CREATING", False) == TaskStatus.QUEUED
+        assert map_run_status("creating", False) == TaskStatus.QUEUED
 
     def test_running_maps_to_running(self):
         assert map_run_status("RUNNING", False) == TaskStatus.RUNNING
+        assert map_run_status("running", False) == TaskStatus.RUNNING
 
     def test_finished_maps_to_completed(self):
         assert map_run_status("FINISHED", True) == TaskStatus.COMPLETED
+        assert map_run_status("finished", True) == TaskStatus.COMPLETED
 
     def test_error_maps_to_failed(self):
         assert map_run_status("ERROR", False) == TaskStatus.FAILED
+        assert map_run_status("error", False) == TaskStatus.FAILED
 
     def test_cancelled_maps_to_failed(self):
         assert map_run_status("CANCELLED", False) == TaskStatus.FAILED
@@ -70,6 +68,12 @@ class TestStatusMapping:
 
     def test_unknown_defaults_to_running(self):
         assert map_run_status("something-new", False) == TaskStatus.RUNNING
+
+    def test_map_review_status(self):
+        assert CursorClient.map_review_status("creating") == TaskStatus.RUNNING
+        assert CursorClient.map_review_status("running") == TaskStatus.RUNNING
+        assert CursorClient.map_review_status("finished") == TaskStatus.COMPLETED
+        assert CursorClient.map_review_status("error") == TaskStatus.FAILED
 
 
 class TestExtractPr:
@@ -87,122 +91,135 @@ class TestExtractPr:
         }
         assert extract_pull_request_url(run) == "https://github.com/org/repo/pull/9"
 
+    def test_run_to_dict_from_sdk_objects(self):
+        branch = SimpleNamespace(
+            repo_url="github.com/org/repo",
+            branch="cursor/fix",
+            pr_url="https://github.com/org/repo/pull/9",
+        )
+        run = SimpleNamespace(
+            id="run-1",
+            agent_id="bc-1",
+            status="finished",
+            result="Done",
+            duration_ms=5000,
+            git=SimpleNamespace(branches=[branch]),
+            created_at="2026-08-10T00:00:00Z",
+        )
+        data = _run_to_dict(run)
+        assert data["id"] == "run-1"
+        assert data["status"] == "finished"
+        assert data["durationMs"] == 5000
+        assert data["git"]["branches"][0]["prUrl"].endswith("/pull/9")
 
-class TestClient:
-    @pytest.mark.asyncio
-    @respx.mock
-    async def test_create_agent(self, cursor):
-        respx.post(f"{API}/v1/agents").mock(
-            return_value=Response(
-                200,
-                json={
-                    "agent": {
-                        "id": "bc-abc123",
-                        "url": "https://cursor.com/agents/bc-abc123",
-                        "latestRunId": "run-1",
-                    },
-                    "run": {"id": "run-1", "status": "CREATING"},
-                },
-            )
-        )
-        result = await cursor.create_agent(
-            "do the thing",
-            repository_url="https://github.com/org/repo",
-            name="test",
-        )
-        assert result["agent_id"] == "bc-abc123"
-        assert result["run_id"] == "run-1"
-        assert "cursor.com/agents" in result["url"]
 
+class TestClientSdk:
     @pytest.mark.asyncio
-    @respx.mock
-    async def test_create_agent_payload(self, cursor):
-        route = respx.post(f"{API}/v1/agents").mock(
-            return_value=Response(
-                200,
-                json={
-                    "agent": {"id": "bc-1", "url": "https://cursor.com/agents/bc-1"},
-                    "run": {"id": "run-1", "status": "CREATING"},
-                },
-            )
+    async def test_create_agent_uses_sdk(self, monkeypatch):
+        fake_run = SimpleNamespace(
+            id="run-1",
+            agent_id="bc-abc",
+            status="running",
+            result="",
+            duration_ms=0,
+            git=None,
+            created_at=None,
         )
-        await cursor.create_agent(
+        fake_agent = MagicMock()
+        fake_agent.agent_id = "bc-abc"
+        fake_agent.send.return_value = fake_run
+
+        create_mock = MagicMock(return_value=fake_agent)
+        monkeypatch.setattr(
+            "app.cursor_client.Agent.create",
+            create_mock,
+        )
+
+        client = CursorClient(api_key="crsr_test", model="composer-2.5", name_prefix="cursor-forge")
+        result = await client.create_agent(
             "do the thing",
             repository_url="https://github.com/org/repo",
             name="demo",
         )
-        payload = route.calls[0].request.read()
-        import json
+        assert result["agent_id"] == "bc-abc"
+        assert result["run_id"] == "run-1"
+        assert "cursor.com/agents" in result["url"]
+        fake_agent.send.assert_called_once()
+        fake_agent.close.assert_called_once()
 
-        body = json.loads(payload)
-        assert body["prompt"]["text"] == "do the thing"
-        assert body["repos"][0]["url"] == "https://github.com/org/repo"
-        assert body["repos"][0]["startingRef"] == "main"
-        assert body["autoCreatePR"] is True
-        assert body["name"].startswith("cursor-forge")
+        create_kwargs = create_mock.call_args.kwargs
+        assert create_kwargs["api_key"] == "crsr_test"
+        assert create_kwargs["model"] == "composer-2.5"
+        assert create_kwargs["cloud"].auto_create_pr is True
 
     @pytest.mark.asyncio
-    @respx.mock
-    async def test_get_agent_status_with_pr(self, cursor):
-        respx.get(f"{API}/v1/agents/bc-abc123").mock(
-            return_value=Response(
-                200,
-                json={"id": "bc-abc123", "latestRunId": "run-1"},
-            )
+    async def test_get_agent_status_from_sdk_run(self, monkeypatch):
+        branch = SimpleNamespace(
+            repo_url="github.com/org/repo",
+            branch="cursor/fix",
+            pr_url="https://github.com/org/repo/pull/1",
         )
-        respx.get(f"{API}/v1/agents/bc-abc123/runs/run-1").mock(
-            return_value=Response(
-                200,
-                json={
-                    "id": "run-1",
-                    "status": "FINISHED",
-                    "result": "Done",
-                    "durationMs": 5000,
-                    "git": {
-                        "branches": [
-                            {"prUrl": "https://github.com/org/repo/pull/1"}
-                        ]
-                    },
-                },
-            )
+        fake_run = SimpleNamespace(
+            id="run-1",
+            agent_id="bc-abc",
+            status="finished",
+            result="Done",
+            duration_ms=5000,
+            git=SimpleNamespace(branches=[branch]),
+            created_at=None,
         )
-        status, pr, run = await cursor.get_agent_status("bc-abc123")
+        monkeypatch.setattr(
+            "app.cursor_client.Agent.get_run",
+            MagicMock(return_value=fake_run),
+        )
+        client = CursorClient(api_key="crsr_test")
+        status, pr, run = await client.get_agent_status("bc-abc", "run-1")
         assert status == TaskStatus.COMPLETED
         assert pr.endswith("/pull/1")
         assert run["result"] == "Done"
 
     @pytest.mark.asyncio
-    @respx.mock
-    async def test_create_review_agent(self, cursor):
-        respx.post(f"{API}/v1/agents").mock(
-            return_value=Response(
-                200,
-                json={
-                    "agent": {"id": "bc-rev", "url": "https://cursor.com/agents/bc-rev"},
-                    "run": {"id": "run-rev", "status": "CREATING"},
-                },
-            )
+    async def test_send_follow_up(self, monkeypatch):
+        fake_run = SimpleNamespace(
+            id="run-2",
+            agent_id="bc-abc",
+            status="running",
+            result="",
+            duration_ms=0,
+            git=None,
+            created_at=None,
         )
-        data = await cursor.create_review_agent(
-            repository_url="https://github.com/org/repo",
-            pr_url="https://github.com/org/repo/pull/3",
+        fake_agent = MagicMock()
+        fake_agent.agent_id = "bc-abc"
+        fake_agent.send.return_value = fake_run
+        monkeypatch.setattr(
+            "app.cursor_client.Agent.resume",
+            MagicMock(return_value=fake_agent),
         )
-        assert data["agent_id"] == "bc-rev"
-
-    @pytest.mark.asyncio
-    @respx.mock
-    async def test_api_error_raises(self, cursor):
-        respx.post(f"{API}/v1/agents").mock(return_value=Response(400, json={"error": "bad"}))
-        with pytest.raises(Exception):
-            await cursor.create_agent("prompt", repository_url="https://github.com/org/repo")
+        client = CursorClient(api_key="crsr_test")
+        result = await client.send_follow_up("bc-abc", "Fix CI")
+        assert result["run_id"] == "run-2"
+        fake_agent.send.assert_called_once()
+        fake_agent.close.assert_called_once()
 
     def test_configured(self):
-        assert not CursorClient(api_key="", api_base=API).configured
-        assert CursorClient(api_key="k", api_base=API).configured
+        assert not CursorClient(api_key="").configured
+        assert CursorClient(api_key="k").configured
 
-    def test_map_review_status(self):
-        # Reviews always have a PR URL, so CREATING promotes to running.
-        assert CursorClient.map_review_status("CREATING") == TaskStatus.RUNNING
-        assert CursorClient.map_review_status("RUNNING") == TaskStatus.RUNNING
-        assert CursorClient.map_review_status("FINISHED") == TaskStatus.COMPLETED
-        assert CursorClient.map_review_status("ERROR") == TaskStatus.FAILED
+    @pytest.mark.asyncio
+    async def test_check_connectivity(self, monkeypatch):
+        monkeypatch.setattr(
+            "app.cursor_client.Cursor.models.list",
+            MagicMock(return_value=[]),
+        )
+        assert await CursorClient(api_key="k").check_connectivity() is True
+
+        monkeypatch.setattr(
+            "app.cursor_client.Cursor.models.list",
+            MagicMock(side_effect=RuntimeError("nope")),
+        )
+        monkeypatch.setattr(
+            "app.cursor_client.Cursor.me",
+            MagicMock(side_effect=RuntimeError("nope")),
+        )
+        assert await CursorClient(api_key="k").check_connectivity() is False

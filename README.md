@@ -1,21 +1,21 @@
 # Cursor Forge — The AI Engineer That Delivers
 
-A production-ready automation service that turns **GitHub Issues into merged Pull Requests** using [Cursor Cloud Agents](https://cursor.com/docs/cloud-agent). Label an issue, and the system dispatches a Cursor agent to implement the fix, run the tests, open a PR, review it with a second Cursor agent, and report back on the issue — with full lifecycle tracking, metrics, and an operations dashboard.
+A production-ready automation service that turns **GitHub Issues into merged Pull Requests** using the official [Cursor SDK](https://cursor.com/docs/sdk/python) (`cursor-sdk`) against [Cursor Cloud Agents](https://cursor.com/docs/cloud-agent). Label an issue, and the system dispatches a Cursor agent to implement the fix, run the tests, open a PR, review it with a second Cursor agent, and report back on the issue — with full lifecycle tracking, metrics, and an operations dashboard.
 
-Built for engineering teams evaluating autonomous software engineering workflows.
+Built for **fintech / digital-banking** engineering teams evaluating autonomous remediation on business-critical codebases (demo target: a fork of [`apache/fineract`](https://github.com/apache/fineract)).
 
 ---
 
 ## Project Overview
 
-When a GitHub Issue is labeled `Cursor-complete` in a configured repository (e.g. [`jan21deepak/superset`](https://github.com/jan21deepak/superset)), this service:
+When a GitHub Issue is labeled `Cursor-complete` in a configured repository (e.g. your fork of [`apache/fineract`](https://github.com/apache/fineract)), this service:
 
 1. Receives the webhook and validates its HMAC signature.
 2. Persists a **Task** record in SQLite.
-3. Creates a **Cursor Cloud Agent** (`POST /v1/agents`) with a high-quality, scoped prompt and `autoCreatePR: true`.
-4. Polls the Cursor Agents API every 20 seconds in a background worker.
+3. Creates a **Cursor Cloud Agent** via the Python SDK (`Agent.create` + `agent.send`) with `CloudAgentOptions(auto_create_pr=True)`.
+4. Polls agent runs every 20 seconds (`Agent.get_run` / `Agent.list_runs`) in a background worker.
 5. On completion, stores the **pull request URL, summary, and runtime**, starts a **Cursor review agent** on that PR, and posts a ✅ comment back on the original issue.
-6. Exposes a live **dashboard**, a **metrics endpoint**, and an orchestration-grade **health endpoint**.
+6. Exposes a live **dashboard**, a **metrics endpoint**, an orchestration-grade **health endpoint**, and a **follow-up** API (`POST /api/tasks/{id}/follow-up`) for SDK `Agent.resume` + `send`.
 
 ## Architecture
 
@@ -26,9 +26,9 @@ flowchart LR
     ISSUE["GitHub Issue<br/>labeled Cursor-complete"]
     WEBHOOK["Cursor Forge FastAPI<br/>POST /webhook - validate HMAC"]
     DB[("SQLite<br/>Task store")]
-    API["Cursor Cloud Agents API<br/>api.cursor.com/v1"]
+    API["Cursor SDK<br/>cursor-sdk Cloud Agents"]
     SESSION["Cursor Cloud Agent<br/>plan, code, test"]
-    WORKER["Background Worker<br/>polls agents/runs"]
+    WORKER["Background Worker<br/>polls SDK runs"]
     PR["Pull Request"]
     REVIEW["Cursor Review Agent<br/>on PR"]
     COMMENT["GitHub Comment<br/>issue + merge tracking"]
@@ -37,12 +37,12 @@ flowchart LR
 
     ISSUE -->|"webhook"| WEBHOOK
     WEBHOOK -->|"persist Task"| DB
-    WEBHOOK -->|"create agent"| API
+    WEBHOOK -->|"Agent.create + send"| API
     API --> SESSION
     SESSION -->|"opens"| PR
     PR --> REVIEW
     SESSION -->|"on complete"| COMMENT
-    WORKER -->|"poll status"| API
+    WORKER -->|"get_run / list_runs"| API
     WORKER -->|"update"| DB
     DB -.-> DASH
     DB -.-> METRICS
@@ -65,8 +65,8 @@ npx -p @mermaid-js/mermaid-cli mmdc \
 | Web framework | FastAPI + Uvicorn |
 | Persistence | SQLite + SQLAlchemy 2.x |
 | Background worker | asyncio task (in-process, 20s poll loop) |
-| Agent runtime | Cursor Cloud Agents REST API v1 (`api.cursor.com`) |
-| HTTP client | httpx (async) |
+| Agent runtime | Official Python [Cursor SDK](https://cursor.com/docs/sdk/python) (`cursor-sdk`) → Cloud Agents |
+| HTTP client | httpx (async) for GitHub; SDK for Cursor agents |
 | Config | pydantic-settings + python-dotenv |
 | UI | Jinja2 + Bootstrap 5 |
 | Container | Docker + Docker Compose |
@@ -118,14 +118,17 @@ CURSOR_API_KEY=<your-cursor-api-key>
 TRIGGER_LABEL=Cursor-complete
 ```
 
-Optional: `CURSOR_MODEL` (model id from `GET https://api.cursor.com/v1/models`), `CURSOR_STARTING_REF` (default `main`), `CURSOR_USD_PER_AGENT_RUN` for ROI estimates.
+Optional: `CURSOR_MODEL` (default `composer-2.5`), `CURSOR_STARTING_REF` (default `main`), `CURSOR_USD_PER_AGENT_RUN` for ROI estimates.
 
-Verify the Cursor key:
+Verify the Cursor key (SDK uses the same key):
 
 ```bash
-curl -s -H "Authorization: Bearer $CURSOR_API_KEY" https://api.cursor.com/v1/me | python3 -m json.tool
-# or
-curl -s -H "Authorization: Bearer $CURSOR_API_KEY" https://api.cursor.com/v1/models | python3 -m json.tool
+python - <<'PY'
+from cursor_sdk import Cursor
+import os
+print(Cursor.me(api_key=os.environ["CURSOR_API_KEY"]))
+print([m.id for m in Cursor.models.list(api_key=os.environ["CURSOR_API_KEY"])][:5])
+PY
 ```
 
 ### 3. Run the service
@@ -262,27 +265,33 @@ The agent prompt includes the repository URL, issue title, and issue body, and i
 - create a pull request,
 - summarize the completed work.
 
-Create call (simplified):
+Create path (Python Cursor SDK, simplified):
 
-```http
-POST https://api.cursor.com/v1/agents
-Authorization: Bearer $CURSOR_API_KEY
-{
-  "prompt": { "text": "..." },
-  "repos": [{ "url": "https://github.com/owner/repo", "startingRef": "main" }],
-  "autoCreatePR": true,
-  "skipReviewerRequest": true
-}
+```python
+from cursor_sdk import Agent, CloudAgentOptions, CloudRepository
+
+agent = Agent.create(
+    model="composer-2.5",
+    api_key=CURSOR_API_KEY,
+    cloud=CloudAgentOptions(
+        repos=[CloudRepository(url="https://github.com/owner/repo", starting_ref="main")],
+        auto_create_pr=True,
+        skip_reviewer_request=True,
+    ),
+)
+run = agent.send(prompt)  # fire-and-forget; worker polls later
 ```
 
-The background worker polls every 20 seconds:
+The background worker polls every 20 seconds via the SDK:
 
-- `GET /v1/agents/{id}` → `latestRunId`
-- `GET /v1/agents/{id}/runs/{runId}` → status, `result`, `durationMs`, `git.branches[].prUrl`
+- `Agent.get_run(run_id, {"runtime": "cloud", "agentId": ...})` (or `Agent.list_runs`)
+- Reads status, `result`, `duration_ms`, `git.branches[].pr_url`
 
-Status map: `CREATING`/`RUNNING` → queued/running; `FINISHED` → completed; `ERROR`/`CANCELLED`/`EXPIRED` → failed.
+Status map: `creating`/`running` → queued/running; `finished` → completed; `error`/`cancelled`/`expired` → failed.
 
-On success it posts a comment to the issue and starts a **review agent** with `repos[0].prUrl` and `autoCreatePR: false`. When that review finishes, the worker attempts squash-merge (or enables GitHub auto-merge).
+On success it posts a comment to the issue and starts a **review agent** with `CloudRepository(pr_url=...)` and `auto_create_pr=False`. When that review finishes, the worker attempts squash-merge (or enables GitHub auto-merge).
+
+Follow-ups use `Agent.resume(agent_id)` + `agent.send(...)` via `POST /api/tasks/{id}/follow-up`.
 
 ## Environment Variables
 
@@ -292,7 +301,7 @@ On success it posts a comment to the issue and starts a **review agent** with `r
 | `GITHUB_TOKEN` | PAT used to post comments / merge PRs | — |
 | `CURSOR_API_KEY` | Cursor user or service-account API key | — |
 | `CURSOR_API_BASE` | Cursor API base URL | `https://api.cursor.com` |
-| `CURSOR_MODEL` | Optional model id (`GET /v1/models`) | (account default) |
+| `CURSOR_MODEL` | Model id passed to `Agent.create` | `composer-2.5` |
 | `CURSOR_NAME_PREFIX` | Prefix for agent display names | `cursor-forge` |
 | `CURSOR_STARTING_REF` | Default git ref for fix agents | `main` |
 | `DATABASE_URL` | SQLAlchemy URL | `sqlite:///./data/tasks.db` |
@@ -343,27 +352,28 @@ Structured single-line logs with ISO-8601 **SGT** timestamps and key=value conte
 2026-08-03T11:30:00.123+08:00 | INFO | app.worker | task.completed | task_id=7 agent_id=bc-… pr=https://github.com/… runtime_seconds=734
 ```
 
-## Cursor Cloud Agents API
+## Cursor SDK (Cloud Agents)
 
 | Concept | Cursor Forge usage |
 |---|---|
-| Cloud Agent | Durable agent id (`bc-…`) |
-| Run | Per-prompt execution (`run-…`) |
-| Create | `POST /v1/agents` with `autoCreatePR: true` |
-| Poll | `GET /v1/agents/{id}/runs/{runId}` |
-| PR URL | `run.git.branches[].prUrl` |
-| Review | Second Cloud Agent with `repos[0].prUrl` |
-| UI deep link | `https://cursor.com/agents/{id}` |
+| Cloud Agent | Durable agent id (`bc-…`) via `Agent.create(..., cloud=...)` |
+| Run | Per-prompt execution via `agent.send(...)` |
+| Create | `Agent.create` + `CloudAgentOptions(auto_create_pr=True)` |
+| Poll | `Agent.get_run` / `Agent.list_runs` (`runtime=cloud`) |
+| PR URL | `run.git.branches[].pr_url` |
+| Review | Second Cloud Agent with `CloudRepository(pr_url=...)` |
+| Follow-up | `Agent.resume` + `send` (`POST /api/tasks/{id}/follow-up`) |
+| UI deep link | `https://cursor.com/agents/{id}` (Filter → Source → SDK) |
 | Trigger label | `Cursor-complete` |
 
-Canonical docs: [Cloud Agents API endpoints](https://cursor.com/docs/cloud-agent/api/endpoints).
+Canonical docs: [Python Cursor SDK](https://cursor.com/docs/sdk/python).
 
 ## Future Improvements
 
 - **Queue-based dispatch** (Celery / Redis) for horizontal scaling beyond the in-process worker
 - **Postgres** backend for multi-replica deployments
-- **Cursor webhook callbacks** instead of polling, when available on v1
+- **SDK streaming** of run events into the dashboard activity feed
 - **Slack / Teams notifications** on task completion
 - **Auth (OIDC)** on the dashboard and metrics endpoints
 - **Multi-repo configuration** with per-repo trigger labels and prompt templates
-- **SDK option** (`cursor-sdk` / `@cursor/sdk`) alongside the REST client
+- **Inline MCP servers** on agent create (GitHub/Linear) for richer enterprise context

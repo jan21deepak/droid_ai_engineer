@@ -2,9 +2,9 @@ flowchart LR
     ISSUE["GitHub Issue<br/>labeled Cursor-complete"]
     WEBHOOK["Cursor Forge FastAPI<br/>POST /webhook - validate HMAC"]
     DB[("SQLite<br/>Task store")]
-    API["Cursor Cloud Agents API<br/>api.cursor.com/v1"]
+    API["Cursor SDK<br/>cursor-sdk Cloud Agents"]
     SESSION["Cursor Cloud Agent<br/>plan, code, test"]
-    WORKER["Background Worker<br/>polls agents/runs"]
+    WORKER["Background Worker<br/>polls SDK runs"]
     PR["Pull Request"]
     REVIEW["Cursor Review Agent<br/>on PR"]
     COMMENT["GitHub Comment<br/>issue + merge tracking"]
@@ -13,12 +13,12 @@ flowchart LR
 
     ISSUE -->|"webhook"| WEBHOOK
     WEBHOOK -->|"persist Task"| DB
-    WEBHOOK -->|"create agent"| API
+    WEBHOOK -->|"Agent.create + send"| API
     API --> SESSION
     SESSION -->|"opens"| PR
     PR --> REVIEW
     SESSION -->|"on complete"| COMMENT
-    WORKER -->|"poll status"| API
+    WORKER -->|"get_run / list_runs"| API
     WORKER -->|"update"| DB
     DB -.-> DASH
     DB -.-> METRICS

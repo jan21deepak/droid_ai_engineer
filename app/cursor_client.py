@@ -1,6 +1,7 @@
-"""Async client for the Cursor Cloud Agents REST API v1.
+"""Cursor Cloud Agents client built on the official Python Cursor SDK.
 
-Docs: https://cursor.com/docs/cloud-agent/api/endpoints
+Uses ``cursor_sdk.Agent`` / ``CloudAgentOptions`` (not raw REST). Sync SDK
+calls run in a thread so FastAPI's async worker can orchestrate many agents.
 """
 
 from __future__ import annotations
@@ -9,7 +10,15 @@ import asyncio
 import logging
 from typing import Any
 
-import httpx
+from cursor_sdk import (
+    Agent,
+    AgentOptions,
+    CloudAgentOptions,
+    CloudRepository,
+    Cursor,
+    CursorAgentError,
+    close_default_client,
+)
 
 from app.config import get_settings
 from app.logging_conf import log_event
@@ -28,7 +37,7 @@ Description:
 
 Requirements:
 - Make only the requested changes described in the issue.
-- Run the project's test suite.
+- Run the project's test suite (or the closest relevant subset if the full suite is impractical).
 - Fix any failures introduced by your changes.
 - Create a pull request with a clear title and description referencing issue #{issue_number}.
 - Summarize the completed work at the end.
@@ -36,14 +45,25 @@ Requirements:
 
 REVIEW_PROMPT_TEMPLATE = """Review the pull request at {pr_url} in repository {repository_url}.
 
-Perform a thorough code review:
+Perform a thorough code review focused on production readiness for a fintech / core-banking style change:
 - Identify bugs, regressions, missing tests, and security issues.
 - Check that the change matches the PR description and linked issue (if any).
 - Leave a clear verdict: approve with notes, or request changes with concrete fixes.
 - Summarize findings at the end. Do not open a new pull request.
 """
 
-# Cursor run status -> internal TaskStatus
+FOLLOW_UP_PROMPT_TEMPLATE = """Continue work on this agent session.
+
+Follow-up instruction:
+{instruction}
+
+Requirements:
+- Keep the existing branch / PR when possible.
+- Run relevant tests after changes.
+- Summarize what you changed.
+"""
+
+# SDK run statuses are lowercase; accept REST-era uppercase too.
 _RUN_STATUS_MAP = {
     "CREATING": TaskStatus.QUEUED,
     "RUNNING": TaskStatus.RUNNING,
@@ -52,6 +72,13 @@ _RUN_STATUS_MAP = {
     "CANCELLED": TaskStatus.FAILED,
     "CANCELED": TaskStatus.FAILED,
     "EXPIRED": TaskStatus.FAILED,
+    "creating": TaskStatus.QUEUED,
+    "running": TaskStatus.RUNNING,
+    "finished": TaskStatus.COMPLETED,
+    "error": TaskStatus.FAILED,
+    "cancelled": TaskStatus.FAILED,
+    "canceled": TaskStatus.FAILED,
+    "expired": TaskStatus.FAILED,
 }
 
 
@@ -68,32 +95,35 @@ def build_review_prompt(repository_url: str, pr_url: str) -> str:
     return REVIEW_PROMPT_TEMPLATE.format(repository_url=repository_url, pr_url=pr_url)
 
 
+def build_follow_up_prompt(instruction: str) -> str:
+    return FOLLOW_UP_PROMPT_TEMPLATE.format(instruction=instruction.strip() or "Continue.")
+
+
 def map_run_status(
     status: str | None,
     has_pull_request: bool,
     *,
     pr_merged: bool = False,
 ) -> str:
-    """Map Cursor run status to an internal TaskStatus."""
-    value = (status or "").upper()
+    """Map Cursor SDK / API run status to an internal TaskStatus."""
+    raw = status or ""
+    value = raw.upper()
     if pr_merged:
         return TaskStatus.COMPLETED
     if value in ("ERROR", "EXPIRED", "CANCELLED", "CANCELED"):
         return TaskStatus.FAILED
     if value == "FINISHED":
         return TaskStatus.COMPLETED
-    if value in _RUN_STATUS_MAP:
-        mapped = _RUN_STATUS_MAP[value]
-        # Still creating/running but PR already exists — keep running until FINISHED
-        # unless merge already landed.
+    mapped = _RUN_STATUS_MAP.get(raw) or _RUN_STATUS_MAP.get(value)
+    if mapped is not None:
         if mapped == TaskStatus.QUEUED and has_pull_request:
             return TaskStatus.RUNNING
         return mapped
-    return TaskStatus.RUNNING if not has_pull_request else TaskStatus.RUNNING
+    return TaskStatus.RUNNING
 
 
 def extract_pull_request_url(run_or_agent: dict) -> str | None:
-    """Pull PR URL from a run (or agent+run) payload."""
+    """Pull PR URL from a normalized run dict (SDK git snapshot)."""
     git = run_or_agent.get("git") or {}
     branches = git.get("branches") or []
     for item in branches:
@@ -101,21 +131,12 @@ def extract_pull_request_url(run_or_agent: dict) -> str | None:
             url = item.get("prUrl") or item.get("pr_url")
             if url:
                 return url
-    # Some payloads nest under agent
     for key in ("run", "latestRun", "latest_run"):
         nested = run_or_agent.get(key)
         if isinstance(nested, dict):
             found = extract_pull_request_url(nested)
             if found:
                 return found
-    return None
-
-
-def extract_branch_name(run_data: dict) -> str | None:
-    git = run_data.get("git") or {}
-    for item in git.get("branches") or []:
-        if isinstance(item, dict) and item.get("branch"):
-            return item["branch"]
     return None
 
 
@@ -127,8 +148,34 @@ def agent_web_url(agent_id: str | None, agent_url: str | None = None) -> str | N
     return None
 
 
+def _run_to_dict(run: Any) -> dict:
+    """Normalize an SDK Run / snapshot into the dict shape the worker expects."""
+    git_obj = getattr(run, "git", None)
+    branches: list[dict] = []
+    if git_obj is not None:
+        for branch in getattr(git_obj, "branches", ()) or ():
+            branches.append(
+                {
+                    "repoUrl": getattr(branch, "repo_url", "") or "",
+                    "branch": getattr(branch, "branch", "") or "",
+                    "prUrl": getattr(branch, "pr_url", "") or "",
+                }
+            )
+    status = getattr(run, "status", None) or "running"
+    duration_ms = getattr(run, "duration_ms", None) or 0
+    return {
+        "id": getattr(run, "id", None) or getattr(run, "run_id", None),
+        "agentId": getattr(run, "agent_id", None),
+        "status": status,
+        "result": getattr(run, "result", None) or "",
+        "durationMs": duration_ms,
+        "git": {"branches": branches},
+        "createdAt": getattr(run, "created_at", None),
+    }
+
+
 class CursorClient:
-    """Async client for creating and monitoring Cursor Cloud Agents."""
+    """Async facade over the sync Cursor SDK cloud agent APIs."""
 
     def __init__(
         self,
@@ -141,8 +188,9 @@ class CursorClient:
     ):
         settings = get_settings()
         self.api_key = api_key if api_key is not None else settings.cursor_api_key
+        # Kept for health/docs compatibility; SDK owns transport.
         self.api_base = (api_base or settings.cursor_api_base).rstrip("/")
-        self.model = model if model is not None else settings.cursor_model
+        self.model = (model if model is not None else settings.cursor_model) or "composer-2.5"
         self.name_prefix = (
             name_prefix if name_prefix is not None else settings.cursor_name_prefix
         )
@@ -153,33 +201,85 @@ class CursorClient:
     def configured(self) -> bool:
         return bool(self.api_key)
 
-    def _headers(self) -> dict:
-        return {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-        }
+    def _display_name(self, name: str | None) -> str | None:
+        if not name:
+            return None
+        display = name
+        if self.name_prefix and not display.startswith(self.name_prefix):
+            display = f"{self.name_prefix}: {display}"
+        return display[:100]
 
-    async def _request(self, method: str, path: str, **kwargs) -> httpx.Response:
-        url = f"{self.api_base}{path}"
-        last_exc: Exception | None = None
-        for attempt in range(1, self.max_retries + 1):
-            try:
-                async with httpx.AsyncClient(timeout=self.timeout) as client:
-                    resp = await client.request(method, url, headers=self._headers(), **kwargs)
-                    resp.raise_for_status()
-                    return resp
-            except httpx.HTTPStatusError as exc:
-                if exc.response.status_code < 500:
-                    raise
-                last_exc = exc
-            except httpx.HTTPError as exc:
-                last_exc = exc
-            if attempt < self.max_retries:
-                await asyncio.sleep(2**attempt)
-        raise last_exc  # type: ignore[misc]
+    def _cloud_options(
+        self,
+        *,
+        repository_url: str,
+        starting_ref: str | None,
+        auto_create_pr: bool,
+        pr_url: str | None,
+    ) -> CloudAgentOptions:
+        repo = CloudRepository(
+            url=repository_url,
+            starting_ref=None if pr_url else (starting_ref or self._default_starting_ref()),
+            pr_url=pr_url,
+        )
+        return CloudAgentOptions(
+            repos=[repo],
+            auto_create_pr=auto_create_pr,
+            skip_reviewer_request=True,
+        )
 
     def _default_starting_ref(self) -> str:
         return get_settings().cursor_starting_ref or "main"
+
+    def _create_agent_sync(
+        self,
+        prompt: str,
+        *,
+        repository_url: str,
+        name: str | None,
+        starting_ref: str | None,
+        auto_create_pr: bool,
+        pr_url: str | None,
+    ) -> dict:
+        agent = Agent.create(
+            model=self.model,
+            api_key=self.api_key,
+            name=self._display_name(name),
+            cloud=self._cloud_options(
+                repository_url=repository_url,
+                starting_ref=starting_ref,
+                auto_create_pr=auto_create_pr,
+                pr_url=pr_url,
+            ),
+        )
+        try:
+            run = agent.send(prompt)
+            agent_id = agent.agent_id
+            run_id = run.id
+            url = agent_web_url(agent_id)
+            log_event(
+                logger,
+                logging.INFO,
+                "cursor.agent_created",
+                agent_id=agent_id,
+                run_id=run_id,
+                url=url,
+                auto_create_pr=auto_create_pr,
+                sdk="cursor-sdk",
+            )
+            return {
+                "agent_id": agent_id,
+                "run_id": run_id,
+                "url": url,
+                "agent": {"id": agent_id, "url": url},
+                "run": _run_to_dict(run),
+                "raw": {"sdk": True},
+            }
+        finally:
+            try:
+                agent.close()
+            except Exception:
+                pass
 
     async def create_agent(
         self,
@@ -191,51 +291,26 @@ class CursorClient:
         auto_create_pr: bool = True,
         pr_url: str | None = None,
     ) -> dict:
-        """Create a Cloud Agent and return {agent_id, run_id, url, raw}."""
-        repo_entry: dict[str, Any] = {"url": repository_url}
-        if pr_url:
-            repo_entry["prUrl"] = pr_url
-        else:
-            repo_entry["startingRef"] = starting_ref or self._default_starting_ref()
-
-        payload: dict[str, Any] = {
-            "prompt": {"text": prompt},
-            "repos": [repo_entry],
-            "autoCreatePR": auto_create_pr,
-            "skipReviewerRequest": True,
-        }
-        if name:
-            display = name
-            if self.name_prefix and not display.startswith(self.name_prefix):
-                display = f"{self.name_prefix}: {display}"
-            payload["name"] = display[:100]
-        if self.model:
-            payload["model"] = {"id": self.model}
-
-        resp = await self._request("POST", "/v1/agents", json=payload)
-        data = resp.json()
-        agent = data.get("agent") or {}
-        run = data.get("run") or {}
-        agent_id = agent.get("id")
-        run_id = run.get("id") or agent.get("latestRunId")
-        url = agent.get("url") or agent_web_url(agent_id)
-        log_event(
-            logger,
-            logging.INFO,
-            "cursor.agent_created",
-            agent_id=agent_id,
-            run_id=run_id,
-            url=url,
-            auto_create_pr=auto_create_pr,
-        )
-        return {
-            "agent_id": agent_id,
-            "run_id": run_id,
-            "url": url,
-            "agent": agent,
-            "run": run,
-            "raw": data,
-        }
+        """Create a Cloud Agent via the SDK and enqueue the first run (no wait)."""
+        try:
+            return await asyncio.to_thread(
+                self._create_agent_sync,
+                prompt,
+                repository_url=repository_url,
+                name=name,
+                starting_ref=starting_ref,
+                auto_create_pr=auto_create_pr,
+                pr_url=pr_url,
+            )
+        except CursorAgentError as exc:
+            log_event(
+                logger,
+                logging.ERROR,
+                "cursor.agent_create_failed",
+                error=str(exc),
+                retryable=getattr(exc, "is_retryable", None),
+            )
+            raise
 
     async def create_review_agent(
         self,
@@ -253,54 +328,82 @@ class CursorClient:
             pr_url=pr_url,
         )
 
-    async def get_agent(self, agent_id: str) -> dict:
-        resp = await self._request("GET", f"/v1/agents/{agent_id}")
-        return resp.json()
+    def _get_run_sync(self, agent_id: str, run_id: str):
+        return Agent.get_run(
+            run_id,
+            {"runtime": "cloud", "agentId": agent_id, "agent_id": agent_id},
+        )
 
-    async def get_run(self, agent_id: str, run_id: str) -> dict:
-        resp = await self._request("GET", f"/v1/agents/{agent_id}/runs/{run_id}")
-        return resp.json()
+    def _latest_run_sync(self, agent_id: str):
+        result = Agent.list_runs(agent_id, {"runtime": "cloud", "limit": 1})
+        items = getattr(result, "items", None) or []
+        return items[0] if items else None
 
-    async def get_latest_run(self, agent_id: str) -> dict | None:
-        agent = await self.get_agent(agent_id)
-        run_id = agent.get("latestRunId") or agent.get("latest_run_id")
-        if not run_id:
-            # Fall back to list runs
-            try:
-                resp = await self._request("GET", f"/v1/agents/{agent_id}/runs", params={"limit": 1})
-                items = resp.json().get("items") or []
-                if items:
-                    return items[0]
-            except httpx.HTTPError:
-                return None
-            return None
-        run = await self.get_run(agent_id, run_id)
-        run["_agent"] = agent
-        return run
-
-    async def get_agent_status(self, agent_id: str, run_id: str | None = None) -> tuple[str, str | None, dict]:
-        """Return (internal_status, pull_request_url, run_data)."""
+    def _get_agent_status_sync(
+        self, agent_id: str, run_id: str | None
+    ) -> tuple[str, str | None, dict]:
         if run_id:
-            run = await self.get_run(agent_id, run_id)
+            run = self._get_run_sync(agent_id, run_id)
         else:
-            run = await self.get_latest_run(agent_id)
+            run = self._latest_run_sync(agent_id)
             if run is None:
                 return TaskStatus.QUEUED, None, {}
-        pr_url = extract_pull_request_url(run)
-        status = map_run_status(run.get("status"), bool(pr_url))
-        return status, pr_url, run
+        data = _run_to_dict(run)
+        pr_url = extract_pull_request_url(data)
+        status = map_run_status(data.get("status"), bool(pr_url))
+        return status, pr_url, data
+
+    async def get_agent_status(
+        self, agent_id: str, run_id: str | None = None
+    ) -> tuple[str, str | None, dict]:
+        """Return (internal_status, pull_request_url, run_data)."""
+        return await asyncio.to_thread(self._get_agent_status_sync, agent_id, run_id)
 
     async def get_run_summary(self, agent_id: str, run_id: str | None = None) -> str | None:
-        if run_id:
-            run = await self.get_run(agent_id, run_id)
-        else:
-            run = await self.get_latest_run(agent_id)
-        if not run:
-            return None
+        _, _, run = await self.get_agent_status(agent_id, run_id)
         result = run.get("result")
         if isinstance(result, str) and result.strip():
             return result.strip()
         return None
+
+    def _follow_up_sync(self, agent_id: str, prompt: str) -> dict:
+        agent = Agent.resume(agent_id, AgentOptions(api_key=self.api_key))
+        try:
+            run = agent.send(prompt)
+            run_id = run.id
+            log_event(
+                logger,
+                logging.INFO,
+                "cursor.follow_up_sent",
+                agent_id=agent_id,
+                run_id=run_id,
+            )
+            return {
+                "agent_id": agent_id,
+                "run_id": run_id,
+                "url": agent_web_url(agent_id),
+                "run": _run_to_dict(run),
+            }
+        finally:
+            try:
+                agent.close()
+            except Exception:
+                pass
+
+    async def send_follow_up(self, agent_id: str, instruction: str) -> dict:
+        """Send a follow-up prompt to an existing cloud agent (live-extend hook)."""
+        prompt = build_follow_up_prompt(instruction)
+        try:
+            return await asyncio.to_thread(self._follow_up_sync, agent_id, prompt)
+        except CursorAgentError as exc:
+            log_event(
+                logger,
+                logging.ERROR,
+                "cursor.follow_up_failed",
+                agent_id=agent_id,
+                error=str(exc),
+            )
+            raise
 
     @staticmethod
     def run_duration_seconds(run_data: dict) -> float | None:
@@ -308,30 +411,37 @@ class CursorClient:
         if ms is None:
             return None
         try:
-            return float(ms) / 1000.0
+            value = float(ms)
         except (TypeError, ValueError):
             return None
+        if value <= 0:
+            return None
+        return value / 1000.0
 
     @staticmethod
     def map_review_status(status: str | None) -> str:
         return map_run_status(status, has_pull_request=True)
 
+    def _check_connectivity_sync(self) -> bool:
+        try:
+            Cursor.models.list(api_key=self.api_key)
+            return True
+        except Exception:
+            try:
+                Cursor.me(api_key=self.api_key)
+                return True
+            except Exception:
+                return False
+
     async def check_connectivity(self) -> bool:
         if not self.configured:
             return False
+        return await asyncio.to_thread(self._check_connectivity_sync)
+
+    @staticmethod
+    def shutdown() -> None:
+        """Dispose the SDK default client (call on app shutdown)."""
         try:
-            async with httpx.AsyncClient(timeout=5) as client:
-                resp = await client.get(
-                    f"{self.api_base}/v1/me",
-                    headers=self._headers(),
-                )
-                if resp.status_code == 200:
-                    return True
-                # Some accounts expose models but not /v1/me
-                resp = await client.get(
-                    f"{self.api_base}/v1/models",
-                    headers=self._headers(),
-                )
-                return resp.status_code == 200
-        except httpx.HTTPError:
-            return False
+            close_default_client()
+        except Exception:
+            pass

@@ -53,10 +53,11 @@ async def lifespan(app: FastAPI):
     init_db()
     stop_event = asyncio.Event()
     worker_task = asyncio.create_task(worker_loop(stop_event))
-    log_event(logger, logging.INFO, "app.started", version=__version__)
+    log_event(logger, logging.INFO, "app.started", version=__version__, agent_runtime="cursor-sdk")
     yield
     stop_event.set()
     await worker_task
+    CursorClient.shutdown()
 
 
 app = FastAPI(title="cursor-ai-engineer", version=__version__, lifespan=lifespan)
@@ -75,13 +76,25 @@ class AssignPullsRequest(BaseModel):
     pull_ids: list[int] = Field(..., min_length=1)
 
 
+class FollowUpRequest(BaseModel):
+    instruction: str = Field(
+        ...,
+        min_length=1,
+        description="Follow-up prompt for an existing Cursor Cloud Agent",
+    )
+
+
 @app.get("/")
 async def root():
     return {
         "service": "cursor-ai-engineer",
         "name": "Cursor Forge — The AI Engineer That Delivers",
         "version": __version__,
-        "description": "GitHub Issue -> Cursor Cloud Agent autonomous engineering automation",
+        "description": (
+            "GitHub Issue -> Cursor SDK Cloud Agent (fix + review) automation "
+            "with engineering KPI dashboard"
+        ),
+        "agent_runtime": "cursor-sdk",
         "links": {"dashboard": "/dashboard", "metrics": "/metrics", "health": "/health"},
     }
 
@@ -691,6 +704,58 @@ async def assign_pulls_to_cursor_review(payload: AssignPullsRequest):
 async def list_tasks(page: int = 1, page_size: int = 10):
     with db_session() as session:
         return recent_activity(session, page=page, page_size=page_size)
+
+
+@app.post("/api/tasks/{task_id}/follow-up")
+async def follow_up_task(task_id: int, payload: FollowUpRequest):
+    """Send a follow-up prompt to the task's Cursor Cloud Agent (SDK resume + send).
+
+    Live-extend hook for interview demos — e.g. \"fix failing CI\" or
+    \"add a regression test\".
+    """
+    cursor = CursorClient()
+    if not cursor.configured:
+        return JSONResponse(
+            status_code=503,
+            content={"detail": "Cursor API is not configured"},
+        )
+
+    with db_session() as session:
+        task = session.get(Task, task_id)
+        if not task:
+            return JSONResponse(status_code=404, content={"detail": "task not found"})
+        agent_id = task.cursor_agent_id
+        if not agent_id:
+            return JSONResponse(
+                status_code=409,
+                content={"detail": "task has no Cursor agent to follow up on"},
+            )
+
+    try:
+        result = await cursor.send_follow_up(agent_id, payload.instruction)
+    except Exception as exc:
+        return JSONResponse(
+            status_code=502,
+            content={"detail": f"follow-up failed: {exc}"},
+        )
+
+    with db_session() as session:
+        db_task = session.get(Task, task_id)
+        if db_task is not None:
+            if result.get("run_id"):
+                db_task.cursor_run_id = result["run_id"]
+            db_task.status = TaskStatus.RUNNING
+            db_task.error = None
+
+    log_event(
+        logger,
+        logging.INFO,
+        "task.follow_up",
+        task_id=task_id,
+        agent_id=agent_id,
+        run_id=result.get("run_id"),
+    )
+    return {"detail": "accepted", "task_id": task_id, **result}
 
 
 @app.get("/dashboard", response_class=HTMLResponse)

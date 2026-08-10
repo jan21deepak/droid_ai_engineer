@@ -5,6 +5,7 @@ httpx==0.28.1
 python-dotenv==1.0.1
 pydantic-settings==2.7.1
 jinja2==3.1.5
+cursor-sdk==1.0.26
 pytest==8.3.4
 pytest-asyncio==0.25.2
 respx==0.22.0

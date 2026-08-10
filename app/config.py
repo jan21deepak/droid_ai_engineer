@@ -19,9 +19,10 @@ class Settings(BaseSettings):
     github_api_url: str = "https://api.github.com"
 
     cursor_api_key: str = ""
+    # Retained for docs/health display; transport is owned by cursor-sdk
     cursor_api_base: str = "https://api.cursor.com"
-    # Optional model id from GET /v1/models; blank uses Cursor account default
-    cursor_model: str = ""
+    # Model id for Cloud Agents (SDK). Blank defaults to composer-2.5 in the client.
+    cursor_model: str = "composer-2.5"
     cursor_name_prefix: str = "cursor-forge"
     cursor_starting_ref: str = "main"
 
