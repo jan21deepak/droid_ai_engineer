@@ -180,7 +180,7 @@
                         <div class="card-body">
                             <div class="text-muted small text-uppercase mb-2">
                                 Review Time Stats
-                                <span class="metric-info" data-bs-toggle="tooltip" data-bs-title="How long Cursor Review spent on each PR, measured from GitHub as the span of review comments posted by the Cursor bot (from the review's start to its last comment). Reviews discovered already-finished no longer show as blank — they are backfilled from the same GitHub timeline.">i</span>
+                                <span class="metric-info" data-bs-toggle="tooltip" data-bs-title="How long Cursor Bugbot spent on each PR, measured from the ``bugbot run`` trigger comment to the ``cursor[bot]`` BUGBOT_REVIEW submission on GitHub. Forge tracks each Bugbot run as a review row and backfills duration from that timeline.">i</span>
                             </div>
                             <div class="row g-3">
                                 <div class="col-6">
@@ -191,7 +191,7 @@
                                 <div class="col-6">
                                     <div class="text-muted small mb-1">Total</div>
                                     <div class="stat-value fs-3" data-metric="review.total_runtime_minutes">{{ stats.review.total_runtime_minutes }}</div>
-                                    <div class="text-muted small">minutes across Cursor Review runs</div>
+                                    <div class="text-muted small">minutes across Bugbot runs</div>
                                 </div>
                             </div>
                         </div>

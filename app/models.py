@@ -212,8 +212,8 @@ class ReviewTask(Base):
     duration_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
 
     def to_dict(self) -> dict:
-        review_url = None
-        if self.cursor_agent_id:
+        review_url = self.pr_url or None
+        if self.cursor_agent_id and self.cursor_agent_id != "bugbot":
             review_url = f"https://cursor.com/agents/{self.cursor_agent_id}"
         elif self.pr_url:
             review_url = self.pr_url

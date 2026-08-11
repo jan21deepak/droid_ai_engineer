@@ -93,3 +93,15 @@ def test_review_runtime_ignores_non_cursor_reviews():
     assert review_runtime_from_github_reviews(reviews) is None
 
 
+def test_bugbot_runtime_from_trigger_to_review():
+    reviews = [
+        {
+            "user": {"login": "cursor[bot]"},
+            "submitted_at": "2026-08-11T05:23:33Z",
+            "body": "<!-- BUGBOT_REVIEW -->\n✅ Bugbot reviewed your changes",
+        }
+    ]
+    trigger = datetime(2026, 8, 11, 5, 21, 52, tzinfo=timezone.utc)
+    assert review_runtime_from_github_reviews(reviews, trigger_at=trigger) == 101.0
+
+

@@ -24,7 +24,7 @@ from app.metrics import compute_metrics, recent_activity
 from app.models import Repository, SyncedIssue, SyncedPullRequest, Task, TaskStatus
 from app.repos import parse_repository_ref, resolve_agent_launch_config
 from app.tasks import TaskCreateError, create_and_dispatch_task
-from app.worker import worker_loop
+from app.worker import ensure_bugbot_review_task, worker_loop
 
 logger = logging.getLogger("app.api")
 
@@ -804,6 +804,13 @@ async def assign_pulls_to_bugbot(payload: AssignPullsRequest):
         try:
             requested = await github.request_bugbot_review(
                 pull["repository"], pull["pr_number"]
+            )
+            ensure_bugbot_review_task(
+                repository=pull["repository"],
+                repository_url=pull.get("repository_url") or "",
+                pr_number=pull["pr_number"],
+                pr_url=pull.get("html_url") or "",
+                pr_title=pull.get("title") or "",
             )
             results.append(
                 {

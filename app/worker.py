@@ -5,6 +5,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 
 import httpx
+from sqlalchemy import or_
 
 from app.config import get_settings
 from app.cursor_client import CursorClient, extract_agent_branch
@@ -104,6 +105,10 @@ def _parse_pr_number(pr_url: str) -> int | None:
     return None
 
 
+BUGBOT_AGENT_ID = "bugbot"
+BUGBOT_REVIEW_MARKER = "BUGBOT_REVIEW"
+
+
 def _persist_task_pr_url(task_id: int, pr_url: str) -> None:
     """Write PR URL immediately so a later Bugbot/crash cannot lose the link."""
     if not pr_url:
@@ -116,14 +121,74 @@ def _persist_task_pr_url(task_id: int, pr_url: str) -> None:
                 db_task.pr_state = "open"
 
 
+def ensure_bugbot_review_task(
+    *,
+    repository: str,
+    repository_url: str = "",
+    pr_number: int,
+    pr_url: str = "",
+    pr_title: str = "",
+) -> int | None:
+    """Create or reuse a ReviewTask row that tracks a Bugbot run on a PR."""
+    if not repository or not pr_number:
+        return None
+    if not pr_url:
+        pr_url = f"https://github.com/{repository}/pull/{pr_number}"
+    if not repository_url:
+        repository_url = f"https://github.com/{repository}"
+
+    with db_session() as session:
+        existing = (
+            session.query(ReviewTask)
+            .filter(
+                ReviewTask.repository == repository,
+                ReviewTask.pr_number == pr_number,
+            )
+            .order_by(ReviewTask.id.desc())
+            .first()
+        )
+        if existing:
+            if not existing.pr_url:
+                existing.pr_url = pr_url
+            if pr_title and not existing.pr_title:
+                existing.pr_title = pr_title
+            if not existing.cursor_agent_id:
+                existing.cursor_agent_id = BUGBOT_AGENT_ID
+            return existing.id
+
+        review = ReviewTask(
+            repository=repository,
+            repository_url=repository_url,
+            pr_number=pr_number,
+            pr_title=pr_title or f"PR #{pr_number}",
+            pr_url=pr_url,
+            cursor_agent_id=BUGBOT_AGENT_ID,
+            status=TaskStatus.RUNNING,
+        )
+        session.add(review)
+        session.flush()
+        log_event(
+            logger,
+            logging.INFO,
+            "bugbot.review_tracked",
+            review_id=review.id,
+            repo=repository,
+            pr=pr_number,
+        )
+        return review.id
+
+
 async def _safe_request_bugbot(
     github: GitHubClient,
     repository: str,
     pr_number: int,
     *,
     task_id: int | None = None,
+    repository_url: str = "",
+    pr_url: str = "",
+    pr_title: str = "",
 ) -> None:
-    """Trigger Bugbot without failing the PR-create path."""
+    """Trigger Bugbot, track a ReviewTask, and never fail the PR-create path."""
     try:
         await github.request_bugbot_review(repository, pr_number)
     except Exception as exc:
@@ -131,6 +196,31 @@ async def _safe_request_bugbot(
             logger,
             logging.WARNING,
             "github.bugbot_trigger_failed",
+            task_id=task_id,
+            repo=repository,
+            pr=pr_number,
+            error=str(exc),
+        )
+    try:
+        if task_id and (not pr_url or not repository_url or not pr_title):
+            with db_session() as session:
+                task = session.get(Task, task_id)
+                if task:
+                    repository_url = repository_url or task.repository_url
+                    pr_url = pr_url or (task.pull_request_url or "")
+                    pr_title = pr_title or (task.issue_title or "")
+        ensure_bugbot_review_task(
+            repository=repository,
+            repository_url=repository_url,
+            pr_number=pr_number,
+            pr_url=pr_url,
+            pr_title=pr_title,
+        )
+    except Exception as exc:
+        log_event(
+            logger,
+            logging.WARNING,
+            "bugbot.review_track_failed",
             task_id=task_id,
             repo=repository,
             pr=pr_number,
@@ -260,9 +350,17 @@ async def ensure_pull_request_for_task(
 def review_runtime_from_github_reviews(
     reviews: list[dict],
     review_created_at: datetime | None = None,
+    *,
+    trigger_at: datetime | None = None,
 ) -> float | None:
-    """Active review time from GitHub PR review submissions by Cursor-related bots."""
+    """Bugbot / Cursor review duration from GitHub PR review submissions.
+
+    Prefers ``trigger_at`` (``bugbot run`` comment) → first ``BUGBOT_REVIEW``
+    (or any cursor/bugbot review) after that. Falls back to the span of bot
+    review submissions, optionally anchored at ``review_created_at``.
+    """
     bot_times: list[datetime] = []
+    bugbot_times: list[datetime] = []
     for item in reviews:
         login = ((item.get("user") or {}).get("login") or "").lower()
         if "cursor" not in login and "bugbot" not in login:
@@ -273,11 +371,27 @@ def review_runtime_from_github_reviews(
         if stamp.tzinfo is None:
             stamp = stamp.replace(tzinfo=timezone.utc)
         bot_times.append(stamp)
+        body = item.get("body") or ""
+        if BUGBOT_REVIEW_MARKER in body:
+            bugbot_times.append(stamp)
     if not bot_times:
         return None
     bot_times.sort()
+    ends = sorted(bugbot_times) if bugbot_times else bot_times
+
+    start = trigger_at or review_created_at
+    if start is not None and start.tzinfo is None:
+        start = start.replace(tzinfo=timezone.utc)
+
+    if start is not None:
+        after = [stamp for stamp in ends if stamp >= start]
+        end = after[0] if after else ends[-1]
+        if start <= end:
+            duration = (end - start).total_seconds()
+            return duration if duration > 0 else None
+
     start = bot_times[0]
-    end = bot_times[-1]
+    end = ends[-1]
     if review_created_at is not None:
         created = review_created_at
         if created.tzinfo is None:
@@ -286,6 +400,36 @@ def review_runtime_from_github_reviews(
             start = min(start, created)
     duration = (end - start).total_seconds()
     return duration if duration > 0 else None
+
+
+def _bugbot_trigger_at(comments: list[dict]) -> datetime | None:
+    """Latest ``bugbot run`` comment timestamp on the PR."""
+    latest: datetime | None = None
+    for comment in comments:
+        body = (comment.get("body") or "").strip().lower()
+        if body != "bugbot run" and not body.startswith("bugbot run"):
+            continue
+        stamp = _parse_iso(comment.get("created_at"))
+        if stamp is None:
+            continue
+        if stamp.tzinfo is None:
+            stamp = stamp.replace(tzinfo=timezone.utc)
+        if latest is None or stamp > latest:
+            latest = stamp
+    return latest
+
+
+def _bugbot_summary(reviews: list[dict]) -> str | None:
+    for item in reviews:
+        login = ((item.get("user") or {}).get("login") or "").lower()
+        if "cursor" not in login and "bugbot" not in login:
+            continue
+        body = item.get("body") or ""
+        if BUGBOT_REVIEW_MARKER not in body:
+            continue
+        text = body.replace(f"<!-- {BUGBOT_REVIEW_MARKER} -->", "").strip()
+        return text[:2000] if text else "Bugbot review completed"
+    return None
 
 
 async def compute_review_runtime(
@@ -306,7 +450,15 @@ async def compute_review_runtime(
             error=str(exc),
         )
         return None
-    return review_runtime_from_github_reviews(reviews, review_created_at)
+    trigger_at = None
+    try:
+        comments = await github.list_issue_comments(repository, pr_number)
+        trigger_at = _bugbot_trigger_at(comments)
+    except httpx.HTTPError:
+        trigger_at = None
+    return review_runtime_from_github_reviews(
+        reviews, review_created_at, trigger_at=trigger_at
+    )
 
 
 async def ensure_review_for_pr(
@@ -320,6 +472,146 @@ async def ensure_review_for_pr(
     Kept as a no-op so older callers/tests that monkeypatch this name still work.
     """
     return
+
+
+async def poll_bugbot_reviews_once(github: GitHubClient | None = None) -> int:
+    """Complete Bugbot ReviewTask rows from GitHub ``cursor[bot]`` reviews."""
+    github = github or GitHubClient()
+    updated = 0
+
+    with db_session() as session:
+        pending = (
+            session.query(ReviewTask)
+            .filter(
+                ReviewTask.status.in_((TaskStatus.QUEUED, TaskStatus.RUNNING)),
+                or_(
+                    ReviewTask.cursor_agent_id == BUGBOT_AGENT_ID,
+                    ReviewTask.cursor_agent_id.is_(None),
+                ),
+            )
+            .all()
+        )
+        missing_duration = (
+            session.query(ReviewTask)
+            .filter(
+                ReviewTask.status == TaskStatus.COMPLETED,
+                ReviewTask.duration_seconds.is_(None),
+                or_(
+                    ReviewTask.cursor_agent_id == BUGBOT_AGENT_ID,
+                    ReviewTask.cursor_agent_id.is_(None),
+                ),
+            )
+            .all()
+        )
+
+    for review in pending + missing_duration:
+        try:
+            reviews = await github.list_pull_request_reviews(
+                review.repository, review.pr_number
+            )
+            comments = await github.list_issue_comments(
+                review.repository, review.pr_number
+            )
+        except Exception as exc:
+            log_event(
+                logger,
+                logging.WARNING,
+                "bugbot.poll_failed",
+                review_id=review.id,
+                repo=review.repository,
+                pr=review.pr_number,
+                error=str(exc),
+            )
+            continue
+
+        trigger_at = _bugbot_trigger_at(comments) or review.created_at
+        duration = review_runtime_from_github_reviews(
+            reviews, review.created_at, trigger_at=trigger_at
+        )
+        summary = _bugbot_summary(reviews)
+        if duration is None and summary is None:
+            continue
+
+        with db_session() as session:
+            db_review = session.get(ReviewTask, review.id)
+            if db_review is None:
+                continue
+            db_review.status = TaskStatus.COMPLETED
+            db_review.cursor_agent_id = db_review.cursor_agent_id or BUGBOT_AGENT_ID
+            if duration is not None:
+                db_review.duration_seconds = duration
+            if summary:
+                db_review.summary = summary
+            if not db_review.completed_at:
+                bot_end = None
+                for item in reviews:
+                    login = ((item.get("user") or {}).get("login") or "").lower()
+                    body = item.get("body") or ""
+                    if ("cursor" in login or "bugbot" in login) and (
+                        BUGBOT_REVIEW_MARKER in body
+                    ):
+                        stamp = _parse_iso(item.get("submitted_at"))
+                        if stamp and (bot_end is None or stamp > bot_end):
+                            bot_end = stamp
+                db_review.completed_at = bot_end or datetime.now(timezone.utc)
+
+        updated += 1
+        log_event(
+            logger,
+            logging.INFO,
+            "bugbot.review_completed",
+            review_id=review.id,
+            repo=review.repository,
+            pr=review.pr_number,
+            duration_seconds=duration,
+        )
+    return updated
+
+
+async def sync_bugbot_reviews_for_open_prs(github: GitHubClient | None = None) -> int:
+    """Ensure ReviewTask rows exist for forge fix tasks that already have PRs."""
+    github = github or GitHubClient()
+    created = 0
+    with db_session() as session:
+        tasks = session.query(Task).filter(Task.pull_request_url.isnot(None)).all()
+        existing = {
+            (r.repository, r.pr_number)
+            for r in session.query(ReviewTask.repository, ReviewTask.pr_number).all()
+        }
+        snapshots = []
+        for t in tasks:
+            pr_number = _parse_pr_number(t.pull_request_url or "")
+            if not pr_number:
+                continue
+            if (t.repository, pr_number) in existing:
+                continue
+            snapshots.append(
+                {
+                    "repository": t.repository,
+                    "repository_url": t.repository_url,
+                    "pr_url": t.pull_request_url,
+                    "pr_title": t.issue_title,
+                    "pr_number": pr_number,
+                }
+            )
+
+    if not snapshots:
+        # Still resolve any in-flight Bugbot rows, but skip GitHub fan-out when
+        # every forge PR already has a review row.
+        return await poll_bugbot_reviews_once(github)
+
+    for snap in snapshots:
+        review_id = ensure_bugbot_review_task(
+            repository=snap["repository"],
+            repository_url=snap["repository_url"],
+            pr_number=snap["pr_number"],
+            pr_url=snap["pr_url"] or "",
+            pr_title=snap["pr_title"] or "",
+        )
+        if review_id:
+            created += 1
+    await poll_bugbot_reviews_once(github)
+    return created
 
 
 async def _attempt_auto_merge(github: GitHubClient, review: ReviewTask) -> tuple[bool, bool, str | None]:
@@ -410,6 +702,7 @@ async def poll_reviews_once(
             .filter(
                 ReviewTask.status.in_((TaskStatus.QUEUED, TaskStatus.RUNNING)),
                 ReviewTask.cursor_agent_id.isnot(None),
+                ReviewTask.cursor_agent_id != BUGBOT_AGENT_ID,
             )
             .all()
         )
@@ -912,6 +1205,7 @@ async def poll_once(cursor: CursorClient | None = None, github: GitHubClient | N
     # Cursor Cloud review agents or auto-merges.
     updated += await refresh_pr_states(github, tasks_with_pr)
     updated += await finalize_merged_running_tasks()
+    updated += await sync_bugbot_reviews_for_open_prs(github)
     updated += await backfill_durations(cursor, github)
 
     return updated
