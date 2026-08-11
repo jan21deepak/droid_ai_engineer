@@ -46,6 +46,42 @@ def asset_version() -> str:
     return f"{__version__}-{int(newest)}"
 
 
+async def _ensure_repo_automation(github: GitHubClient, full_name: str) -> dict:
+    """Ensure trigger label + issues webhook exist for a registered repository."""
+    settings = get_settings()
+    out: dict = {"label": None, "webhook": None}
+    try:
+        out["label"] = await github.ensure_label(full_name, settings.trigger_label)
+    except Exception as exc:
+        log_event(
+            logger,
+            logging.WARNING,
+            "github.label_ensure_failed",
+            repo=full_name,
+            error=str(exc),
+        )
+        out["label"] = False
+
+    public = (settings.public_base_url or "").strip().rstrip("/")
+    if public:
+        try:
+            out["webhook"] = await github.ensure_issues_webhook(
+                full_name,
+                webhook_url=f"{public}/webhook",
+                secret=settings.github_webhook_secret,
+            )
+        except Exception as exc:
+            log_event(
+                logger,
+                logging.WARNING,
+                "github.webhook_ensure_failed",
+                repo=full_name,
+                error=str(exc),
+            )
+            out["webhook"] = {"error": str(exc)}
+    return out
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = get_settings()
@@ -277,6 +313,7 @@ async def add_repository(payload: AddRepositoryRequest):
         )
         session.add(repo)
         session.flush()
+        repo_dict = repo.to_dict()
         log_event(
             logger,
             logging.INFO,
@@ -284,7 +321,12 @@ async def add_repository(payload: AddRepositoryRequest):
             repo=repo.full_name,
             environment=repo.cursor_environment or None,
         )
-        return JSONResponse(status_code=201, content={"repository": repo.to_dict()})
+
+    automation = await _ensure_repo_automation(github, full_name)
+    return JSONResponse(
+        status_code=201,
+        content={"repository": repo_dict, "automation": automation},
+    )
 
 
 @app.patch("/api/repositories/{repo_id}")
@@ -563,8 +605,17 @@ async def list_synced_issues():
 
 @app.post("/api/issues/assign")
 async def assign_issues_to_cursor(payload: AssignIssuesRequest):
+    """Add the trigger label on GitHub so the webhook (flow 1) creates the agent.
+
+    Always applies ``Cursor-complete`` (or ``TRIGGER_LABEL``) on the issue. When
+    ``PUBLIC_BASE_URL`` is configured, forge waits briefly for the webhook to
+    create the task; otherwise it dispatches the agent directly after labeling
+    (same end state, with duplicate protection if the webhook also fires).
+    """
     settings = get_settings()
     github = GitHubClient()
+    public = (settings.public_base_url or "").strip()
+    prefer_webhook = bool(public)
 
     with db_session() as session:
         issues = (
@@ -584,32 +635,113 @@ async def assign_issues_to_cursor(payload: AssignIssuesRequest):
             labels = json.loads(issue.get("labels") or "[]")
         except json.JSONDecodeError:
             labels = []
+
+        await github.ensure_label(issue["repository"], settings.trigger_label)
+        labeled = True
         if settings.trigger_label not in labels:
-            labels = list(labels) + [settings.trigger_label]
-            await github.add_issue_label(
+            labeled = await github.add_issue_label(
                 issue["repository"], issue["issue_number"], settings.trigger_label
             )
+            labels = list(labels) + [settings.trigger_label]
+            # Keep local sync in sync for the Issues UI "assigned" badge path.
+            with db_session() as session:
+                row = session.get(SyncedIssue, issue["id"])
+                if row is not None:
+                    row.labels = json.dumps(labels)
 
-        try:
-            result = await create_and_dispatch_task(
-                repository=issue["repository"],
-                repository_url=issue["repository_url"],
-                issue_number=issue["issue_number"],
-                issue_title=issue["title"],
-                issue_body=issue["body"],
-                labels=labels,
+        if not labeled:
+            results.append(
+                {
+                    "issue_id": issue["id"],
+                    "ok": False,
+                    "detail": "failed to add trigger label on GitHub",
+                }
             )
-            results.append({"issue_id": issue["id"], "ok": True, **result})
-        except TaskCreateError as exc:
-            results.append({
+            continue
+
+        result = None
+        if prefer_webhook:
+            # Label delivery is async; wait briefly for webhook → create_and_dispatch.
+            for _ in range(8):
+                await asyncio.sleep(0.5)
+                with db_session() as session:
+                    existing = (
+                        session.query(Task)
+                        .filter(
+                            Task.repository == issue["repository"],
+                            Task.issue_number == issue["issue_number"],
+                            Task.status.in_(
+                                (TaskStatus.QUEUED, TaskStatus.RUNNING, TaskStatus.COMPLETED)
+                            ),
+                        )
+                        .order_by(Task.id.desc())
+                        .first()
+                    )
+                    if existing:
+                        result = {
+                            "task_id": existing.id,
+                            "agent_id": existing.cursor_agent_id,
+                            "run_id": existing.cursor_run_id,
+                            "status": existing.status,
+                            "via": "webhook",
+                        }
+                        break
+
+        if result is None:
+            try:
+                dispatched = await create_and_dispatch_task(
+                    repository=issue["repository"],
+                    repository_url=issue["repository_url"],
+                    issue_number=issue["issue_number"],
+                    issue_title=issue["title"],
+                    issue_body=issue["body"],
+                    labels=labels,
+                )
+                result = {**dispatched, "via": "direct" if not prefer_webhook else "webhook_fallback"}
+            except TaskCreateError as exc:
+                results.append(
+                    {
+                        "issue_id": issue["id"],
+                        "ok": exc.status_code == 200,
+                        "detail": exc.message,
+                        "task_id": exc.task_id,
+                        "label": settings.trigger_label,
+                    }
+                )
+                continue
+
+        results.append(
+            {
                 "issue_id": issue["id"],
-                "ok": exc.status_code == 200,
-                "detail": exc.message,
-                "task_id": exc.task_id,
-            })
+                "ok": True,
+                "label": settings.trigger_label,
+                **result,
+            }
+        )
 
     accepted = sum(1 for r in results if r.get("ok"))
     return {"detail": "processed", "accepted": accepted, "results": results}
+
+
+@app.post("/api/webhooks/sync")
+async def sync_github_webhooks():
+    """Ensure trigger label + issues webhook exist on every registered repository."""
+    settings = get_settings()
+    if not (settings.public_base_url or "").strip():
+        return JSONResponse(
+            status_code=400,
+            content={
+                "detail": "PUBLIC_BASE_URL is not set; start a tunnel and set it so GitHub can reach /webhook",
+            },
+        )
+    github = GitHubClient()
+    with db_session() as session:
+        repos = [r.full_name for r in session.query(Repository).all()]
+    results = []
+    for full_name in repos:
+        automation = await _ensure_repo_automation(github, full_name)
+        results.append({"repository": full_name, **automation})
+    return {"detail": "synced", "public_base_url": settings.public_base_url, "results": results}
 
 
 @app.get("/api/pulls")

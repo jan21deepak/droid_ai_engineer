@@ -104,6 +104,40 @@ def _parse_pr_number(pr_url: str) -> int | None:
     return None
 
 
+def _persist_task_pr_url(task_id: int, pr_url: str) -> None:
+    """Write PR URL immediately so a later Bugbot/crash cannot lose the link."""
+    if not pr_url:
+        return
+    with db_session() as session:
+        db_task = session.get(Task, task_id)
+        if db_task and not db_task.pull_request_url:
+            db_task.pull_request_url = pr_url
+            if not db_task.pr_state:
+                db_task.pr_state = "open"
+
+
+async def _safe_request_bugbot(
+    github: GitHubClient,
+    repository: str,
+    pr_number: int,
+    *,
+    task_id: int | None = None,
+) -> None:
+    """Trigger Bugbot without failing the PR-create path."""
+    try:
+        await github.request_bugbot_review(repository, pr_number)
+    except Exception as exc:
+        log_event(
+            logger,
+            logging.WARNING,
+            "github.bugbot_trigger_failed",
+            task_id=task_id,
+            repo=repository,
+            pr=pr_number,
+            error=str(exc),
+        )
+
+
 async def ensure_pull_request_for_task(
     task: Task,
     run_data: dict,
@@ -135,9 +169,10 @@ async def ensure_pull_request_for_task(
             branch=branch,
             url=existing.get("html_url"),
         )
+        _persist_task_pr_url(task.id, existing["html_url"])
         pr_number = int(existing.get("number") or 0) or _parse_pr_number(existing["html_url"])
         if pr_number:
-            await github.request_bugbot_review(repository, pr_number)
+            await _safe_request_bugbot(github, repository, pr_number, task_id=task.id)
         return existing["html_url"]
 
     launch = resolve_agent_launch_config(
@@ -179,6 +214,15 @@ async def ensure_pull_request_for_task(
         if exc.response.status_code == 422:
             existing = await github.find_open_pull_request_for_head(repository, branch)
             if existing and existing.get("html_url"):
+                _persist_task_pr_url(task.id, existing["html_url"])
+                pr_number = (
+                    int(existing.get("number") or 0)
+                    or _parse_pr_number(existing["html_url"])
+                )
+                if pr_number:
+                    await _safe_request_bugbot(
+                        github, repository, pr_number, task_id=task.id
+                    )
                 return existing["html_url"]
         log_event(
             logger,
@@ -204,9 +248,12 @@ async def ensure_pull_request_for_task(
         return None
 
     pr_url = pr.get("html_url")
+    # Persist before Bugbot so a crash still leaves the PR link on the task.
+    if pr_url:
+        _persist_task_pr_url(task.id, pr_url)
     pr_number = int(pr.get("number") or 0) or _parse_pr_number(pr_url or "")
     if pr_number:
-        await github.request_bugbot_review(repository, pr_number)
+        await _safe_request_bugbot(github, repository, pr_number, task_id=task.id)
     return pr_url
 
 
@@ -701,7 +748,7 @@ async def poll_once(cursor: CursorClient | None = None, github: GitHubClient | N
         recoverable = (
             session.query(Task)
             .filter(
-                Task.status == TaskStatus.FAILED,
+                Task.status.in_((TaskStatus.FAILED, TaskStatus.COMPLETED)),
                 Task.pull_request_url.is_(None),
                 Task.cursor_agent_id.isnot(None),
                 Task.created_at >= recheck_cutoff,
@@ -835,8 +882,11 @@ async def poll_once(cursor: CursorClient | None = None, github: GitHubClient | N
                 if refreshed.pull_request_url:
                     pr_number = _parse_pr_number(refreshed.pull_request_url)
                     if pr_number:
-                        await github.request_bugbot_review(
-                            refreshed.repository, pr_number
+                        await _safe_request_bugbot(
+                            github,
+                            refreshed.repository,
+                            pr_number,
+                            task_id=refreshed.id,
                         )
             elif new_status == TaskStatus.FAILED:
                 log_event(

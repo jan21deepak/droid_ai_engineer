@@ -17,6 +17,9 @@ class Settings(BaseSettings):
     github_webhook_secret: str = ""
     github_token: str = ""
     github_api_url: str = "https://api.github.com"
+    # Public base URL GitHub can reach (ngrok / cloudflared), e.g. https://abc.trycloudflare.com
+    # When set, forge installs issue webhooks on registered repos and Assign can rely on label→webhook.
+    public_base_url: str = ""
 
     cursor_api_key: str = ""
     # Retained for docs/health display; transport is owned by cursor-sdk

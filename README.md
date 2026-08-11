@@ -15,6 +15,11 @@ When a GitHub Issue is labeled `Cursor-complete` in a configured repository (e.g
 5. On completion, stores the **pull request URL, summary, and runtime**, comments ``bugbot run`` so **Cursor Bugbot** reviews the PR, and posts a ✅ comment back on the original issue.
 6. Exposes a live **dashboard**, a **metrics endpoint**, an orchestration-grade **health endpoint**, and a **follow-up** API (`POST /api/tasks/{id}/follow-up`) for SDK `Agent.resume` + `send`.
 
+**Two equivalent triggers**
+
+1. **GitHub label** — apply `Cursor-complete` on an issue. GitHub POSTs to `PUBLIC_BASE_URL/webhook` (tunnel required) and forge starts the agent.
+2. **Dashboard Assign** — **Add Issues** imports 5 open issues; **Assign to Cursor** applies the same `Cursor-complete` label on GitHub (so flow 1 can fire) and ensures the agent is created (waits for the webhook when `PUBLIC_BASE_URL` is set, otherwise dispatches directly; duplicates are ignored).
+
 ## Architecture
 
 Issue-fix Cloud Agents launch in the **Cursor environment configured for that repository** (e.g. Omnigent issues → Omnigent env, Superset → Superset env), not the forge app’s own environment. Each registered repo stores a `cursor_environment` name in SQLite; create uses `CloudEnvironment(name=…)` from the Cursor SDK.
@@ -313,6 +318,7 @@ Configure each repo’s environment name on the dashboard (**Repositories** → 
 | Variable | Description | Default |
 |---|---|---|
 | `GITHUB_WEBHOOK_SECRET` | Shared secret for webhook HMAC validation | — |
+| `PUBLIC_BASE_URL` | Public tunnel URL GitHub can reach (e.g. `https://….trycloudflare.com`). Enables label→webhook dispatch and `POST /api/webhooks/sync` | — |
 | `GITHUB_TOKEN` | PAT used to post comments / open same-repo PRs | — |
 | `REVIEW_AUTO_MERGE` | Squash-merge after Cursor review finishes (`true`/`false`) | `false` |
 | `BUGBOT_TRIGGER_ON_PR` | Comment `bugbot run` on forge PRs for Cursor Bugbot | `true` |

@@ -237,11 +237,142 @@ class GitHubClient:
             async with httpx.AsyncClient(timeout=15) as client:
                 resp = await client.post(url, headers=self._headers(), json={"labels": [label]})
                 resp.raise_for_status()
+            log_event(
+                logger,
+                logging.INFO,
+                "github.label_added",
+                repo=repository,
+                issue=issue_number,
+                label=label,
+            )
             return True
         except httpx.HTTPError as exc:
             log_event(logger, logging.WARNING, "github.label_failed", repo=repository,
                       issue=issue_number, label=label, error=str(exc))
             return False
+
+    async def ensure_label(
+        self,
+        repository: str,
+        name: str,
+        *,
+        color: str = "0E8A16",
+        description: str = "Assign to Cursor Forge for autonomous fix",
+    ) -> bool:
+        """Create the repo label if missing. Returns True if it exists or was created."""
+        if not self.token or not name:
+            return False
+        encoded = name.replace(" ", "%20")
+        async with httpx.AsyncClient(timeout=15) as client:
+            get = await client.get(
+                f"{self.api_url}/repos/{repository}/labels/{encoded}",
+                headers=self._headers(),
+            )
+            if get.status_code == 200:
+                return True
+            if get.status_code not in (404,):
+                log_event(
+                    logger,
+                    logging.WARNING,
+                    "github.label_lookup_failed",
+                    repo=repository,
+                    label=name,
+                    status=get.status_code,
+                )
+            create = await client.post(
+                f"{self.api_url}/repos/{repository}/labels",
+                headers=self._headers(),
+                json={"name": name, "color": color.lstrip("#"), "description": description[:100]},
+            )
+            if create.status_code in (201, 422):
+                # 422 = already exists (race)
+                return True
+            log_event(
+                logger,
+                logging.WARNING,
+                "github.label_create_failed",
+                repo=repository,
+                label=name,
+                status=create.status_code,
+                error=create.text[:200],
+            )
+            return False
+
+    async def ensure_issues_webhook(
+        self,
+        repository: str,
+        *,
+        webhook_url: str,
+        secret: str,
+    ) -> dict:
+        """Install or update an issues webhook pointing at forge's public URL."""
+        if not self.token:
+            raise RuntimeError("GitHub token is not configured")
+        webhook_url = (webhook_url or "").rstrip("/")
+        if not webhook_url.endswith("/webhook"):
+            webhook_url = f"{webhook_url}/webhook"
+        async with httpx.AsyncClient(timeout=20) as client:
+            listed = await client.get(
+                f"{self.api_url}/repos/{repository}/hooks",
+                headers=self._headers(),
+                params={"per_page": 100},
+            )
+            listed.raise_for_status()
+            hooks = listed.json() or []
+            existing = None
+            fallback = None
+            for hook in hooks:
+                cfg = hook.get("config") or {}
+                url = (cfg.get("url") or "").rstrip("/")
+                events = hook.get("events") or []
+                if url == webhook_url:
+                    existing = hook
+                    break
+                if fallback is None and url.endswith("/webhook") and "issues" in events:
+                    fallback = hook
+            if existing is None:
+                existing = fallback
+
+            payload = {
+                "name": "web",
+                "active": True,
+                "events": ["issues"],
+                "config": {
+                    "url": webhook_url,
+                    "content_type": "json",
+                    "secret": secret or "unset",
+                    "insecure_ssl": "0",
+                },
+            }
+            if existing:
+                hook_id = existing["id"]
+                resp = await client.patch(
+                    f"{self.api_url}/repos/{repository}/hooks/{hook_id}",
+                    headers=self._headers(),
+                    json=payload,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                action = "updated"
+            else:
+                resp = await client.post(
+                    f"{self.api_url}/repos/{repository}/hooks",
+                    headers=self._headers(),
+                    json=payload,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                action = "created"
+        log_event(
+            logger,
+            logging.INFO,
+            "github.webhook_ensured",
+            repo=repository,
+            action=action,
+            hook_id=data.get("id"),
+            url=webhook_url,
+        )
+        return {"action": action, "hook": data, "url": webhook_url}
 
     async def list_open_pull_requests(
         self, full_name: str, per_page: int = 50, max_pages: int = 5
