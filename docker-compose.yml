@@ -7,10 +7,12 @@ services:
       - .env
     environment:
       DATABASE_URL: sqlite:////data/tasks.db
+      WORKSPACE_ROOT: /data/workspace
     volumes:
-      - cursor_data:/data
+      - droid_data:/data
+      - droid_home:/home/appuser/.factory
     restart: unless-stopped
 
 volumes:
-  cursor_data:
-
+  droid_data:
+  droid_home:

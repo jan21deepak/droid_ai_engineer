@@ -59,46 +59,49 @@
   }
 
   // ---- Repositories ----
-  let cursorEnvironments = [];
+  let droidModels = [];
 
-  function environmentOptionsHtml(selected) {
+  function modelOptionsHtml(selected) {
     const current = (selected || "").trim();
-    const names = cursorEnvironments.map((e) => e.name);
-    const options = ['<option value="">None (bare clone)</option>'];
-    if (current && !names.includes(current)) {
+    const ids = droidModels.map((m) => m.id);
+    const options = ['<option value="">Default (auto)</option>'];
+    if (current && !ids.includes(current)) {
       options.push(
         `<option value="${escapeHtml(current)}" selected>${escapeHtml(current)} (saved)</option>`
       );
     }
-    for (const env of cursorEnvironments) {
-      const selectedAttr = env.name === current ? " selected" : "";
+    for (const model of droidModels) {
+      const selectedAttr = model.id === current ? " selected" : "";
+      const label = model.display_name && model.display_name !== model.id
+        ? `${model.display_name} (${model.id})`
+        : model.id;
       options.push(
-        `<option value="${escapeHtml(env.name)}"${selectedAttr}>${escapeHtml(env.name)}</option>`
+        `<option value="${escapeHtml(model.id)}"${selectedAttr}>${escapeHtml(label)}</option>`
       );
     }
     return options.join("");
   }
 
-  async function loadCursorEnvironments() {
+  async function loadDroidModels() {
     try {
-      const res = await fetch("/api/cursor/environments");
+      const res = await fetch("/api/droid/models");
       const data = await res.json();
-      if (!res.ok) throw new Error(data.detail || "Failed to load environments");
-      cursorEnvironments = data.environments || [];
+      if (!res.ok) throw new Error(data.detail || "Failed to load models");
+      droidModels = data.models || [];
     } catch (err) {
-      cursorEnvironments = [];
+      droidModels = [];
     }
   }
 
   async function loadRepos() {
     const tbody = $("#repos-tbody");
-    tbody.innerHTML = `<tr><td colspan="4" class="text-center text-muted py-4">Loading…</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="5" class="text-center text-muted py-4">Loading…</td></tr>`;
     try {
       const res = await fetch("/api/repositories");
       const data = await res.json();
       const repos = data.repositories || [];
       if (!repos.length) {
-        tbody.innerHTML = `<tr><td colspan="4" class="text-center text-muted py-4">No repositories yet. Add one above.</td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="5" class="text-center text-muted py-4">No repositories yet. Add one above.</td></tr>`;
         return;
       }
       tbody.innerHTML = repos
@@ -107,13 +110,19 @@
         <tr data-repo-id="${r.id}">
           <td>
             <a href="${r.url}" target="_blank" rel="noopener">${escapeHtml(r.full_name)}</a>
-            <div class="text-muted small text-truncate" style="max-width:280px">${escapeHtml(r.description || "")}</div>
+            <div class="text-muted small text-truncate" style="max-width:260px">${escapeHtml(r.description || "")}</div>
           </td>
-          <td style="min-width:180px">
-            <select class="form-select form-select-sm repo-env-input" data-id="${r.id}"
-                    title="Cursor Cloud Agents environment name">
-              ${environmentOptionsHtml(r.cursor_environment || "")}
+          <td style="min-width:160px">
+            <select class="form-select form-select-sm repo-model-input" data-id="${r.id}"
+                    title="Model id for this repository's Droid sessions">
+              ${modelOptionsHtml(r.droid_model || "")}
             </select>
+          </td>
+          <td style="min-width:200px">
+            <input type="text" class="form-control form-control-sm repo-setup-input" data-id="${r.id}"
+                   value="${escapeHtml(r.setup_command || "")}"
+                   placeholder="e.g. npm ci (optional)"
+                   title="Shell command run in the workspace clone before the session">
           </td>
           <td class="text-muted small">${r.created_at_display || formatSgt(r.created_at)}</td>
           <td class="text-end text-nowrap">
@@ -127,7 +136,7 @@
         )
         .join("");
     } catch (err) {
-      tbody.innerHTML = `<tr><td colspan="4" class="text-center text-danger py-4">Failed to load repositories</td></tr>`;
+      tbody.innerHTML = `<tr><td colspan="5" class="text-center text-danger py-4">Failed to load repositories</td></tr>`;
     }
   }
 
@@ -146,7 +155,7 @@
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.detail || "Failed to add repository");
-      showAlert(alert, data.detail === "already registered" ? "Repository already registered." : "Repository added. Set environment on the row below if needed.", "success");
+      showAlert(alert, data.detail === "already registered" ? "Repository already registered." : "Repository added. Set model / setup command on the row below if needed.", "success");
       $("#repo-url").value = "";
       await loadRepos();
     } catch (err) {
@@ -164,7 +173,8 @@
     if (saveBtn) {
       const id = saveBtn.dataset.id;
       const row = saveBtn.closest("tr");
-      const cursor_environment = row.querySelector(".repo-env-input")?.value.trim() || "";
+      const droid_model = row.querySelector(".repo-model-input")?.value.trim() || "";
+      const setup_command = row.querySelector(".repo-setup-input")?.value.trim() || "";
       hideAlert(alert);
       saveBtn.disabled = true;
       saveBtn.textContent = "Saving…";
@@ -172,16 +182,16 @@
         const res = await fetch(`/api/repositories/${id}`, {
           method: "PATCH",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ cursor_environment }),
+          body: JSON.stringify({ droid_model, setup_command }),
         });
         const data = await res.json();
         if (!res.ok) throw new Error(data.detail || "Failed to update repository");
-        const env = data.repository?.cursor_environment;
+        const model = data.repository?.droid_model;
         showAlert(
           alert,
-          env
-            ? `Saved environment "${env}" for ${data.repository.full_name}.`
-            : `Cleared environment for ${data.repository.full_name}; agents will use a bare repo clone.`,
+          model
+            ? `Saved model "${model}" for ${data.repository.full_name}.`
+            : `Saved config for ${data.repository.full_name}; sessions use the default model.`,
           "success"
         );
       } catch (err) {
@@ -226,7 +236,7 @@
   });
 
   $("#refresh-repos").addEventListener("click", () => {
-    loadCursorEnvironments().then(() => loadRepos());
+    loadDroidModels().then(() => loadRepos());
   });
 
   // ---- Issues ----
@@ -238,9 +248,9 @@
 
   function updateAssignButton() {
     const selected = $$(".issue-check:checked:not(:disabled)");
-    $("#assign-cursor-btn").disabled = selected.length === 0;
-    $("#assign-cursor-btn").textContent =
-      selected.length > 0 ? `Assign to Cursor (${selected.length})` : "Assign to Cursor";
+    $("#assign-droid-btn").disabled = selected.length === 0;
+    $("#assign-droid-btn").textContent =
+      selected.length > 0 ? `Assign to Droid (${selected.length})` : "Assign to Droid";
   }
 
   function renderIssueRow(issue) {
@@ -355,12 +365,12 @@
 
   $("#refresh-issues").addEventListener("click", loadIssues);
 
-  $("#assign-cursor-btn").addEventListener("click", async () => {
+  $("#assign-droid-btn").addEventListener("click", async () => {
     const alert = $("#issues-alert");
     hideAlert(alert);
     const ids = $$(".issue-check:checked:not(:disabled)").map((cb) => Number(cb.value));
     if (!ids.length) return;
-    const btn = $("#assign-cursor-btn");
+    const btn = $("#assign-droid-btn");
     btn.disabled = true;
     btn.textContent = "Assigning…";
     try {
@@ -371,7 +381,7 @@
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.detail || "Assignment failed");
-      showAlert(alert, `Assigned ${data.accepted} issue(s) to Cursor.`, "success");
+      showAlert(alert, `Assigned ${data.accepted} issue(s) to Droid.`, "success");
       await loadIssues();
       await refreshMetrics();
       const tab = new bootstrap.Tab($("#metrics-tab"));
@@ -431,7 +441,7 @@
     }));
     datasets.push({
       type: "line",
-      label: "Cursor runtime (min)",
+      label: "Droid runtime (min)",
       data: rows.map((d) => d.runtime_minutes || 0),
       borderColor: NEON.amber,
       backgroundColor: NEON.amber,
@@ -592,16 +602,18 @@
         if (t.status === "completed" && t.merged) {
           statusLabel = `<span class="badge text-bg-success">Completed · Merged</span>`;
         }
-        const sessionBtn = t.cursor_agent_url
-          ? `<a class="btn btn-sm btn-outline-dark" href="${t.cursor_agent_url}" target="_blank" rel="noopener">${isReview ? "Cursor Review" : "Cursor Agent"}</a>`
-          : `<span class="text-muted">—</span>`;
+        const session = t.droid_session_url
+          ? `<a class="btn btn-sm btn-outline-dark" href="${t.droid_session_url}" target="_blank" rel="noopener">${isReview ? "Droid Review" : "Droid Fix"}</a>`
+          : t.droid_session_id
+            ? `<span class="badge text-bg-dark" title="Droid session ${escapeHtml(t.droid_session_id)}">${escapeHtml(String(t.droid_session_id).slice(0, 8))}</span>`
+            : `<span class="text-muted">—</span>`;
         return `
           <tr>
             <td>${typeBadge}</td>
             <td>${escapeHtml(t.repository)}</td>
             <td>${target}</td>
             <td>${statusLabel}</td>
-            <td>${sessionBtn}</td>
+            <td>${session}</td>
             <td>${link}</td>
             <td class="text-muted small">${runtime}</td>
             <td class="text-muted small">${completed}</td>
@@ -713,7 +725,7 @@
   }
 
   // Initial load
-  loadCursorEnvironments().then(() => loadRepos());
+  loadDroidModels().then(() => loadRepos());
   loadIssues();
   initTooltips();
   refreshMetrics();

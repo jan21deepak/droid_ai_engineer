@@ -8,7 +8,7 @@ def test_dashboard_html(client):
     resp = client.get("/dashboard")
     assert resp.status_code == 200
     assert "text/html" in resp.headers.get("content-type", "")
-    assert b"Cursor Forge" in resp.content
+    assert b"Droid Forge" in resp.content
 
 
 def test_health_reports_components(client):
@@ -18,4 +18,4 @@ def test_health_reports_components(client):
     assert data["application"] == "ok"
     assert data["checks"]["database"] == "ok"
     assert data["status"] in ("healthy", "degraded")
-    assert set(data["checks"]) == {"database", "github", "cursor"}
+    assert set(data["checks"]) == {"database", "github", "droid"}

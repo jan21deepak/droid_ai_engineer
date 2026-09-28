@@ -1,13 +1,14 @@
-"""Shared task / Cursor agent creation used by webhook and dashboard APIs."""
+"""Shared task / Droid session dispatch used by webhook and dashboard APIs."""
 
 import json
 import logging
 
-from app.cursor_client import CursorClient, build_prompt
+from app import worker
+from app.config import get_settings
 from app.database import db_session
+from app.droid_client import get_droid_client
 from app.logging_conf import log_event
 from app.models import Task, TaskStatus
-from app.repos import resolve_agent_launch_config
 
 logger = logging.getLogger("app.tasks")
 
@@ -29,9 +30,11 @@ async def create_and_dispatch_task(
     issue_body: str,
     labels: list[str] | None = None,
 ) -> dict:
-    """Persist a Task and create a Cursor Cloud Agent when configured.
+    """Persist a Task and launch a local Droid fix session when configured.
 
-    Returns ``{"task_id": int, "agent_id": str | None, "run_id": str | None, "status": str}``.
+    Returns ``{"task_id": int, "session_id": str | None, "status": str}``.
+    The Droid session is launched in the background so webhook callers get an
+    immediate 202 (GitHub kills webhook deliveries after ~10 seconds).
     """
     with db_session() as session:
         existing = (
@@ -68,60 +71,26 @@ async def create_and_dispatch_task(
         task_id=task_id, repo=repository, issue=issue_number,
     )
 
-    agent_id = None
-    run_id = None
-    status = TaskStatus.QUEUED
-    cursor = CursorClient()
-    if not cursor.configured:
-        log_event(logger, logging.WARNING, "cursor.not_configured", task_id=task_id)
-        return {"task_id": task_id, "agent_id": None, "run_id": None, "status": status}
+    droid = get_droid_client()
+    if not droid.configured:
+        log_event(logger, logging.WARNING, "droid.not_configured", task_id=task_id)
+        return {"task_id": task_id, "session_id": None, "status": TaskStatus.QUEUED}
 
-    launch = resolve_agent_launch_config(repository=repository, repository_url=repository_url)
-    prompt = build_prompt(repository_url, issue_number, issue_title, issue_body or "")
-    try:
-        result = await cursor.create_agent(
-            prompt,
-            repository_url=repository_url,
-            name=f"{repository}#{issue_number}: {issue_title}"[:80],
-            # Forge opens same-repo PRs via PAT. Cursor autoCreatePR on forks
-            # often targets the upstream parent and fails permissions.
-            auto_create_pr=False,
-            environment=launch.get("environment"),
-            starting_ref=launch.get("starting_ref"),
-        )
-        agent_id = result.get("agent_id")
-        run_id = result.get("run_id")
-        with db_session() as session:
-            db_task = session.get(Task, task_id)
-            db_task.cursor_agent_id = agent_id
-            db_task.cursor_run_id = run_id
-            db_task.status = TaskStatus.RUNNING
-        status = TaskStatus.RUNNING
-        log_event(
-            logger, logging.INFO, "cursor.agent_linked",
-            task_id=task_id, agent_id=agent_id, run_id=run_id,
-            environment=launch.get("environment"),
-        )
-    except Exception as exc:
-        with db_session() as session:
-            db_task = session.get(Task, task_id)
-            db_task.status = TaskStatus.FAILED
-            db_task.error = f"Cursor agent creation failed: {exc}"
-        log_event(
-            logger, logging.ERROR, "cursor.agent_create_failed",
-            task_id=task_id, error=str(exc),
-            environment=launch.get("environment"),
-        )
-        raise TaskCreateError(
-            "Cursor agent creation failed",
-            status_code=502,
-            task_id=task_id,
-        ) from exc
+    # Launch in the background: workspace clone + session open can take longer
+    # than GitHub's webhook delivery window. The task flips to RUNNING (with a
+    # session id) as soon as launch_fix_task succeeds.
+    worker.spawn_fix_launch(
+        task_id,
+        repository=repository,
+        repository_url=repository_url,
+        issue_number=issue_number,
+        issue_title=issue_title,
+        issue_body=issue_body or "",
+    )
 
     return {
         "task_id": task_id,
-        "agent_id": agent_id,
-        "run_id": run_id,
-        "status": status,
-        "environment": launch.get("environment"),
+        "session_id": None,
+        "status": TaskStatus.QUEUED,
+        "detail": "launching",
     }

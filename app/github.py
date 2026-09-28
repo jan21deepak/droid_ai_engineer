@@ -120,44 +120,6 @@ class GitHubClient:
                 page += 1
         return comments
 
-    async def request_bugbot_review(self, repository: str, pr_number: int) -> bool:
-        """Ask Cursor Bugbot to review a PR by commenting ``bugbot run`` (idempotent)."""
-        if not get_settings().bugbot_trigger_on_pr:
-            return False
-        try:
-            existing = await self.list_issue_comments(repository, pr_number)
-        except httpx.HTTPError as exc:
-            log_event(
-                logger,
-                logging.WARNING,
-                "github.bugbot_trigger_failed",
-                repo=repository,
-                pr=pr_number,
-                error=str(exc),
-            )
-            return False
-        for comment in existing:
-            body = (comment.get("body") or "").strip().lower()
-            if body == "bugbot run" or body.startswith("bugbot run"):
-                log_event(
-                    logger,
-                    logging.INFO,
-                    "github.bugbot_already_requested",
-                    repo=repository,
-                    pr=pr_number,
-                )
-                return False
-        ok = await self.post_issue_comment(repository, pr_number, "bugbot run")
-        if ok:
-            log_event(
-                logger,
-                logging.INFO,
-                "github.bugbot_requested",
-                repo=repository,
-                pr=pr_number,
-            )
-        return ok
-
     async def get_repository(self, full_name: str) -> dict:
         """Fetch repository metadata. Raises httpx.HTTPStatusError on failure."""
         url = f"{self.api_url}/repos/{full_name}"
@@ -237,14 +199,8 @@ class GitHubClient:
             async with httpx.AsyncClient(timeout=15) as client:
                 resp = await client.post(url, headers=self._headers(), json={"labels": [label]})
                 resp.raise_for_status()
-            log_event(
-                logger,
-                logging.INFO,
-                "github.label_added",
-                repo=repository,
-                issue=issue_number,
-                label=label,
-            )
+            log_event(logger, logging.INFO, "github.label_added", repo=repository,
+                      issue=issue_number, label=label)
             return True
         except httpx.HTTPError as exc:
             log_event(logger, logging.WARNING, "github.label_failed", repo=repository,
@@ -257,7 +213,7 @@ class GitHubClient:
         name: str,
         *,
         color: str = "0E8A16",
-        description: str = "Assign to Cursor Forge for autonomous fix",
+        description: str = "Assign to Droid Forge for autonomous fix",
     ) -> bool:
         """Create the repo label if missing. Returns True if it exists or was created."""
         if not self.token or not name:
@@ -483,6 +439,41 @@ class GitHubClient:
         )
         return pr
 
+    async def create_pull_request_review(
+        self,
+        repository: str,
+        pr_number: int,
+        body: str,
+        *,
+        event: str = "COMMENT",
+    ) -> dict:
+        """Post a PR review on behalf of the forge token (Droid review agent).
+
+        ``event`` is one of COMMENT, APPROVE, REQUEST_CHANGES. GitHub rejects
+        APPROVE / REQUEST_CHANGES when the token owner authored the PR; callers
+        should retry with COMMENT on 403/422.
+        """
+        if not self.token:
+            raise RuntimeError("GitHub token is not configured")
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                f"{self.api_url}/repos/{repository}/pulls/{pr_number}/reviews",
+                headers=self._headers(),
+                json={"body": body, "event": event},
+            )
+            resp.raise_for_status()
+            review = resp.json()
+        log_event(
+            logger,
+            logging.INFO,
+            "github.review_posted",
+            repo=repository,
+            pr=pr_number,
+            event=event,
+            review_id=review.get("id"),
+        )
+        return review
+
     async def find_open_pull_request_for_head(
         self, repository: str, head: str
     ) -> dict | None:
@@ -630,7 +621,7 @@ class GitHubClient:
                     "github.auto_merge_failed",
                     repo=repository,
                     pr=pr_number,
-                    error=str(payload["errors"]),
+                    error=payload["errors"],
                 )
                 return False
             log_event(

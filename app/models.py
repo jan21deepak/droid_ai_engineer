@@ -31,11 +31,12 @@ class Repository(Base):
     full_name: Mapped[str] = mapped_column(String(255), unique=True, index=True)
     url: Mapped[str] = mapped_column(String(512), default="")
     description: Mapped[str] = mapped_column(Text, default="")
-    # Named Cursor Cloud Agent environment for this repo (dashboard → Cloud Agents).
-    # When set, fix agents launch with CloudEnvironment(name=...) instead of a bare
-    # repos=[] clone, so Omnigent issues use the Omnigent env, etc.
-    cursor_environment: Mapped[str] = mapped_column(String(255), default="")
-    # Optional starting git ref for agents when not using a named environment.
+    # Optional shell command run in the freshly cloned workspace before the
+    # Droid session starts (e.g. "pip install -e .", "npm ci").
+    setup_command: Mapped[str] = mapped_column(String(1000), default="")
+    # Optional per-repo model id override; empty = global DROID_MODEL ("auto").
+    droid_model: Mapped[str] = mapped_column(String(128), default="")
+    # Optional starting git ref for fix workspaces when cloning.
     starting_ref: Mapped[str] = mapped_column(String(255), default="")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
@@ -47,7 +48,8 @@ class Repository(Base):
             "full_name": self.full_name,
             "url": self.url,
             "description": self.description,
-            "cursor_environment": self.cursor_environment or "",
+            "setup_command": self.setup_command or "",
+            "droid_model": self.droid_model or "",
             "starting_ref": self.starting_ref or "",
             "created_at": iso_sgt(self.created_at),
             "created_at_display": format_sgt(self.created_at),
@@ -55,7 +57,7 @@ class Repository(Base):
 
 
 class SyncedIssue(Base):
-    """Open GitHub issues pulled into the app for manual Cursor assignment."""
+    """Open GitHub issues pulled into the app for manual Droid assignment."""
 
     __tablename__ = "synced_issues"
     __table_args__ = (UniqueConstraint("repository", "issue_number", name="uq_repo_issue"),)
@@ -90,6 +92,8 @@ class SyncedIssue(Base):
 
 
 class Task(Base):
+    """One issue-fix run: a local Droid session in a workspace clone."""
+
     __tablename__ = "tasks"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -99,8 +103,7 @@ class Task(Base):
     issue_title: Mapped[str] = mapped_column(String(512), default="")
     issue_body: Mapped[str] = mapped_column(Text, default="")
     labels: Mapped[str] = mapped_column(Text, default="[]")
-    cursor_agent_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
-    cursor_run_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    droid_session_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
     status: Mapped[str] = mapped_column(String(32), default=TaskStatus.QUEUED, index=True)
     pull_request_url: Mapped[str | None] = mapped_column(String(512), nullable=True)
     # Refreshed from GitHub so delivery metrics don't depend on review rows existing.
@@ -108,7 +111,7 @@ class Task(Base):
     pr_merged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     summary: Mapped[str | None] = mapped_column(Text, nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
-    acus_consumed: Mapped[float | None] = mapped_column(Float, nullable=True)
+    factory_credits: Mapped[float | None] = mapped_column(Float, nullable=True)
     estimated_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     cost_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
@@ -118,25 +121,21 @@ class Task(Base):
     duration_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
 
     def to_dict(self) -> dict:
-        session_url = None
-        if self.cursor_agent_id:
-            session_url = f"https://cursor.com/agents/{self.cursor_agent_id}"
         return {
             "id": self.id,
             "repository": self.repository,
             "repository_url": self.repository_url,
             "issue_number": self.issue_number,
             "issue_title": self.issue_title,
-            "cursor_agent_id": self.cursor_agent_id,
-            "cursor_run_id": self.cursor_run_id,
-            "cursor_agent_url": session_url,
+            "droid_session_id": self.droid_session_id,
+            "droid_session_url": None,
             "status": self.status,
             "pull_request_url": self.pull_request_url,
             "pr_state": self.pr_state,
             "merged": self.pr_state == "merged",
             "pr_merged_at": iso_sgt(self.pr_merged_at),
             "summary": self.summary,
-            "acus_consumed": self.acus_consumed,
+            "factory_credits": self.factory_credits,
             "estimated_tokens": self.estimated_tokens,
             "cost_usd": self.cost_usd,
             "created_at": iso_sgt(self.created_at),
@@ -149,7 +148,7 @@ class Task(Base):
 
 
 class SyncedPullRequest(Base):
-    """Open, non-draft PRs available for Cursor Review assignment."""
+    """Open, non-draft PRs available for Droid review assignment."""
 
     __tablename__ = "synced_pull_requests"
     __table_args__ = (UniqueConstraint("repository", "pr_number", name="uq_repo_pr"),)
@@ -186,7 +185,7 @@ class SyncedPullRequest(Base):
 
 
 class ReviewTask(Base):
-    """Tracks a Cursor Cloud Agent review run against a pull request, including auto-merge."""
+    """Tracks a Droid review session against a pull request, including auto-merge."""
 
     __tablename__ = "review_tasks"
 
@@ -197,13 +196,13 @@ class ReviewTask(Base):
     pr_title: Mapped[str] = mapped_column(String(512), default="")
     pr_url: Mapped[str] = mapped_column(String(512), default="")
     commit_sha: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    cursor_agent_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
-    cursor_run_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    droid_session_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
     status: Mapped[str] = mapped_column(String(32), default=TaskStatus.QUEUED, index=True)
     merged: Mapped[bool] = mapped_column(Boolean, default=False)
     auto_merge_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     summary: Mapped[str | None] = mapped_column(Text, nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    factory_credits: Mapped[float | None] = mapped_column(Float, nullable=True)
     cost_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
@@ -212,11 +211,6 @@ class ReviewTask(Base):
     duration_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
 
     def to_dict(self) -> dict:
-        review_url = self.pr_url or None
-        if self.cursor_agent_id and self.cursor_agent_id != "bugbot":
-            review_url = f"https://cursor.com/agents/{self.cursor_agent_id}"
-        elif self.pr_url:
-            review_url = self.pr_url
         return {
             "id": self.id,
             "repository": self.repository,
@@ -225,19 +219,19 @@ class ReviewTask(Base):
             "pr_title": self.pr_title,
             "pr_url": self.pr_url,
             "commit_sha": self.commit_sha,
-            "cursor_agent_id": self.cursor_agent_id,
-            "cursor_run_id": self.cursor_run_id,
+            "droid_session_id": self.droid_session_id,
+            "droid_session_url": None,
             "status": self.status,
             "merged": self.merged,
             "auto_merge_enabled": self.auto_merge_enabled,
             "summary": self.summary,
             "error": self.error,
+            "factory_credits": self.factory_credits,
             "cost_usd": self.cost_usd,
             "created_at": iso_sgt(self.created_at),
             "created_at_display": format_sgt(self.created_at),
             "completed_at": iso_sgt(self.completed_at),
             "completed_at_display": format_sgt(self.completed_at),
             "duration_seconds": self.duration_seconds,
-            "cursor_agent_url": review_url,
             "kind": "review",
         }

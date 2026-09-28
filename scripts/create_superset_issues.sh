@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Create sample issues on jan21deepak/superset labeled Cursor-complete.
+# Create sample issues on jan21deepak/superset labeled Droid-complete.
 # Requires: gh auth as an account with write access to that repo.
 set -euo pipefail
 REPO="${REPO:-jan21deepak/superset}"
-LABEL="${LABEL:-Cursor-complete}"
+LABEL="${LABEL:-Droid-complete}"
 
-gh label create "$LABEL" --repo "$REPO" --color "0E8A16" --description "Trigger Cursor AI Engineer automation" 2>/dev/null || true
+gh label create "$LABEL" --repo "$REPO" --color "0E8A16" --description "Trigger Droid Forge automation" 2>/dev/null || true
 
 create_issue() {
   local title="$1"

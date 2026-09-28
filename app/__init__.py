@@ -1,5 +1,3 @@
-"""cursor-ai-engineer: GitHub Issue -> Cursor Cloud Agent automation service."""
+"""droid-ai-engineer: GitHub Issue -> Droid (Factory) agent automation service."""
 
-__version__ = "1.0.0"
-
-
+__version__ = "2.0.0"

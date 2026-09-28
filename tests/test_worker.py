@@ -1,4 +1,7 @@
+"""Tests for event-driven Droid run finalization and GitHub state polling."""
+
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -8,82 +11,31 @@ from app.database import db_session
 from app.models import ReviewTask, Task, TaskStatus
 
 
-class StubCursor:
-    """Minimal CursorClient stand-in returning a fixed run payload."""
-
-    configured = True
-
-    def __init__(self, run_payload, *, status=None, pr_url=None):
-        self.run_payload = run_payload
-        self._status = status
-        self._pr_url = pr_url
-
-    async def get_agent_status(self, agent_id, run_id=None):
-        status = self._status
-        if status is None:
-            from app.cursor_client import map_run_status, extract_pull_request_url
-
-            pr = self._pr_url or extract_pull_request_url(self.run_payload)
-            status = map_run_status(self.run_payload.get("status"), bool(pr))
-        pr_url = self._pr_url
-        if pr_url is None:
-            from app.cursor_client import extract_pull_request_url
-
-            pr_url = extract_pull_request_url(self.run_payload)
-        return status, pr_url, self.run_payload
-
-    async def get_run_summary(self, agent_id, run_id=None):
-        return self.run_payload.get("result") or "Fixed the bug."
-
-    async def create_review_agent(self, **kwargs):
-        raise AssertionError("review create not expected in this test")
-
-
 class StubGitHub:
-    def __init__(self, pull_requests=None, reviews=None):
+    def __init__(self, pull_requests=None):
         self.pull_requests = pull_requests or {}
-        self.reviews = reviews or {}
         self.comments = []
         self.created_prs = []
-        self.bugbot_requests = []
+        self.review_posts = []
 
     async def post_issue_comment(self, repository, issue_number, body):
         self.comments.append((repository, issue_number, body))
-        return True
-
-    async def list_issue_comments(self, repository, issue_number, *, per_page=100):
-        return [
-            {"body": body}
-            for repo, num, body in self.comments
-            if repo == repository and num == issue_number
-        ]
-
-    async def request_bugbot_review(self, repository, pr_number):
-        # Mirror production: post idempotent trigger comment
-        existing = await self.list_issue_comments(repository, pr_number)
-        if any((c.get("body") or "").strip().lower().startswith("bugbot run") for c in existing):
-            return False
-        await self.post_issue_comment(repository, pr_number, "bugbot run")
-        self.bugbot_requests.append((repository, pr_number))
         return True
 
     async def get_pull_request(self, repository, pr_number):
         return self.pull_requests.get((repository, pr_number), {"state": "open"})
 
     async def merge_pull_request(self, *args, **kwargs):
-        raise AssertionError("auto-merge should be disabled")
+        raise AssertionError("auto-merge should be disabled by default")
 
     async def enable_auto_merge(self, *args, **kwargs):
-        raise AssertionError("auto-merge should be disabled")
-
-    async def list_pull_request_reviews(self, repository, pr_number):
-        return self.reviews.get((repository, pr_number), [])
-
-    async def find_open_pull_request_for_head(self, repository, head):
-        return None
+        raise AssertionError("auto-merge should be disabled by default")
 
     async def get_repository(self, full_name):
         return {"default_branch": "main", "full_name": full_name}
+
+    async def find_open_pull_request_for_head(self, repository, head):
+        return None
 
     async def create_pull_request(
         self, repository, *, title, head, base, body="", draft=False, same_repo=True
@@ -97,19 +49,43 @@ class StubGitHub:
             "number": 99,
             "html_url": f"https://github.com/{repository}/pull/99",
             "title": title,
-            "head": {
-                "ref": head_ref.split(":", 1)[-1],
-                "repo": {"full_name": repository},
-            },
-            "base": {
-                "ref": base,
-                "repo": {"full_name": repository},
-            },
+            "head": {"ref": head_ref.split(":", 1)[-1], "repo": {"full_name": repository}},
+            "base": {"ref": base, "repo": {"full_name": repository}},
             "body": body,
             "_head_param": head_ref,
         }
         self.created_prs.append(pr)
         return pr
+
+    async def create_pull_request_review(self, repository, pr_number, body, *, event="COMMENT"):
+        self.review_posts.append((repository, pr_number, body, event))
+        return {"id": 1, "event": event}
+
+
+class StubDroid:
+    """DroidClient stand-in for finalize paths."""
+
+    configured = True
+
+    def __init__(self, branch="droid/fix-branch"):
+        self.branch = branch
+        self.resumed: list[str] = []
+        self.pushed: list[str] = []
+
+    @property
+    def active_sessions(self):
+        return set()
+
+    async def current_branch(self, repository, task_id):
+        return self.branch
+
+    async def ensure_branch_pushed(self, repository, task_id, branch):
+        self.pushed.append(branch)
+        return True
+
+    async def resume_interrupted(self, session_id, *, on_complete=None):
+        self.resumed.append(session_id)
+        return {"session_id": session_id, "status": "running"}
 
 
 def add_task(**overrides):
@@ -118,12 +94,9 @@ def add_task(**overrides):
         repository_url="https://github.com/jan21deepak/omnigent",
         issue_number=2,
         issue_title="[Bug] cold start can call StartCascade",
-        cursor_agent_id="bc-abc",
-        cursor_run_id="run-abc",
-        status=TaskStatus.FAILED,
+        droid_session_id="sess-abc",
+        status=TaskStatus.RUNNING,
         created_at=datetime.now(timezone.utc),
-        completed_at=datetime.now(timezone.utc),
-        duration_seconds=719.0,
     )
     defaults.update(overrides)
     with db_session() as session:
@@ -133,160 +106,270 @@ def add_task(**overrides):
         return task.id
 
 
-async def _noop(*args, **kwargs):
-    return None
+def success_outcome(text="Fixed the bug.\nBRANCH: droid/fix-branch", duration=734.0):
+    return {
+        "session_id": "sess-abc",
+        "kind": "fix",
+        "success": True,
+        "subtype": "success",
+        "text": text,
+        "duration_seconds": duration,
+        "credits": 2.5,
+        "tokens": 12345,
+        "error": None,
+    }
 
 
-async def _zero(*args, **kwargs):
-    return 0
+def failure_outcome(error="droid crashed"):
+    return {
+        "session_id": "sess-abc",
+        "kind": "fix",
+        "success": False,
+        "subtype": "error_during_execution",
+        "text": "",
+        "duration_seconds": 12.0,
+        "credits": None,
+        "tokens": None,
+        "error": error,
+    }
 
 
 @pytest.mark.asyncio
-async def test_failed_task_is_recovered_when_pr_appears_later(client, monkeypatch):
-    """A failed agent can still open a PR afterwards — recover on recheck."""
+async def test_finalize_fix_task_success_opens_pr_comments_and_starts_review(client, monkeypatch):
     task_id = add_task()
-    pr_url = "https://github.com/jan21deepak/omnigent/pull/7"
-    cursor = StubCursor(
-        {
-            "id": "run-abc",
-            "status": "FINISHED",
-            "result": "Opened PR",
-            "durationMs": 12000,
-            "git": {"branches": [{"prUrl": pr_url}]},
-        }
-    )
     github = StubGitHub()
-    monkeypatch.setattr(worker, "ensure_review_for_pr", _noop)
-    monkeypatch.setattr(worker, "poll_reviews_once", _zero)
+    droid = StubDroid()
+    started_reviews = []
 
-    await worker.poll_once(cursor=cursor, github=github)
+    async def fake_start_pr_review(**kwargs):
+        started_reviews.append(kwargs)
+        return {"review_id": 77, "started": True, "detail": "droid_review_started"}
 
-    with db_session() as session:
-        task = session.get(Task, task_id)
-        assert task.status == TaskStatus.COMPLETED
-        assert task.pull_request_url == pr_url
-    assert github.comments, "completion comment should be posted on recovery"
+    monkeypatch.setattr(worker, "GitHubClient", lambda: github)
+    monkeypatch.setattr(worker, "get_droid_client", lambda: droid)
+    monkeypatch.setattr(worker, "start_pr_review", fake_start_pr_review)
 
-
-@pytest.mark.asyncio
-async def test_failed_task_without_pr_stays_failed(client, monkeypatch):
-    task_id = add_task()
-    cursor = StubCursor({"id": "run-abc", "status": "ERROR", "git": {"branches": []}})
-    github = StubGitHub()
-    monkeypatch.setattr(worker, "ensure_review_for_pr", _noop)
-    monkeypatch.setattr(worker, "poll_reviews_once", _zero)
-
-    await worker.poll_once(cursor=cursor, github=github)
-
-    with db_session() as session:
-        assert session.get(Task, task_id).status == TaskStatus.FAILED
-    assert not github.comments
-
-
-@pytest.mark.asyncio
-async def test_pr_fallback_opens_pr_when_cursor_only_pushed_branch(client, monkeypatch):
-    """When Cursor pushes a branch but cannot open a PR, forge opens it via PAT."""
-    task_id = add_task(
-        status=TaskStatus.RUNNING,
-        completed_at=None,
-        duration_seconds=None,
-        issue_number=58,
-        issue_title="[Bug] Android switcher height",
-    )
-    cursor = StubCursor(
-        {
-            "id": "run-abc",
-            "status": "FINISHED",
-            "result": (
-                "Branch cursor/android-switcher-height-0e0c is pushed, but PR "
-                "creation failed due to repository permissions (must be a collaborator)."
-            ),
-            "durationMs": 5000,
-            "git": {
-                "branches": [
-                    {
-                        "branch": "cursor/android-switcher-height-0e0c",
-                        "prUrl": "",
-                    }
-                ]
-            },
-        }
-    )
-    github = StubGitHub()
-    monkeypatch.setattr(worker, "ensure_review_for_pr", _noop)
-    monkeypatch.setattr(worker, "poll_reviews_once", _zero)
-
-    await worker.poll_once(cursor=cursor, github=github)
+    await worker.finalize_fix_task(task_id, success_outcome())
 
     with db_session() as session:
         task = session.get(Task, task_id)
         assert task.status == TaskStatus.COMPLETED
         assert task.pull_request_url == "https://github.com/jan21deepak/omnigent/pull/99"
-    assert github.created_prs
-    assert github.created_prs[0]["head"]["ref"] == "cursor/android-switcher-height-0e0c"
-    assert github.created_prs[0]["_head_param"] == "jan21deepak:cursor/android-switcher-height-0e0c"
+        assert task.summary.startswith("Fixed the bug.")
+        assert task.duration_seconds == 734.0
+        assert task.factory_credits == 2.5
+        assert task.estimated_tokens == 12345
+        assert task.completed_at is not None
+
+    assert github.created_prs, "forge should open the same-repo PR via PAT"
+    assert github.created_prs[0]["_head_param"] == "jan21deepak:droid/fix-branch"
     assert github.created_prs[0]["base"]["repo"]["full_name"] == "jan21deepak/omnigent"
-    assert github.bugbot_requests == [("jan21deepak/omnigent", 99)]
-    assert any(body == "bugbot run" for _, _, body in github.comments)
+    assert github.comments, "completion comment should be posted on the issue"
+    assert "sess-abc" in github.comments[0][2]
+    assert started_reviews, "PR review session should be started"
+    assert started_reviews[0]["pr_number"] == 99
 
 
 @pytest.mark.asyncio
-async def test_review_completion_does_not_auto_merge_by_default(client, monkeypatch):
-    """REVIEW_AUTO_MERGE defaults to false so Bugbot can review before merge."""
-    from app.config import get_settings
+async def test_finalize_fix_task_success_reuses_existing_pr(client, monkeypatch):
+    task_id = add_task(
+        pull_request_url="https://github.com/jan21deepak/omnigent/pull/7",
+        pr_state="open",
+    )
+    github = StubGitHub()
+    droid = StubDroid()
+    started_reviews = []
 
-    get_settings.cache_clear()
-    assert get_settings().review_auto_merge is False
+    async def fake_start_pr_review(**kwargs):
+        started_reviews.append(kwargs)
+        return {"review_id": 78, "started": True, "detail": "droid_review_started"}
 
+    monkeypatch.setattr(worker, "GitHubClient", lambda: github)
+    monkeypatch.setattr(worker, "get_droid_client", lambda: droid)
+    monkeypatch.setattr(worker, "start_pr_review", fake_start_pr_review)
+
+    await worker.finalize_fix_task(task_id, success_outcome())
+
+    assert not github.created_prs, "existing PR must not be duplicated"
+    with db_session() as session:
+        task = session.get(Task, task_id)
+        assert task.pull_request_url.endswith("/pull/7")
+    assert started_reviews and started_reviews[0]["pr_number"] == 7
+
+
+@pytest.mark.asyncio
+async def test_finalize_fix_task_failure_marks_failed(client, monkeypatch):
+    task_id = add_task()
+    github = StubGitHub()
+    monkeypatch.setattr(worker, "GitHubClient", lambda: github)
+    monkeypatch.setattr(worker, "get_droid_client", lambda: StubDroid())
+
+    await worker.finalize_fix_task(task_id, failure_outcome())
+
+    with db_session() as session:
+        task = session.get(Task, task_id)
+        assert task.status == TaskStatus.FAILED
+        assert "droid crashed" in task.error
+    assert not github.comments
+    assert not github.created_prs
+
+
+def test_ensure_review_task_row_dedupes_active():
+    first_id, created = worker.ensure_review_task_row(
+        repository="jan21deepak/omnigent", pr_number=5
+    )
+    assert created is True
+    second_id, created_again = worker.ensure_review_task_row(
+        repository="jan21deepak/omnigent", pr_number=5
+    )
+    assert created_again is False
+    assert second_id == first_id
+
+    # A completed review does not block a fresh review request.
+    with db_session() as session:
+        session.get(ReviewTask, first_id).status = TaskStatus.COMPLETED
+    third_id, created_third = worker.ensure_review_task_row(
+        repository="jan21deepak/omnigent", pr_number=5
+    )
+    assert created_third is True
+    assert third_id != first_id
+
+
+@pytest.mark.asyncio
+async def test_finalize_review_task_posts_github_review_with_verdict(client, monkeypatch):
     with db_session() as session:
         review = ReviewTask(
             repository="jan21deepak/omnigent",
             repository_url="https://github.com/jan21deepak/omnigent",
-            pr_number=69,
-            pr_title="Keep open for Bugbot",
-            pr_url="https://github.com/jan21deepak/omnigent/pull/69",
-            cursor_agent_id="bc-review",
-            cursor_run_id="run-review",
+            pr_number=9,
+            pr_title="Fix the thing",
+            pr_url="https://github.com/jan21deepak/omnigent/pull/9",
+            droid_session_id="sess-rev",
             status=TaskStatus.RUNNING,
         )
         session.add(review)
         session.flush()
         review_id = review.id
 
-    class DoneCursor(StubCursor):
-        async def get_agent_status(self, agent_id, run_id=None):
-            return TaskStatus.COMPLETED, None, {
-                "id": "run-review",
-                "status": "FINISHED",
-                "result": "LGTM with notes",
-                "durationMs": 1000,
-            }
-
     github = StubGitHub()
-    updated = await worker.poll_reviews_once(cursor=DoneCursor({}), github=github)
-    assert updated == 1
+    monkeypatch.setattr(worker, "GitHubClient", lambda: github)
+
+    outcome = {
+        "session_id": "sess-rev",
+        "kind": "review",
+        "success": True,
+        "subtype": "success",
+        "text": "Solid change with one nit.\nVERDICT: APPROVE",
+        "duration_seconds": 240.0,
+        "credits": 0.5,
+        "tokens": None,
+        "error": None,
+    }
+    await worker.finalize_review_task(review_id, outcome)
+
+    assert github.review_posts == [
+        ("jan21deepak/omnigent", 9, "Solid change with one nit.\nVERDICT: APPROVE", "APPROVE")
+    ]
     with db_session() as session:
-        row = session.get(ReviewTask, review_id)
-        assert row.status == TaskStatus.COMPLETED
-        assert row.merged is False
-        assert row.auto_merge_enabled is False
+        review = session.get(ReviewTask, review_id)
+        assert review.status == TaskStatus.COMPLETED
+        assert review.duration_seconds == 240.0
+        assert review.merged is False
 
 
 @pytest.mark.asyncio
-async def test_old_failed_tasks_are_not_rechecked(client, monkeypatch):
-    stale = datetime.now(timezone.utc) - timedelta(days=worker.RECHECK_FAILED_DAYS + 1)
-    task_id = add_task(created_at=stale, completed_at=stale)
+async def test_finalize_review_task_falls_back_to_comment_event(client, monkeypatch):
+    with db_session() as session:
+        review = ReviewTask(
+            repository="jan21deepak/omnigent",
+            pr_number=10,
+            pr_title="Fix the other thing",
+            pr_url="https://github.com/jan21deepak/omnigent/pull/10",
+            droid_session_id="sess-rev2",
+            status=TaskStatus.RUNNING,
+        )
+        session.add(review)
+        session.flush()
+        review_id = review.id
 
-    class Exploding(StubCursor):
-        async def get_agent_status(self, agent_id, run_id=None):
-            raise AssertionError("stale failed task should not be polled")
+    class OwnPrGitHub(StubGitHub):
+        async def create_pull_request_review(self, repository, pr_number, body, *, event="COMMENT"):
+            if event != "COMMENT":
+                # GitHub rejects APPROVE on the token owner's own PR.
+                request = httpx.Request("POST", f"https://api.github.com/repos/{repository}/pulls/{pr_number}/reviews")
+                raise httpx.HTTPStatusError(
+                    "Can not approve your own pull request",
+                    request=request,
+                    response=httpx.Response(422, request=request),
+                )
+            return await super().create_pull_request_review(repository, pr_number, body, event=event)
 
-    monkeypatch.setattr(worker, "ensure_review_for_pr", _noop)
-    monkeypatch.setattr(worker, "poll_reviews_once", _zero)
-    await worker.poll_once(cursor=Exploding({}), github=StubGitHub())
+    github = OwnPrGitHub()
+    monkeypatch.setattr(worker, "GitHubClient", lambda: github)
+
+    outcome = {
+        "session_id": "sess-rev2",
+        "kind": "review",
+        "success": True,
+        "subtype": "success",
+        "text": "Needs changes.\nVERDICT: REQUEST_CHANGES",
+        "duration_seconds": 120.0,
+        "credits": None,
+        "tokens": None,
+        "error": None,
+    }
+    await worker.finalize_review_task(review_id, outcome)
+
+    events = [post[3] for post in github.review_posts]
+    assert events == ["COMMENT"], "own-PR rejection should fall back to COMMENT"
+
+
+@pytest.mark.asyncio
+async def test_recovery_resumes_orphaned_sessions_and_fails_lost_rows(client, monkeypatch):
+    running_id = add_task(droid_session_id="sess-orphan")
+    queued_id = add_task(
+        repository="jan21deepak/omnigent",
+        issue_number=3,
+        droid_session_id=None,
+        status=TaskStatus.QUEUED,
+    )
+    with db_session() as session:
+        review = ReviewTask(
+            repository="jan21deepak/omnigent",
+            pr_number=6,
+            pr_url="https://github.com/jan21deepak/omnigent/pull/6",
+            droid_session_id=None,
+            status=TaskStatus.QUEUED,
+        )
+        session.add(review)
+        session.flush()
+        review_id = review.id
+
+    droid = StubDroid()
+    recovered = await worker.recover_interrupted_tasks(droid)
+    assert recovered == 1
+    assert droid.resumed == ["sess-orphan"]
 
     with db_session() as session:
-        assert session.get(Task, task_id).status == TaskStatus.FAILED
+        assert session.get(Task, running_id).status == TaskStatus.RUNNING
+        assert session.get(Task, queued_id).status == TaskStatus.FAILED
+        assert "restart" in session.get(Task, queued_id).error
+        assert session.get(ReviewTask, review_id).status == TaskStatus.FAILED
+
+
+@pytest.mark.asyncio
+async def test_recovery_skips_live_sessions(client):
+    task_id = add_task(droid_session_id="sess-live")
+
+    class LiveDroid(StubDroid):
+        @property
+        def active_sessions(self):
+            return {"sess-live"}
+
+    recovered = await worker.recover_interrupted_tasks(LiveDroid())
+    assert recovered == 0
+    with db_session() as session:
+        assert session.get(Task, task_id).status == TaskStatus.RUNNING
 
 
 @pytest.mark.asyncio
@@ -323,9 +406,7 @@ async def test_refresh_pr_states_marks_open_pr(client):
         status=TaskStatus.COMPLETED,
         pull_request_url="https://github.com/jan21deepak/omnigent/pull/7",
     )
-    github = StubGitHub(
-        {("jan21deepak/omnigent", 7): {"state": "open", "merged": False}}
-    )
+    github = StubGitHub({("jan21deepak/omnigent", 7): {"state": "open", "merged": False}})
     with db_session() as session:
         tasks = [session.get(Task, task_id)]
 
@@ -335,87 +416,40 @@ async def test_refresh_pr_states_marks_open_pr(client):
         assert session.get(Task, task_id).pr_state == "open"
 
 
-class MissingReviewCursor(StubCursor):
-    """Cursor no longer knows about the review agent (404)."""
-
-    async def get_agent_status(self, agent_id, run_id=None):
-        request = httpx.Request("GET", "https://api.cursor.com/v1/agents/bc-x")
-        raise httpx.HTTPStatusError(
-            "not found",
-            request=request,
-            response=httpx.Response(404, request=request),
-        )
-
-
-def add_review(**overrides):
-    defaults = dict(
-        repository="jan21deepak/omnigent",
-        repository_url="https://github.com/jan21deepak/omnigent",
-        pr_number=6,
-        pr_title="[Bug] shell tool gates are inert",
-        pr_url="https://github.com/jan21deepak/omnigent/pull/6",
-        cursor_agent_id="bc-review",
-        cursor_run_id="run-review",
-        status=TaskStatus.QUEUED,
-        created_at=datetime.now(timezone.utc)
-        - timedelta(hours=worker.ABANDONED_REVIEW_HOURS + 1),
-    )
-    defaults.update(overrides)
+@pytest.mark.asyncio
+async def test_poll_github_state_marks_merged_reviews(client):
     with db_session() as session:
-        review = ReviewTask(**defaults)
+        review = ReviewTask(
+            repository="jan21deepak/omnigent",
+            pr_number=12,
+            pr_title="Merged elsewhere",
+            pr_url="https://github.com/jan21deepak/omnigent/pull/12",
+            status=TaskStatus.COMPLETED,
+            merged=False,
+        )
         session.add(review)
         session.flush()
-        return review.id
+        review_id = review.id
 
-
-@pytest.mark.asyncio
-async def test_abandoned_review_without_github_evidence_is_discarded(client):
-    review_id = add_review()
-
-    updated = await worker.poll_reviews_once(
-        cursor=MissingReviewCursor({}), github=StubGitHub()
+    github = StubGitHub(
+        {("jan21deepak/omnigent", 12): {"state": "closed", "merged": True, "merged_at": "2026-08-02T10:00:00Z"}}
     )
-
+    updated = await worker.poll_github_state(github)
     assert updated == 1
     with db_session() as session:
-        assert session.get(ReviewTask, review_id) is None
+        assert session.get(ReviewTask, review_id).merged is True
 
 
 @pytest.mark.asyncio
-async def test_abandoned_review_completes_when_cursor_bot_reviewed_on_github(client):
-    review_id = add_review()
-    github = StubGitHub(
-        reviews={
-            ("jan21deepak/omnigent", 6): [
-                {
-                    "user": {"login": "cursor[bot]"},
-                    "submitted_at": "2026-08-02T14:00:00Z",
-                },
-                {
-                    "user": {"login": "cursor[bot]"},
-                    "submitted_at": "2026-08-02T14:08:00Z",
-                },
-            ]
-        }
+async def test_finalize_merged_running_task_completes_active_rows(client):
+    task_id = add_task(
+        status=TaskStatus.RUNNING,
+        pull_request_url="https://github.com/jan21deepak/omnigent/pull/4",
+        pr_state="merged",
     )
-
-    await worker.poll_reviews_once(cursor=MissingReviewCursor({}), github=github)
-
+    updated = await worker.finalize_merged_running_tasks()
+    assert updated == 1
     with db_session() as session:
-        review = session.get(ReviewTask, review_id)
-        assert review.status == TaskStatus.COMPLETED
-        assert review.duration_seconds == 8 * 60
-        assert review.completed_at is not None
-
-
-@pytest.mark.asyncio
-async def test_recent_missing_review_is_left_alone(client):
-    review_id = add_review(created_at=datetime.now(timezone.utc))
-
-    updated = await worker.poll_reviews_once(
-        cursor=MissingReviewCursor({}), github=StubGitHub()
-    )
-
-    assert updated == 0
-    with db_session() as session:
-        assert session.get(ReviewTask, review_id).status == TaskStatus.QUEUED
+        task = session.get(Task, task_id)
+        assert task.status == TaskStatus.COMPLETED
+        assert task.completed_at is not None

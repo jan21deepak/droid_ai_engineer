@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Cursor Forge — The AI Engineer That Delivers</title>
+    <title>Droid Forge — The AI Engineer That Delivers</title>
     <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 32 32%22><rect width=%2232%22 height=%2232%22 rx=%227%22 fill=%22%230b0b18%22/><text x=%226%22 y=%2223%22 font-size=%2220%22 font-family=%22monospace%22 font-weight=%22bold%22 fill=%22%2300e5ff%22>F</text></svg>">
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
     <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -17,7 +17,7 @@
     <div class="container">
         <span class="navbar-brand brand mb-0">
             <span class="brand-mark" aria-hidden="true">⚡</span>
-            <span class="brand-name">Cursor Forge</span>
+            <span class="brand-name">Droid Forge</span>
             <span class="brand-dash" aria-hidden="true">—</span>
             <span class="brand-tag">The AI Engineer That Delivers</span>
         </span>
@@ -43,7 +43,7 @@
             <div class="card shadow-sm border-0 mb-4">
                 <div class="card-body">
                     <h5 class="card-title mb-3">Add GitHub repository</h5>
-                    <p class="text-muted small">After adding, set the Cursor environment on the repository row below (starting ref defaults to <code>main</code>).</p>
+                    <p class="text-muted small">After adding, optionally set a per-repo model and a setup command on the repository row below (starting ref defaults to the repo default branch).</p>
                     <form id="add-repo-form" class="row g-2 align-items-end">
                         <div class="col-md-9">
                             <label class="form-label small text-muted mb-1" for="repo-url">Repository</label>
@@ -68,13 +68,14 @@
                         <thead>
                         <tr>
                             <th>Repository</th>
-                            <th>Cursor environment</th>
+                            <th>Model</th>
+                            <th>Setup command</th>
                             <th>Added</th>
                             <th class="text-end">Actions</th>
                         </tr>
                         </thead>
                         <tbody id="repos-tbody">
-                        <tr><td colspan="4" class="text-center text-muted py-4">Loading…</td></tr>
+                        <tr><td colspan="5" class="text-center text-muted py-4">Loading…</td></tr>
                         </tbody>
                     </table>
                 </div>
@@ -86,11 +87,11 @@
             <div class="d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2">
                 <div>
                     <h5 class="mb-1">Synced issues</h5>
-                    <p class="text-muted small mb-0">Grouped by repository. Select issues and assign them to Cursor.</p>
+                    <p class="text-muted small mb-0">Grouped by repository. Select issues and assign them to Droid.</p>
                 </div>
                 <div class="d-flex gap-2">
                     <button class="btn btn-outline-secondary btn-sm" id="refresh-issues">Refresh</button>
-                    <button class="btn btn-primary" id="assign-cursor-btn" disabled>Assign to Cursor</button>
+                    <button class="btn btn-primary" id="assign-droid-btn" disabled>Assign to Droid</button>
                 </div>
             </div>
             <div id="issues-alert" class="alert d-none" role="alert"></div>
@@ -108,7 +109,7 @@
                             <div class="stat-value text-primary" data-metric="running">{{ stats.running }}</div>
                             <div class="text-muted small text-uppercase">
                                 Running
-                                <span class="metric-info" data-bs-toggle="tooltip" data-bs-title="Cursor runs currently queued or in progress, counting both issue-fix sessions and PR reviews.">i</span>
+                                <span class="metric-info" data-bs-toggle="tooltip" data-bs-title="Droid runs currently queued or in progress, counting both issue-fix sessions and PR reviews.">i</span>
                             </div>
                             <div class="text-muted split-line" data-metric="split.running">{{ stats.fix.running }} fixes · {{ stats.review.running }} reviews</div>
                         </div>
@@ -119,8 +120,8 @@
                         <div class="card-body">
                             <div class="stat-value text-success" data-metric="completed">{{ stats.completed }}</div>
                             <div class="text-muted small text-uppercase">
-                                Cursor Runs Completed
-                                <span class="metric-info" data-bs-toggle="tooltip" data-bs-title="Total Cursor runs that finished successfully. This counts fix sessions and PR reviews separately, so it is larger than the number of pull requests — one issue typically produces one fix session, one PR and one review.">i</span>
+                                Droid Runs Completed
+                                <span class="metric-info" data-bs-toggle="tooltip" data-bs-title="Total Droid runs that finished successfully. This counts fix sessions and PR reviews separately, so it is larger than the number of pull requests — one issue typically produces one fix session, one PR and one review.">i</span>
                             </div>
                             <div class="text-muted split-line" data-metric="split.completed">{{ stats.fix.completed }} fixes · {{ stats.review.completed }} reviews</div>
                         </div>
@@ -132,7 +133,7 @@
                             <div class="stat-value text-danger" data-metric="failed">{{ stats.failed }}</div>
                             <div class="text-muted small text-uppercase">
                                 Failed
-                                <span class="metric-info" data-bs-toggle="tooltip" data-bs-title="Cursor runs that ended without a usable result. A fix session that was suspended for inactivity but later opened a PR is not counted here — it is re-checked and reclassified as completed.">i</span>
+                                <span class="metric-info" data-bs-toggle="tooltip" data-bs-title="Droid runs that ended without a usable result. A fix session that pushed a branch but failed to finish is re-checked and reclassified as completed when its PR lands.">i</span>
                             </div>
                             <div class="text-muted split-line" data-metric="split.failed">{{ stats.fix.failed }} fixes · {{ stats.review.failed }} reviews</div>
                         </div>
@@ -158,7 +159,7 @@
                         <div class="card-body">
                             <div class="text-muted small text-uppercase mb-2">
                                 Fix Time Stats
-                                <span class="metric-info" data-bs-toggle="tooltip" data-bs-title="Active Cursor working time on issue-fix sessions, measured from the session transcript. Inter-message gaps where Cursor is speaking and the gap is under 15 minutes are summed; waits for a human reply and long idle/resume gaps are excluded. Average covers completed fixes; total covers every finished fix session with a recorded runtime.">i</span>
+                                <span class="metric-info" data-bs-toggle="tooltip" data-bs-title="Active Droid working time on issue-fix sessions, reported by the Droid session itself. Average covers completed fixes; total covers every finished fix session with a recorded runtime.">i</span>
                             </div>
                             <div class="row g-3">
                                 <div class="col-6">
@@ -180,7 +181,7 @@
                         <div class="card-body">
                             <div class="text-muted small text-uppercase mb-2">
                                 Review Time Stats
-                                <span class="metric-info" data-bs-toggle="tooltip" data-bs-title="How long Cursor Bugbot spent on each PR, measured from the ``bugbot run`` trigger comment to the ``cursor[bot]`` BUGBOT_REVIEW submission on GitHub. Forge tracks each Bugbot run as a review row and backfills duration from that timeline.">i</span>
+                                <span class="metric-info" data-bs-toggle="tooltip" data-bs-title="How long the Droid review agent spent on each PR. Forge tracks each review session as a review row and records the duration reported by the session.">i</span>
                             </div>
                             <div class="row g-3">
                                 <div class="col-6">
@@ -191,7 +192,7 @@
                                 <div class="col-6">
                                     <div class="text-muted small mb-1">Total</div>
                                     <div class="stat-value fs-3" data-metric="review.total_runtime_minutes">{{ stats.review.total_runtime_minutes }}</div>
-                                    <div class="text-muted small">minutes across Bugbot runs</div>
+                                    <div class="text-muted small">minutes across Droid review sessions</div>
                                 </div>
                             </div>
                         </div>
@@ -203,7 +204,7 @@
                 <div class="card-body">
                     <div class="text-muted small text-uppercase mb-1">
                         Time-to-Dollar Savings
-                        <span class="metric-info" data-bs-toggle="tooltip" data-bs-title="Engineering cost avoided by Cursor. Counts are real: {{ stats.fix.completed }} completed fixes and {{ stats.review.completed }} completed reviews. Each is valued at the human effort it replaced — {{ stats.assumptions.junior_hours_per_issue }}h per fix and {{ stats.assumptions.junior_hours_per_review }}h per review at ${{ '%.2f'|format(stats.assumptions.junior_hourly_usd) }}/hr (a ${{ '{:,.0f}'.format(stats.assumptions.junior_swe_annual_cost_usd) }} junior SWE over 1,920 hrs) — minus Cursor agent run cost estimate of ${{ '%.2f'|format(stats.cursor_cost_usd) }}. The hours-per-item rates are configurable assumptions; everything else is measured.">i</span>
+                        <span class="metric-info" data-bs-toggle="tooltip" data-bs-title="Engineering cost avoided by Droid. Counts are real: {{ stats.fix.completed }} completed fixes and {{ stats.review.completed }} completed reviews. Each is valued at the human effort it replaced — {{ stats.assumptions.junior_hours_per_issue }}h per fix and {{ stats.assumptions.junior_hours_per_review }}h per review at ${{ '%.2f'|format(stats.assumptions.junior_hourly_usd) }}/hr (a ${{ '{:,.0f}'.format(stats.assumptions.junior_swe_annual_cost_usd) }} junior SWE over 1,920 hrs) — minus Droid agent run cost estimate of ${{ '%.2f'|format(stats.agent_cost_usd) }}. The hours-per-item rates are configurable assumptions; everything else is measured.">i</span>
                     </div>
                     <div class="stat-value text-success" data-metric="productivity_gained_usd">${{ '%.2f'|format(stats.productivity_gained_usd) }}</div>
                     <div class="text-muted small mt-1">
@@ -220,7 +221,7 @@
                         <div class="col-6 col-lg">
                             <div class="text-muted small text-uppercase mb-1">
                                 Avg PR Cycle Time
-                                <span class="metric-info" data-bs-toggle="tooltip" data-bs-title="Average active Cursor working time to open a PR, measured from the session transcript with idle waits and human pauses excluded. Sample: {{ stats.engineering.pr_cycle_time_sample }} completed fix session(s). Shorter means changes reach review faster.">i</span>
+                                <span class="metric-info" data-bs-toggle="tooltip" data-bs-title="Average active Droid working time to open a PR. Sample: {{ stats.engineering.pr_cycle_time_sample }} completed fix session(s). Shorter means changes reach review faster.">i</span>
                             </div>
                             <div class="stat-value fs-4" data-metric="eng.pr_cycle_time_hours">{{ stats.engineering.pr_cycle_time_hours }}</div>
                             <div class="text-muted small">avg hours of active work</div>
@@ -228,7 +229,7 @@
                         <div class="col-6 col-lg">
                             <div class="text-muted small text-uppercase mb-1">
                                 PRs Delivered (7d)
-                                <span class="metric-info" data-bs-toggle="tooltip" data-bs-title="Distinct pull requests opened by Cursor fix sessions in the last 7 days ({{ stats.engineering.prs_total }} PR(s) all-time). One issue produces one PR, so this is lower than the completed-runs count, which also includes reviews. Counted as soon as the PR exists, even if the session is still open waiting for input.">i</span>
+                                <span class="metric-info" data-bs-toggle="tooltip" data-bs-title="Distinct pull requests opened by Droid fix sessions in the last 7 days ({{ stats.engineering.prs_total }} PR(s) all-time). One issue produces one PR, so this is lower than the completed-runs count, which also includes reviews.">i</span>
                             </div>
                             <div class="stat-value fs-4" data-metric="eng.prs_last_7_days">{{ stats.engineering.prs_last_7_days }}</div>
                             <div class="text-muted small">PRs opened in last 7 days</div>
@@ -236,7 +237,7 @@
                         <div class="col-6 col-lg">
                             <div class="text-muted small text-uppercase mb-1">
                                 Merge Rate
-                                <span class="metric-info" data-bs-toggle="tooltip" data-bs-title="Share of every PR Cursor opened that has landed on the default branch: {{ stats.engineering.prs_merged }} merged of {{ stats.engineering.prs_total }} PR(s), with {{ stats.engineering.prs_open }} still open and {{ stats.engineering.prs_closed }} closed unmerged. Merge state is read from GitHub for each PR, so PRs without a Cursor review still count against this rate.">i</span>
+                                <span class="metric-info" data-bs-toggle="tooltip" data-bs-title="Share of every PR Droid opened that has landed on the default branch: {{ stats.engineering.prs_merged }} merged of {{ stats.engineering.prs_total }} PR(s), with {{ stats.engineering.prs_open }} still open and {{ stats.engineering.prs_closed }} closed unmerged. Merge state is read from GitHub for each PR.">i</span>
                             </div>
                             <div class="stat-value fs-4"><span data-metric="eng.merge_rate_percent">{{ stats.engineering.merge_rate_percent }}</span>%</div>
                             <div class="text-muted small"><span data-metric="eng.merge_detail">{{ stats.engineering.prs_merged }} of {{ stats.engineering.prs_total }} PRs merged</span></div>
@@ -244,7 +245,7 @@
                         <div class="col-6 col-lg">
                             <div class="text-muted small text-uppercase mb-1">
                                 Change Failure Rate
-                                <span class="metric-info" data-bs-toggle="tooltip" data-bs-title="Share of every finished Cursor run — fixes and reviews — that ended in failure rather than a usable result: {{ stats.engineering.runs_failed }} failed out of {{ stats.engineering.runs_finished }} finished run(s), made up of {{ stats.engineering.fixes_failed }}/{{ stats.engineering.fixes_finished }} fixes and {{ stats.engineering.reviews_failed }}/{{ stats.engineering.reviews_finished }} reviews. Rising values mean Cursor is burning spend without shipping.">i</span>
+                                <span class="metric-info" data-bs-toggle="tooltip" data-bs-title="Share of every finished Droid run — fixes and reviews — that ended in failure rather than a usable result: {{ stats.engineering.runs_failed }} failed out of {{ stats.engineering.runs_finished }} finished run(s), made up of {{ stats.engineering.fixes_failed }}/{{ stats.engineering.fixes_finished }} fixes and {{ stats.engineering.reviews_failed }}/{{ stats.engineering.reviews_finished }} reviews. Rising values mean Droid is burning spend without shipping.">i</span>
                             </div>
                             <div class="stat-value fs-4"><span data-metric="eng.change_failure_rate_percent">{{ stats.engineering.change_failure_rate_percent }}</span>%</div>
                             <div class="text-muted small"><span data-metric="eng.failure_detail">{{ stats.engineering.runs_failed }} of {{ stats.engineering.runs_finished }} runs failed</span></div>
@@ -257,7 +258,7 @@
                 <div class="card-header fw-semibold d-flex justify-content-between align-items-center flex-wrap gap-2">
                     <span>
                         Daily Activity
-                        <span class="metric-info" data-bs-toggle="tooltip" data-bs-title="Work finished per day over the last 14 days, bucketed by Singapore calendar date. Fixes land on the day their session reached a terminal state, PRs on the day their fix session first reported them, and reviews on the day they finished (or started, when this app never observed the finish). The line shows total Cursor runtime recorded that day.">i</span>
+                        <span class="metric-info" data-bs-toggle="tooltip" data-bs-title="Work finished per day over the last 14 days, bucketed by Singapore calendar date. Fixes land on the day their session reached a terminal state, PRs on the day their fix session first reported them, and reviews on the day they finished. The line shows total Droid runtime recorded that day.">i</span>
                     </span>
                     <span class="text-muted small">last 14 days · SGT</span>
                 </div>
@@ -281,7 +282,7 @@
                             <th>Repository</th>
                             <th>Target</th>
                             <th>Status</th>
-                            <th>Cursor</th>
+                            <th>Session</th>
                             <th>Link</th>
                             <th>Runtime</th>
                             <th>Completed</th>
@@ -317,8 +318,10 @@
                                 {% endif %}
                             </td>
                             <td>
-                                {% if task.cursor_agent_url %}
-                                <a class="btn btn-sm btn-outline-dark" href="{{ task.cursor_agent_url }}" target="_blank" rel="noopener">{% if task.kind == 'review' %}Cursor Review{% else %}Cursor Agent{% endif %}</a>
+                                {% if task.droid_session_url %}
+                                <a class="btn btn-sm btn-outline-dark" href="{{ task.droid_session_url }}" target="_blank" rel="noopener">{% if task.kind == 'review' %}Droid Review{% else %}Droid Fix{% endif %}</a>
+                                {% elif task.droid_session_id %}
+                                <span class="badge text-bg-dark" title="Droid session {{ task.droid_session_id }}">{{ task.droid_session_id[:8] }}</span>
                                 {% else %}
                                 <span class="text-muted">—</span>
                                 {% endif %}

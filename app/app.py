@@ -5,6 +5,7 @@ import json
 import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from functools import partial
 from pathlib import Path
 
 import httpx
@@ -17,14 +18,17 @@ from pydantic import BaseModel, Field
 from app import __version__
 from app.config import get_settings
 from app.database import check_db_connectivity, db_session, init_db
-from app.cursor_client import CursorClient
+from app.droid_client import (
+    DroidSessionBusyError,
+    get_droid_client,
+)
 from app.github import GitHubClient, parse_issue_event, should_trigger, verify_signature
 from app.logging_conf import log_event, setup_logging
 from app.metrics import compute_metrics, recent_activity
-from app.models import Repository, SyncedIssue, SyncedPullRequest, Task, TaskStatus
-from app.repos import parse_repository_ref, resolve_agent_launch_config
+from app.models import Repository, ReviewTask, SyncedIssue, SyncedPullRequest, Task, TaskStatus
+from app.repos import parse_repository_ref
 from app.tasks import TaskCreateError, create_and_dispatch_task
-from app.worker import ensure_bugbot_review_task, worker_loop
+from app.worker import recover_interrupted_tasks, start_pr_review, worker_loop
 
 logger = logging.getLogger("app.api")
 
@@ -87,39 +91,49 @@ async def lifespan(app: FastAPI):
     settings = get_settings()
     setup_logging(settings.log_level)
     init_db()
+    droid = get_droid_client()
+    await recover_interrupted_tasks(droid)
     stop_event = asyncio.Event()
     worker_task = asyncio.create_task(worker_loop(stop_event))
-    log_event(logger, logging.INFO, "app.started", version=__version__, agent_runtime="cursor-sdk")
+    log_event(logger, logging.INFO, "app.started", version=__version__, agent_runtime="droid-sdk")
     yield
     stop_event.set()
     await worker_task
-    CursorClient.shutdown()
+    await droid.shutdown()
 
 
-app = FastAPI(title="cursor-ai-engineer", version=__version__, lifespan=lifespan)
+app = FastAPI(title="droid-ai-engineer", version=__version__, lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
 
 
 class AddRepositoryRequest(BaseModel):
     url: str = Field(..., description="GitHub repository URL or owner/repo slug")
-    cursor_environment: str = Field(
+    droid_model: str = Field(
         default="",
-        description="Named Cursor Cloud Agent environment for this repository",
+        description="Optional per-repo model id override (empty = DROID_MODEL)",
+    )
+    setup_command: str = Field(
+        default="",
+        description="Optional shell command run in the workspace clone before the session",
     )
     starting_ref: str = Field(
         default="",
-        description="Optional git ref used when no named environment is set",
+        description="Optional git ref used when cloning the workspace",
     )
 
 
 class UpdateRepositoryRequest(BaseModel):
-    cursor_environment: str | None = Field(
+    droid_model: str | None = Field(
         default=None,
-        description="Named Cursor Cloud Agent environment for this repository",
+        description="Optional per-repo model id override (empty = DROID_MODEL)",
+    )
+    setup_command: str | None = Field(
+        default=None,
+        description="Optional shell command run in the workspace clone before the session",
     )
     starting_ref: str | None = Field(
         default=None,
-        description="Optional git ref used when no named environment is set",
+        description="Optional git ref used when cloning the workspace",
     )
 
 
@@ -135,7 +149,7 @@ class FollowUpRequest(BaseModel):
     instruction: str = Field(
         ...,
         min_length=1,
-        description="Follow-up prompt for an existing Cursor Cloud Agent",
+        description="Follow-up prompt for the existing Droid session",
     )
 
 
@@ -150,12 +164,12 @@ async def health():
     settings = get_settings()
     db_ok = check_db_connectivity()
     github_ok = await GitHubClient().check_connectivity()
-    cursor_ok = await CursorClient().check_connectivity()
+    droid_ok = await get_droid_client().check_connectivity()
 
     if not db_ok:
         overall = "unhealthy"
         status_code = 503
-    elif not github_ok or not cursor_ok:
+    elif not github_ok or not droid_ok:
         overall = "degraded"
         status_code = 200
     else:
@@ -171,7 +185,7 @@ async def health():
             "checks": {
                 "database": "ok" if db_ok else "error",
                 "github": "ok" if github_ok else ("unconfigured" if not settings.github_token else "error"),
-                "cursor": "ok" if cursor_ok else ("unconfigured" if not settings.cursor_api_key else "error"),
+                "droid": "ok" if droid_ok else ("unconfigured" if not settings.factory_api_key else "error"),
             },
         },
     )
@@ -244,43 +258,12 @@ async def list_repositories():
         return {"repositories": [r.to_dict() for r in repos]}
 
 
-@app.get("/api/cursor/environments")
-async def list_cursor_environments():
-    """Named Cursor Cloud Agent environments for the dashboard dropdown.
-
-    Cursor has no public list-environments API, so names are discovered from
-    recent agents plus any values already saved on registered repositories.
-    """
-    cursor = CursorClient()
-    discovered = await cursor.list_environments() if cursor.configured else []
-    by_name: dict[str, dict] = {
-        item["name"]: {
-            "name": item["name"],
-            "repositories": list(item.get("repositories") or []),
-            "source": item.get("source") or "cursor",
-        }
-        for item in discovered
-        if item.get("name")
-    }
-
-    with db_session() as session:
-        for repo in session.query(Repository).all():
-            name = (repo.cursor_environment or "").strip()
-            if not name:
-                continue
-            entry = by_name.setdefault(
-                name,
-                {"name": name, "repositories": [], "source": "saved"},
-            )
-            if repo.url and repo.url not in entry["repositories"]:
-                entry["repositories"].append(repo.url)
-            if repo.full_name:
-                full = f"https://github.com/{repo.full_name}"
-                if full not in entry["repositories"] and repo.full_name not in entry["repositories"]:
-                    entry["repositories"].append(repo.full_name)
-
-    environments = sorted(by_name.values(), key=lambda row: row["name"].lower())
-    return {"environments": environments, "count": len(environments)}
+@app.get("/api/droid/models")
+async def list_droid_models():
+    """Model catalog for the dashboard dropdown (Factory Router = "auto")."""
+    droid = get_droid_client()
+    models = await droid.list_available_models() if droid.configured else []
+    return {"models": models, "count": len(models)}
 
 
 @app.post("/api/repositories")
@@ -306,7 +289,8 @@ async def add_repository(payload: AddRepositoryRequest):
             full_name=meta.get("full_name") or full_name,
             url=meta.get("html_url") or f"https://github.com/{full_name}",
             description=(meta.get("description") or "")[:2000],
-            cursor_environment=(payload.cursor_environment or "").strip(),
+            droid_model=(payload.droid_model or "").strip(),
+            setup_command=(payload.setup_command or "").strip(),
             starting_ref=(payload.starting_ref or "").strip()
             or (meta.get("default_branch") or "main")
             or "main",
@@ -319,7 +303,8 @@ async def add_repository(payload: AddRepositoryRequest):
             logging.INFO,
             "repository.added",
             repo=repo.full_name,
-            environment=repo.cursor_environment or None,
+            model=repo.droid_model or None,
+            setup_command=bool(repo.setup_command),
         )
 
     automation = await _ensure_repo_automation(github, full_name)
@@ -331,13 +316,15 @@ async def add_repository(payload: AddRepositoryRequest):
 
 @app.patch("/api/repositories/{repo_id}")
 async def update_repository(repo_id: int, payload: UpdateRepositoryRequest):
-    """Update Cursor environment / starting ref for a registered repository."""
+    """Update Droid model / setup command / starting ref for a registered repository."""
     with db_session() as session:
         repo = session.get(Repository, repo_id)
         if not repo:
             return JSONResponse(status_code=404, content={"detail": "not found"})
-        if payload.cursor_environment is not None:
-            repo.cursor_environment = payload.cursor_environment.strip()
+        if payload.droid_model is not None:
+            repo.droid_model = payload.droid_model.strip()
+        if payload.setup_command is not None:
+            repo.setup_command = payload.setup_command.strip()
         if payload.starting_ref is not None:
             repo.starting_ref = payload.starting_ref.strip()
         session.flush()
@@ -346,8 +333,9 @@ async def update_repository(repo_id: int, payload: UpdateRepositoryRequest):
             logging.INFO,
             "repository.updated",
             repo=repo.full_name,
-            environment=repo.cursor_environment or None,
+            model=repo.droid_model or None,
             starting_ref=repo.starting_ref or None,
+            setup_command=bool(repo.setup_command),
         )
         return {"repository": repo.to_dict()}
 
@@ -604,12 +592,12 @@ async def list_synced_issues():
 
 
 @app.post("/api/issues/assign")
-async def assign_issues_to_cursor(payload: AssignIssuesRequest):
-    """Add the trigger label on GitHub so the webhook (flow 1) creates the agent.
+async def assign_issues_to_droid(payload: AssignIssuesRequest):
+    """Add the trigger label on GitHub so the webhook (flow 1) launches the agent.
 
-    Always applies ``Cursor-complete`` (or ``TRIGGER_LABEL``) on the issue. When
-    ``PUBLIC_BASE_URL`` is configured, forge waits briefly for the webhook to
-    create the task; otherwise it dispatches the agent directly after labeling
+    Always applies the trigger label on the issue. When ``PUBLIC_BASE_URL`` is
+    configured, forge waits briefly for the webhook to create the task;
+    otherwise it dispatches the Droid session directly after labeling
     (same end state, with duplicate protection if the webhook also fires).
     """
     settings = get_settings()
@@ -680,8 +668,7 @@ async def assign_issues_to_cursor(payload: AssignIssuesRequest):
                     if existing:
                         result = {
                             "task_id": existing.id,
-                            "agent_id": existing.cursor_agent_id,
-                            "run_id": existing.cursor_run_id,
+                            "session_id": existing.droid_session_id,
                             "status": existing.status,
                             "via": "webhook",
                         }
@@ -750,6 +737,12 @@ async def list_synced_pulls():
     with db_session() as session:
         repos = session.query(Repository).all()
         repo_ids = [r.id for r in repos]
+        active_reviews = {
+            (r.repository, r.pr_number)
+            for r in session.query(ReviewTask)
+            .filter(ReviewTask.status.in_(TaskStatus.ACTIVE))
+            .all()
+        }
 
     for repo_id in repo_ids:
         result = await _sync_repository_pulls(repo_id)
@@ -771,8 +764,7 @@ async def list_synced_pulls():
         grouped: dict[str, list] = {}
         for pull in pulls:
             payload = pull.to_dict()
-            # Legacy field: previously meant "Cursor review agent active".
-            payload["assigned"] = False
+            payload["assigned"] = (pull.repository, pull.pr_number) in active_reviews
             grouped.setdefault(pull.repository, []).append(payload)
         return {
             "repositories": [
@@ -782,11 +774,8 @@ async def list_synced_pulls():
 
 
 @app.post("/api/pulls/assign")
-async def assign_pulls_to_bugbot(payload: AssignPullsRequest):
-    """Trigger Cursor Bugbot on selected PRs (comment ``bugbot run``).
-
-    Forge no longer starts Cursor Cloud review agents.
-    """
+async def assign_pulls_to_droid(payload: AssignPullsRequest):
+    """Launch a Droid review session on the selected pull requests."""
     with db_session() as session:
         pulls = (
             session.query(SyncedPullRequest)
@@ -798,14 +787,10 @@ async def assign_pulls_to_bugbot(payload: AssignPullsRequest):
     if not snapshots:
         return JSONResponse(status_code=404, content={"detail": "no matching pull requests"})
 
-    github = GitHubClient()
     results = []
     for pull in snapshots:
         try:
-            requested = await github.request_bugbot_review(
-                pull["repository"], pull["pr_number"]
-            )
-            ensure_bugbot_review_task(
+            result = await start_pr_review(
                 repository=pull["repository"],
                 repository_url=pull.get("repository_url") or "",
                 pr_number=pull["pr_number"],
@@ -815,24 +800,25 @@ async def assign_pulls_to_bugbot(payload: AssignPullsRequest):
             results.append(
                 {
                     "pull_id": pull["id"],
-                    "ok": True,
-                    "detail": "bugbot_requested" if requested else "bugbot_already_requested",
+                    "ok": bool(result.get("started")),
+                    "detail": result.get("detail", ""),
+                    "review_id": result.get("review_id"),
                     "pr_number": pull["pr_number"],
                 }
             )
             log_event(
                 logger,
                 logging.INFO,
-                "bugbot.assigned",
+                "droid.review_assigned",
                 repo=pull["repository"],
                 pr=pull["pr_number"],
-                requested=requested,
+                started=result.get("started"),
             )
         except Exception as exc:
             log_event(
                 logger,
                 logging.WARNING,
-                "github.bugbot_trigger_failed",
+                "droid.review_assign_failed",
                 repo=pull["repository"],
                 pr=pull["pr_number"],
                 error=str(exc),
@@ -857,31 +843,42 @@ async def list_tasks(page: int = 1, page_size: int = 10):
 
 @app.post("/api/tasks/{task_id}/follow-up")
 async def follow_up_task(task_id: int, payload: FollowUpRequest):
-    """Send a follow-up prompt to the task's Cursor Cloud Agent (SDK resume + send).
+    """Send a follow-up prompt to the task's Droid session (SDK resume + send).
 
     Live-extend hook for interview demos — e.g. \"fix failing CI\" or
     \"add a regression test\".
     """
-    cursor = CursorClient()
-    if not cursor.configured:
+    from app.worker import finalize_fix_task
+
+    droid = get_droid_client()
+    if not droid.configured:
         return JSONResponse(
             status_code=503,
-            content={"detail": "Cursor API is not configured"},
+            content={"detail": "Droid is not configured (FACTORY_API_KEY missing)"},
         )
 
     with db_session() as session:
         task = session.get(Task, task_id)
         if not task:
             return JSONResponse(status_code=404, content={"detail": "task not found"})
-        agent_id = task.cursor_agent_id
-        if not agent_id:
+        session_id = task.droid_session_id
+        if not session_id:
             return JSONResponse(
                 status_code=409,
-                content={"detail": "task has no Cursor agent to follow up on"},
+                content={"detail": "task has no Droid session to follow up on"},
             )
 
     try:
-        result = await cursor.send_follow_up(agent_id, payload.instruction)
+        result = await droid.send_follow_up(
+            session_id,
+            payload.instruction,
+            on_complete=partial(finalize_fix_task, task_id),
+        )
+    except DroidSessionBusyError:
+        return JSONResponse(
+            status_code=409,
+            content={"detail": "the Droid session is still running a turn; retry when it finishes"},
+        )
     except Exception as exc:
         return JSONResponse(
             status_code=502,
@@ -891,8 +888,6 @@ async def follow_up_task(task_id: int, payload: FollowUpRequest):
     with db_session() as session:
         db_task = session.get(Task, task_id)
         if db_task is not None:
-            if result.get("run_id"):
-                db_task.cursor_run_id = result["run_id"]
             db_task.status = TaskStatus.RUNNING
             db_task.error = None
 
@@ -901,8 +896,7 @@ async def follow_up_task(task_id: int, payload: FollowUpRequest):
         logging.INFO,
         "task.follow_up",
         task_id=task_id,
-        agent_id=agent_id,
-        run_id=result.get("run_id"),
+        session_id=session_id,
     )
     return {"detail": "accepted", "task_id": task_id, **result}
 

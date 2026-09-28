@@ -2,16 +2,17 @@ import hashlib
 import hmac
 import json
 
-from app.github import IssueEvent, parse_issue_event, should_trigger, verify_signature
+from app.github import parse_issue_event, should_trigger, verify_signature
 
 SECRET = "test-secret"
+TRIGGER_LABEL = "Droid-complete"
 
 
 def sign(body: bytes, secret: str = SECRET) -> str:
     return "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
 
 
-def issue_payload(action="opened", labels=("Cursor-complete",), label_added=None, number=42):
+def issue_payload(action="opened", labels=(TRIGGER_LABEL,), label_added=None, number=42):
     payload = {
         "action": action,
         "repository": {
@@ -53,7 +54,7 @@ class TestParsing:
         assert event.issue_number == 42
         assert event.issue_title == "Fix the chart legend"
         assert event.issue_body == "The legend overlaps the chart."
-        assert event.labels == ["Cursor-complete"]
+        assert event.labels == [TRIGGER_LABEL]
 
     def test_parse_handles_null_body(self):
         payload = issue_payload()
@@ -63,23 +64,22 @@ class TestParsing:
 
 class TestTriggerRules:
     def test_opened_with_label_triggers(self):
-        assert should_trigger(parse_issue_event(issue_payload("opened")), "Cursor-complete")
+        assert should_trigger(parse_issue_event(issue_payload("opened")), TRIGGER_LABEL)
 
     def test_opened_without_label_does_not_trigger(self):
-        assert not should_trigger(parse_issue_event(issue_payload("opened", labels=())), "Cursor-complete")
+        assert not should_trigger(parse_issue_event(issue_payload("opened", labels=())), TRIGGER_LABEL)
 
     def test_labeled_with_trigger_label(self):
         event = parse_issue_event(
-            issue_payload("labeled", labels=("Cursor-complete",), label_added="Cursor-complete")
+            issue_payload("labeled", labels=(TRIGGER_LABEL,), label_added=TRIGGER_LABEL)
         )
-        assert should_trigger(event, "Cursor-complete")
+        assert should_trigger(event, TRIGGER_LABEL)
 
     def test_labeled_with_other_label(self):
-        event = parse_issue_event(issue_payload("labeled", labels=("bug",), label_added="bug"))
-        assert not should_trigger(event, "Cursor-complete")
+        assert not should_trigger(parse_issue_event(issue_payload("labeled", labels=("bug",), label_added="bug")), TRIGGER_LABEL)
 
     def test_closed_does_not_trigger(self):
-        assert not should_trigger(parse_issue_event(issue_payload("closed")), "Cursor-complete")
+        assert not should_trigger(parse_issue_event(issue_payload("closed")), TRIGGER_LABEL)
 
 
 class TestWebhookEndpoint:
@@ -124,5 +124,3 @@ class TestWebhookEndpoint:
     def test_malformed_payload_422(self, client):
         resp = self.post(client, {"action": "opened", "issue": {}, "repository": {}})
         assert resp.status_code == 422
-
-

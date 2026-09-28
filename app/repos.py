@@ -1,4 +1,4 @@
-"""Helpers for parsing GitHub repository URLs / slugs and agent launch config."""
+"""Helpers for parsing GitHub repository URLs / slugs and Droid launch config."""
 
 import re
 
@@ -27,10 +27,11 @@ def resolve_agent_launch_config(
     repository: str | None = None,
     repository_url: str | None = None,
 ) -> dict[str, str | None]:
-    """Look up the Cursor environment / starting ref for a registered repo.
+    """Look up the Droid launch config (model, setup command, starting ref).
 
-    Returns ``{"environment": str|None, "starting_ref": str|None}``. Missing
-    registrations yield empty config so callers fall back to bare ``repos``.
+    Returns ``{"model": str|None, "setup_command": str|None,
+    "starting_ref": str|None}``. Missing registrations yield empty config so
+    callers fall back to the global model and a bare clone.
     """
     full_name = parse_repository_ref(repository or "") or parse_repository_ref(
         repository_url or ""
@@ -38,7 +39,7 @@ def resolve_agent_launch_config(
     if not full_name and repository and "/" in repository:
         full_name = repository.strip()
     if not full_name:
-        return {"environment": None, "starting_ref": None}
+        return {"model": None, "setup_command": None, "starting_ref": None}
 
     with db_session() as session:
         row = (
@@ -54,7 +55,9 @@ def resolve_agent_launch_config(
                 .first()
             )
         if not row:
-            return {"environment": None, "starting_ref": None}
-        environment = (row.cursor_environment or "").strip() or None
-        starting_ref = (row.starting_ref or "").strip() or "main"
-        return {"environment": environment, "starting_ref": starting_ref}
+            return {"model": None, "setup_command": None, "starting_ref": None}
+        return {
+            "model": (row.droid_model or "").strip() or None,
+            "setup_command": (row.setup_command or "").strip() or None,
+            "starting_ref": (row.starting_ref or "").strip() or "main",
+        }

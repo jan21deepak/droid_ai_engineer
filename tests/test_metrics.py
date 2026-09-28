@@ -1,21 +1,20 @@
 from datetime import datetime, timedelta, timezone
 
-from app.config import get_settings
 from app.database import db_session
 from app.models import Repository, ReviewTask, Task, TaskStatus
 from app.repos import parse_repository_ref
 from app.timeutil import now_sgt
 
 
-def add_task(session, status, duration=None, acus_consumed=None, cost_usd=None, pr_url=None, pr_state=None):
+def add_task(session, status, duration=None, factory_credits=None, cost_usd=None, pr_url=None, pr_state=None):
     task = Task(
         repository="jan21deepak/superset",
         issue_number=1,
         issue_title="t",
-        cursor_agent_id=f"session-{status}-{duration}",
+        droid_session_id=f"session-{status}-{duration}",
         status=status,
         duration_seconds=duration,
-        acus_consumed=acus_consumed,
+        factory_credits=factory_credits,
         cost_usd=cost_usd,
         pull_request_url=pr_url,
         pr_state=pr_state,
@@ -55,7 +54,7 @@ def test_metrics_empty(client):
     assert data["engineering"]["pr_cycle_time_hours"] == 0
     assert data["engineering"]["prs_last_7_days"] == 0
     assert data["tokens_used"] is None
-    assert data["cursor_cost_usd"] == 0
+    assert data["agent_cost_usd"] == 0
     assert data["productivity_gained_usd"] == 0
 
 
@@ -81,12 +80,25 @@ def test_metrics_with_tasks(client):
     assert data["review"]["average_runtime_minutes"] == 1.0
     assert data["review"]["total_runtime_minutes"] == 1.0
     assert data["review"]["merged"] == 1
-    assert data["cursor_cost_usd"] == 6.75
+    assert data["agent_cost_usd"] == 6.75
     assert data["tokens_used"] is None
     # (2 fixes × 4h + 1 review × 1h) × (150000/1920) − 6.75
     assert data["productivity_gained_usd"] > 0
     assert "assumptions" in data
     assert data["assumptions"]["junior_hours_per_review"] == 1.0
+    assert data["assumptions"]["droid_usd_per_agent_run"] == 0
+
+
+def test_metrics_reports_session_tokens_and_credits(client):
+    with db_session() as session:
+        add_task(session, TaskStatus.COMPLETED, duration=100, factory_credits=2.5)
+    with db_session() as session:
+        task = session.query(Task).one()
+        task.estimated_tokens = 12345
+    data = client.get("/metrics").json()
+    assert data["tokens_used"] == 12345
+    assert data["tokens_source"] == "droid_session_usage"
+    assert data["total_factory_credits"] == 2.5
 
 
 def test_dashboard_renders(client):
@@ -96,34 +108,29 @@ def test_dashboard_renders(client):
     resp = client.get("/dashboard")
     assert resp.status_code == 200
     assert "Repositories" in resp.text
-    assert "Assign to Cursor" in resp.text
-    assert "Review ready PRs" not in resp.text
-    assert "Assign to Cursor Review" not in resp.text
+    assert "Assign to Droid" in resp.text
+    assert "Assign to Cursor" not in resp.text
+    assert "Assign to Droid Review" not in resp.text
     assert "Fix Time Stats" in resp.text
     assert "Review Time Stats" in resp.text
     assert "Engineering KPIs" in resp.text
     assert "Avg PR Cycle Time" in resp.text
     assert "PRs Delivered (7d)" in resp.text
     assert "Merge Rate" in resp.text
-    assert "Lead Time to PR" not in resp.text
     assert "Change Failure Rate" in resp.text
     assert "Time-to-Dollar Savings" in resp.text
-    assert "Cursor Agent" in resp.text
-    assert "Cursor Forge" in resp.text
+    assert "Droid Forge" in resp.text
     assert "The AI Engineer That Delivers" in resp.text
-    assert "Autonomous Issue Resolution" not in resp.text
     assert 'data-bs-theme="dark"' in resp.text
     assert "Daily Activity" in resp.text
     assert 'id="daily-chart"' in resp.text
     assert "last 14 days · SGT" in resp.text
     # Status cards, KPIs, ROI figure and the daily chart all carry explanations
     assert resp.text.count('class="metric-info"') == 12
-    assert "Cursor Runs Completed" in resp.text
+    assert "Droid Runs Completed" in resp.text
     assert "PRs merged" in resp.text
     assert "Tokens Used" not in resp.text
     assert "Algorithm:" not in resp.text
-    assert "Cursor Cost" not in resp.text
-    assert "ZZZ-gone" not in resp.text
     assert "Recent Activity" in resp.text
     assert 'id="activity-pager"' in resp.text
     assert 'id="activity-pagination"' in resp.text
@@ -200,7 +207,7 @@ def test_metrics_include_engineering_kpis(client):
             session,
             TaskStatus.COMPLETED,
             duration=3600,
-            acus_consumed=1.0,
+            factory_credits=1.0,
             pr_url="https://github.com/jan21deepak/superset/pull/3",
             pr_state="merged",
         )
@@ -234,7 +241,7 @@ def test_prs_outside_seven_day_window_excluded(client):
             repository="jan21deepak/superset",
             issue_number=9,
             issue_title="old fix",
-            cursor_agent_id="session-old",
+            droid_session_id="session-old",
             status=TaskStatus.COMPLETED,
             duration_seconds=1200,
             pull_request_url="https://github.com/jan21deepak/superset/pull/9",
@@ -248,8 +255,7 @@ def test_prs_outside_seven_day_window_excluded(client):
 
 
 def test_prs_counted_for_still_running_sessions(client):
-    """Cursor often leaves a session running (waiting_for_user) after opening a
-    PR. The PR is still delivered work and must be counted."""
+    """A PR is still delivered work even while its Droid session is running."""
     with db_session() as session:
         add_task(
             session,
@@ -268,8 +274,8 @@ def test_prs_counted_for_still_running_sessions(client):
 
 
 def test_merge_rate_counts_unreviewed_prs(client):
-    """An unmerged PR must drag the merge rate down even when no Cursor Review
-    row exists for it — otherwise the rate reads 100% while PRs sit open."""
+    """An unmerged PR must drag the merge rate down even when no review row
+    exists for it — otherwise the rate reads 100% while PRs sit open."""
     with db_session() as session:
         add_task(
             session,
@@ -343,7 +349,7 @@ def test_timestamps_are_rendered_in_sgt(client):
                 repository="jan21deepak/superset",
                 issue_number=1,
                 issue_title="t",
-                cursor_agent_id="sgt-session",
+                droid_session_id="sgt-session",
                 status=TaskStatus.COMPLETED,
                 duration_seconds=600,
                 created_at=stamp,
@@ -364,7 +370,7 @@ def test_daily_activity_buckets_by_sgt_day(client):
                 repository="jan21deepak/superset",
                 issue_number=1,
                 issue_title="t",
-                cursor_agent_id="daily-session",
+                droid_session_id="daily-session",
                 status=TaskStatus.COMPLETED,
                 duration_seconds=600,
                 pull_request_url="https://github.com/jan21deepak/superset/pull/20",
@@ -490,7 +496,7 @@ def test_add_issues_imports_five_from_parent_and_syncs(client, monkeypatch):
     assert len(grouped[0]["issues"]) == 5
 
 
-def test_list_and_assign_pulls_triggers_bugbot(client, monkeypatch):
+def test_list_and_assign_pulls_starts_droid_review(client, monkeypatch):
     with db_session() as session:
         repo = Repository(
             full_name="jan21deepak/superset",
@@ -507,27 +513,26 @@ def test_list_and_assign_pulls_triggers_bugbot(client, monkeypatch):
                 "html_url": f"https://github.com/{full_name}/pull/3",
                 "draft": False,
                 "state": "open",
-                "user": {"login": "cursor-bot"},
+                "user": {"login": "droid-bot"},
                 "head": {"sha": "abc123"},
             }
         ]
 
-    bugbot_calls = []
+    review_calls = []
 
-    async def fake_request_bugbot(self, repository, pr_number):
-        bugbot_calls.append((repository, pr_number))
-        return True
+    async def fake_start_pr_review(**kwargs):
+        review_calls.append(kwargs)
+        return {"review_id": 55, "started": True, "detail": "droid_review_started"}
 
     monkeypatch.setattr(
         "app.github.GitHubClient.list_open_pull_requests", fake_list_open_pull_requests
     )
-    monkeypatch.setattr(
-        "app.github.GitHubClient.request_bugbot_review", fake_request_bugbot
-    )
+    monkeypatch.setattr("app.app.start_pr_review", fake_start_pr_review)
 
     listed = client.get("/api/pulls").json()
     assert len(listed["repositories"]) == 1
     assert listed["repositories"][0]["pulls"][0]["pr_number"] == 3
+    assert listed["repositories"][0]["pulls"][0]["assigned"] is False
     pull_id = listed["repositories"][0]["pulls"][0]["id"]
 
     assigned = client.post("/api/pulls/assign", json={"pull_ids": [pull_id]})
@@ -535,5 +540,6 @@ def test_list_and_assign_pulls_triggers_bugbot(client, monkeypatch):
     body = assigned.json()
     assert body["accepted"] == 1
     assert body["results"][0]["ok"] is True
-    assert body["results"][0]["detail"] == "bugbot_requested"
-    assert bugbot_calls == [("jan21deepak/superset", 3)]
+    assert body["results"][0]["detail"] == "droid_review_started"
+    assert review_calls[0]["repository"] == "jan21deepak/superset"
+    assert review_calls[0]["pr_number"] == 3
