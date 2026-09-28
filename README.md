@@ -265,7 +265,7 @@ Failure mapping: `RunSuccess` → completed; `RunInterrupted` / `RunFailure` / t
 
 ### PR Review
 
-A second, read-only Droid session (`Autonomy.OFF`, permission requests auto-rejected) checks out the PR head branch (`git fetch origin pull/N/head`) and reviews the diff for production readiness. Forge parses its `VERDICT: APPROVE | REQUEST_CHANGES` line and posts a GitHub PR review with the full findings. If GitHub rejects the verdict event (e.g. the token owner opened the PR), forge falls back to a plain review comment. `REVIEW_AUTO_MERGE=false` by default; set it to `true` to squash-merge after an approving verdict.
+A second, read-only Droid session checks out the PR head branch (blobless full clone, then `git fetch origin pull/N/head`) and reviews the diff for production readiness. Review sessions run at `DROID_REVIEW_AUTONOMY` (default `high`); they must not be `off`, because headless turns auto-reject permission requests and an `off` review aborts on its first read command. Forge parses the `VERDICT: APPROVE | REQUEST_CHANGES` line and posts a GitHub PR review with the full findings. If GitHub rejects the verdict event (e.g. the token owner opened the PR), forge falls back to a plain review comment. `REVIEW_AUTO_MERGE=false` by default; set it to `true` to squash-merge after an approving verdict.
 
 ### Restart recovery
 
