@@ -118,6 +118,11 @@ class TestPrompts:
         assert "pull/3" in prompt
         assert "VERDICT: APPROVE" in prompt
         assert "review" in prompt.lower()
+        assert "origin/main...HEAD" in prompt
+
+    def test_review_prompt_defaults_base(self):
+        prompt = build_review_prompt("https://github.com/org/repo", "https://github.com/org/repo/pull/3", "")
+        assert "origin/main...HEAD" in prompt
 
     def test_follow_up_prompt(self):
         prompt = build_follow_up_prompt("Fix failing CI")
@@ -211,11 +216,55 @@ class TestWorkspaces:
         )
         assert (ws / "setup_marker.txt").read_text().strip() == "setup-ok"
 
+    @pytest.mark.asyncio
+    async def test_prepare_review_workspace_has_merge_base(self, tmp_path, monkeypatch):
+        """Review clone must carry history so `git diff base...HEAD` works."""
+        bare = make_bare_repo(tmp_path)
+        work = tmp_path / "work"
+        subprocess.run(["git", "clone", "-q", str(bare), str(work)], check=True)
+        run = lambda *a: subprocess.run(  # noqa: E731
+            ["git", *a], cwd=work, check=True, capture_output=True
+        )
+        run("checkout", "-q", "-b", "feature")
+        (work / "feature.txt").write_text("new")
+        run("add", ".")
+        run("-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-qm", "feature")
+        head = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=work, capture_output=True, text=True
+        ).stdout.strip()
+        subprocess.run(["git", "push", "-q", "origin", "feature"], cwd=work, check=True)
+        subprocess.run(
+            ["git", "-C", str(bare), "update-ref", "refs/pull/7/head", head], check=True
+        )
+
+        monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path / "ws"))
+        get_settings.cache_clear()
+        monkeypatch.setattr(droid_client, "_remote_url", lambda repository, token: str(bare))
+
+        client = DroidClient(api_key="fk_test")
+        ws = await client.prepare_review_workspace(
+            repository="jan21deepak/demo", review_id=1, pr_number=7, base_ref="main"
+        )
+        diff = subprocess.run(
+            ["git", "diff", "main...HEAD", "--stat"], cwd=ws, capture_output=True, text=True
+        )
+        assert diff.returncode == 0, diff.stderr
+        assert "feature.txt" in diff.stdout
+
 
 class TestClient:
     def test_configured(self):
         assert not DroidClient(api_key="").configured
         assert DroidClient(api_key="fk_test").configured
+
+    def test_review_autonomy_is_not_off(self, monkeypatch):
+        """Headless review runs auto-reject permission requests; OFF aborts them."""
+        monkeypatch.setenv("DROID_AUTONOMY", "high")
+        monkeypatch.setenv("DROID_REVIEW_AUTONOMY", "high")
+        get_settings.cache_clear()
+        client = DroidClient(api_key="fk_test")
+        assert client.autonomy(review=True) != droid_client.Autonomy.OFF
+        assert client.autonomy(review=False) != droid_client.Autonomy.OFF
 
     def test_configured_via_cli_auth(self, monkeypatch):
         from app.config import get_settings

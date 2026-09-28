@@ -50,7 +50,8 @@ Requirements:
 
 REVIEW_PROMPT_TEMPLATE = """Review the code changes on the currently checked-out branch of the repository: {repository_url}
 Pull request: {pr_url}
-The changes are relative to the base ref "{base_ref}" (use `git diff` to inspect them).
+The changes are relative to the base branch "origin/{base_ref}"; inspect them with
+`git diff origin/{base_ref}...HEAD` (three-dot compares against the merge base).
 
 Perform a thorough code review focused on production readiness:
 - Identify bugs, regressions, missing tests, and security issues.
@@ -117,7 +118,7 @@ def build_review_prompt(
     return REVIEW_PROMPT_TEMPLATE.format(
         repository_url=repository_url,
         pr_url=pr_url,
-        base_ref=base_ref or "the repository default branch",
+        base_ref=(base_ref or "").strip() or "main",
     )
 
 
@@ -252,9 +253,9 @@ class DroidClient:
     # ---- settings / discovery -------------------------------------------
 
     def autonomy(self, *, review: bool = False) -> Autonomy:
-        if review:
-            return Autonomy.OFF
-        level = (get_settings().droid_autonomy or "high").strip().lower()
+        settings = get_settings()
+        raw = settings.droid_review_autonomy if review else settings.droid_autonomy
+        level = (raw or "high").strip().lower()
         return {
             "off": Autonomy.OFF,
             "low": Autonomy.LOW,
@@ -375,24 +376,54 @@ class DroidClient:
         repository: str,
         review_id: int,
         pr_number: int,
+        base_ref: str | None = None,
     ) -> Path:
-        """Clone the repo and check out the pull request head branch."""
+        """Clone the repo, materialize the base branch, and check out the PR head.
+
+        A *shallow* clone has no common history with the PR branch, so
+        ``git diff base...HEAD`` fails with "no merge base". Use a blobless
+        (``--filter=blob:none``) full-history clone so the merge base exists,
+        then fetch the PR head and a local base branch for diffing.
+        """
         settings = get_settings()
         ws = review_workspace_dir(repository, review_id)
         remote = _remote_url(repository, settings.github_token or None)
         ws.parent.mkdir(parents=True, exist_ok=True)
 
         if not (ws / ".git").exists():
-            await _git(["clone", "--depth", "1", remote, str(ws)])
+            await _git(["clone", "--filter=blob:none", remote, str(ws)])
+            await _git(["config", "user.name", "Droid Forge"], cwd=ws)
+            await _git(["config", "user.email", "droid-forge@users.noreply.github.com"], cwd=ws)
         else:
             await _git(["remote", "set-url", "origin", remote], cwd=ws)
+            await _git(["fetch", "--filter=blob:none", "--prune", "origin"], cwd=ws)
 
+        base = (base_ref or "").strip() or "main"
         branch = f"pr-{pr_number}"
         await _git(
-            ["fetch", "--depth", "1", "--force", "origin", f"pull/{pr_number}/head:{branch}"],
+            ["fetch", "--force", "origin", f"pull/{pr_number}/head:{branch}"],
             cwd=ws,
         )
         await _git(["checkout", "-q", "--force", branch], cwd=ws)
+
+        # Materialize the base branch locally when it is absent. Do this after
+        # checking out the PR branch: a fresh clone leaves the default branch
+        # checked out, and git refuses to force-update the current worktree ref.
+        try:
+            await _git(["rev-parse", "--verify", f"refs/heads/{base}"], cwd=ws)
+        except DroidRunError:
+            try:
+                await _git(["fetch", "origin", base], cwd=ws)
+                await _git(["branch", base, f"origin/{base}"], cwd=ws)
+            except DroidRunError as exc:
+                log_event(
+                    logger,
+                    logging.WARNING,
+                    "droid.review_base_ref_failed",
+                    review_id=review_id,
+                    base=base,
+                    error=str(exc),
+                )
         return ws
 
     # ---- branch helpers ---------------------------------------------------
@@ -593,7 +624,10 @@ class DroidClient:
         if not self.configured:
             raise DroidRunError("Droid is not configured (FACTORY_API_KEY missing)")
         ws = await self.prepare_review_workspace(
-            repository=repository, review_id=review_id, pr_number=pr_number
+            repository=repository,
+            review_id=review_id,
+            pr_number=pr_number,
+            base_ref=base_ref,
         )
         prompt = build_review_prompt(repository_url, pr_url, base_ref or "")
         session = Session(

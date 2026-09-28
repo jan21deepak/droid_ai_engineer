@@ -33,6 +33,11 @@ class Settings(BaseSettings):
     droid_model: str = "auto"
     # Autonomy for fix sessions: off | low | medium | high
     droid_autonomy: str = "high"
+    # Autonomy for PR review sessions. Must not be "off": headless runs
+    # auto-reject permission requests, and OFF makes the review agent ask for
+    # permission on ordinary read commands, which aborts the run. The review
+    # prompt keeps the agent read-only; this only controls prompting.
+    droid_review_autonomy: str = "high"
     # Wall-clock budget for a single Droid turn (fix, review, follow-up)
     droid_turn_timeout_seconds: float = 3600.0
     # Where per-task repository workspace clones live

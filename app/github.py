@@ -469,7 +469,7 @@ class GitHubClient:
             "github.review_posted",
             repo=repository,
             pr=pr_number,
-            event=event,
+            review_event=event,
             review_id=review.get("id"),
         )
         return review

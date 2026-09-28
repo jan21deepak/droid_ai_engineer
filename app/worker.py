@@ -349,6 +349,11 @@ async def finalize_fix_task(task_id: int, outcome: dict) -> None:
                     error=str(exc),
                 )
 
+    # Keep the completion comment accurate: the PR may have just been created
+    # above, and `refreshed` is a detached snapshot that does not see it.
+    if pr_url and not refreshed.pull_request_url:
+        refreshed.pull_request_url = pr_url
+
     await github.post_issue_comment(
         refreshed.repository,
         refreshed.issue_number,

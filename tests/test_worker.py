@@ -166,6 +166,9 @@ async def test_finalize_fix_task_success_opens_pr_comments_and_starts_review(cli
     assert github.created_prs[0]["base"]["repo"]["full_name"] == "jan21deepak/omnigent"
     assert github.comments, "completion comment should be posted on the issue"
     assert "sess-abc" in github.comments[0][2]
+    # The just-created PR must appear in the comment, not "n/a".
+    assert "https://github.com/jan21deepak/omnigent/pull/99" in github.comments[0][2]
+    assert "n/a" not in github.comments[0][2]
     assert started_reviews, "PR review session should be started"
     assert started_reviews[0]["pr_number"] == 99
 

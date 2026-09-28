@@ -127,7 +127,7 @@ FACTORY_API_KEY=<your-factory-api-key>
 TRIGGER_LABEL=Droid-complete
 ```
 
-Optional: `DROID_MODEL` (default `auto` = Factory Router), `DROID_AUTONOMY` (default `high`, needed for git push), `DROID_USD_PER_AGENT_RUN` for ROI estimates, `DROID_TURN_TIMEOUT_SECONDS` (default 3600) for the per-turn wall-clock budget.
+Optional: `DROID_MODEL` (default `auto` = Factory Router), `DROID_AUTONOMY` (default `high`, needed for git push), `DROID_REVIEW_AUTONOMY` (default `high`, review sessions), `DROID_USD_PER_AGENT_RUN` for ROI estimates, `DROID_TURN_TIMEOUT_SECONDS` (default 3600) for the per-turn wall-clock budget.
 
 Verify the Droid key (the SDK uses the same key):
 
@@ -282,6 +282,7 @@ Droid sessions persist on disk (`~/.factory`). On startup, forge finds RUNNING r
 | `DROID_ALLOW_CLI_AUTH` | Use the local droid CLI's login when `FACTORY_API_KEY` is empty (local runs) | `false` |
 | `DROID_MODEL` | Model id for sessions (`auto` = Factory Router) | `auto` |
 | `DROID_AUTONOMY` | Autonomy for fix sessions: `off` / `low` / `medium` / `high` | `high` |
+| `DROID_REVIEW_AUTONOMY` | Autonomy for PR review sessions. Do not set `off`: headless runs auto-reject permission requests, which aborts the review on ordinary read commands | `high` |
 | `DROID_TURN_TIMEOUT_SECONDS` | Wall-clock budget for one Droid turn | `3600` |
 | `WORKSPACE_ROOT` | Where per-task repository clones live | `./data/workspace` |
 | `DATABASE_URL` | SQLAlchemy URL | `sqlite:///./data/tasks.db` |
