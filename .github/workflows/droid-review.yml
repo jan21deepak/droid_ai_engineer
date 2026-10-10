@@ -46,7 +46,8 @@ jobs:
       - name: Post review comment
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # Detached checkout: pin the repo so gh doesn't probe git for context.
+          # Detached checkout: pin repo and PR number so gh needs no git context.
           GH_REPO: ${{ github.repository }}
+          NUMBER: ${{ github.event.pull_request.number }}
         run: gh pr comment "$NUMBER" --body-file review.md
         if: always()
