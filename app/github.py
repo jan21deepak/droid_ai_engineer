@@ -4,11 +4,13 @@ import hashlib
 import hmac
 import logging
 from dataclasses import dataclass, field
+from typing import Any
 
 import httpx
 
 from app.config import get_settings
 from app.logging_conf import log_event
+from app.resilience import retry_with_backoff
 
 logger = logging.getLogger("app.github")
 
@@ -36,7 +38,7 @@ class IssueEvent:
     label_added: str | None = None
 
 
-def parse_issue_event(payload: dict) -> IssueEvent:
+def parse_issue_event(payload: dict[str, Any]) -> IssueEvent:
     """Extract the relevant fields from a GitHub `issues` webhook payload."""
     repo = payload.get("repository") or {}
     issue = payload.get("issue") or {}
@@ -56,11 +58,9 @@ def should_trigger(event: IssueEvent, trigger_label: str) -> bool:
     """Trigger on `opened` with the label present, or on the label being added."""
     if not event.issue_number:
         return False
-    if event.action == "opened" and trigger_label in event.labels:
-        return True
-    if event.action == "labeled" and event.label_added == trigger_label:
-        return True
-    return False
+    return (event.action == "opened" and trigger_label in event.labels) or (
+        event.action == "labeled" and event.label_added == trigger_label
+    )
 
 
 class GitHubClient:
@@ -71,7 +71,7 @@ class GitHubClient:
         self.token = token if token is not None else settings.github_token
         self.api_url = (api_url or settings.github_api_url).rstrip("/")
 
-    def _headers(self) -> dict:
+    def _headers(self) -> dict[str, str]:
         headers = {
             "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": "2022-11-28",
@@ -82,8 +82,14 @@ class GitHubClient:
 
     async def post_issue_comment(self, repository: str, issue_number: int, body: str) -> bool:
         if not self.token:
-            log_event(logger, logging.WARNING, "github.comment_skipped", reason="no token configured",
-                      repo=repository, issue=issue_number)
+            log_event(
+                logger,
+                logging.WARNING,
+                "github.comment_skipped",
+                reason="no token configured",
+                repo=repository,
+                issue=issue_number,
+            )
             return False
         url = f"{self.api_url}/repos/{repository}/issues/{issue_number}/comments"
         try:
@@ -93,17 +99,18 @@ class GitHubClient:
             log_event(logger, logging.INFO, "github.comment_posted", repo=repository, issue=issue_number)
             return True
         except httpx.HTTPError as exc:
-            log_event(logger, logging.ERROR, "github.comment_failed", repo=repository,
-                      issue=issue_number, error=str(exc))
+            log_event(
+                logger, logging.ERROR, "github.comment_failed", repo=repository, issue=issue_number, error=str(exc)
+            )
             return False
 
     async def list_issue_comments(
         self, repository: str, issue_number: int, *, per_page: int = 100
-    ) -> list[dict]:
+    ) -> list[dict[str, Any]]:
         """List comments on an issue or pull request (same GitHub issues API)."""
         if not self.token:
             return []
-        comments: list[dict] = []
+        comments: list[dict[str, Any]] = []
         page = 1
         async with httpx.AsyncClient(timeout=20) as client:
             while page <= 5:
@@ -120,13 +127,18 @@ class GitHubClient:
                 page += 1
         return comments
 
-    async def get_repository(self, full_name: str) -> dict:
-        """Fetch repository metadata. Raises httpx.HTTPStatusError on failure."""
-        url = f"{self.api_url}/repos/{full_name}"
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.get(url, headers=self._headers())
-            resp.raise_for_status()
-            return resp.json()
+    async def get_repository(self, full_name: str) -> dict[str, Any]:
+        """Fetch repository metadata. Retries transient failures; raises after 3 attempts."""
+
+        async def fetch() -> dict[str, Any]:
+            url = f"{self.api_url}/repos/{full_name}"
+            async with httpx.AsyncClient(timeout=15) as client:
+                resp = await client.get(url, headers=self._headers())
+                resp.raise_for_status()
+                data: dict[str, Any] = resp.json()
+                return data
+
+        return await retry_with_backoff(fetch)
 
     async def list_issues(
         self,
@@ -134,9 +146,9 @@ class GitHubClient:
         state: str = "open",
         per_page: int = 50,
         max_pages: int = 5,
-    ) -> list[dict]:
+    ) -> list[dict[str, Any]]:
         """List issues (excluding PRs) for a repository."""
-        issues: list[dict] = []
+        issues: list[dict[str, Any]] = []
         async with httpx.AsyncClient(timeout=30) as client:
             for page in range(1, max_pages + 1):
                 resp = await client.get(
@@ -156,9 +168,7 @@ class GitHubClient:
                     break
         return issues
 
-    async def list_open_issues(
-        self, full_name: str, per_page: int = 50, max_pages: int = 5
-    ) -> list[dict]:
+    async def list_open_issues(self, full_name: str, per_page: int = 50, max_pages: int = 5) -> list[dict[str, Any]]:
         return await self.list_issues(full_name, "open", per_page, max_pages)
 
     async def create_issue(
@@ -167,11 +177,11 @@ class GitHubClient:
         title: str,
         body: str = "",
         labels: list[str] | None = None,
-    ) -> dict:
+    ) -> dict[str, Any]:
         """Create a GitHub issue and return its API response."""
         if not self.token:
             raise RuntimeError("GitHub token is not configured")
-        payload: dict = {"title": title, "body": body}
+        payload: dict[str, Any] = {"title": title, "body": body}
         if labels:
             payload["labels"] = labels
         async with httpx.AsyncClient(timeout=15) as client:
@@ -181,7 +191,7 @@ class GitHubClient:
                 json=payload,
             )
             resp.raise_for_status()
-            issue = resp.json()
+            issue: dict[str, Any] = resp.json()
         log_event(
             logger,
             logging.INFO,
@@ -199,12 +209,18 @@ class GitHubClient:
             async with httpx.AsyncClient(timeout=15) as client:
                 resp = await client.post(url, headers=self._headers(), json={"labels": [label]})
                 resp.raise_for_status()
-            log_event(logger, logging.INFO, "github.label_added", repo=repository,
-                      issue=issue_number, label=label)
+            log_event(logger, logging.INFO, "github.label_added", repo=repository, issue=issue_number, label=label)
             return True
         except httpx.HTTPError as exc:
-            log_event(logger, logging.WARNING, "github.label_failed", repo=repository,
-                      issue=issue_number, label=label, error=str(exc))
+            log_event(
+                logger,
+                logging.WARNING,
+                "github.label_failed",
+                repo=repository,
+                issue=issue_number,
+                label=label,
+                error=str(exc),
+            )
             return False
 
     async def ensure_label(
@@ -260,7 +276,7 @@ class GitHubClient:
         *,
         webhook_url: str,
         secret: str,
-    ) -> dict:
+    ) -> dict[str, Any]:
         """Install or update an issues webhook pointing at forge's public URL."""
         if not self.token:
             raise RuntimeError("GitHub token is not configured")
@@ -308,7 +324,7 @@ class GitHubClient:
                     json=payload,
                 )
                 resp.raise_for_status()
-                data = resp.json()
+                data: dict[str, Any] = resp.json()
                 action = "updated"
             else:
                 resp = await client.post(
@@ -332,9 +348,9 @@ class GitHubClient:
 
     async def list_open_pull_requests(
         self, full_name: str, per_page: int = 50, max_pages: int = 5
-    ) -> list[dict]:
+    ) -> list[dict[str, Any]]:
         """List open, non-draft pull requests for a repository."""
-        pulls: list[dict] = []
+        pulls: list[dict[str, Any]] = []
         async with httpx.AsyncClient(timeout=30) as client:
             for page in range(1, max_pages + 1):
                 resp = await client.get(
@@ -364,7 +380,7 @@ class GitHubClient:
         body: str = "",
         draft: bool = False,
         same_repo: bool = True,
-    ) -> dict:
+    ) -> dict[str, Any]:
         """Open a pull request. Returns the GitHub PR payload.
 
         When ``same_repo`` is True (default), ``head`` is normalized to
@@ -407,7 +423,7 @@ class GitHubClient:
                     errors=errors,
                 )
             resp.raise_for_status()
-            pr = resp.json()
+            pr: dict[str, Any] = resp.json()
 
         base_repo = ((pr.get("base") or {}).get("repo") or {}).get("full_name") or ""
         head_repo = ((pr.get("head") or {}).get("repo") or {}).get("full_name") or ""
@@ -421,9 +437,7 @@ class GitHubClient:
                 head_repo=head_repo,
                 url=pr.get("html_url"),
             )
-            raise RuntimeError(
-                f"PR base repo is {base_repo}, expected same-repo PR on {repository}"
-            )
+            raise RuntimeError(f"PR base repo is {base_repo}, expected same-repo PR on {repository}")
 
         log_event(
             logger,
@@ -446,7 +460,7 @@ class GitHubClient:
         body: str,
         *,
         event: str = "COMMENT",
-    ) -> dict:
+    ) -> dict[str, Any]:
         """Post a PR review on behalf of the forge token (Droid review agent).
 
         ``event`` is one of COMMENT, APPROVE, REQUEST_CHANGES. GitHub rejects
@@ -462,7 +476,7 @@ class GitHubClient:
                 json={"body": body, "event": event},
             )
             resp.raise_for_status()
-            review = resp.json()
+            review: dict[str, Any] = resp.json()
         log_event(
             logger,
             logging.INFO,
@@ -474,50 +488,60 @@ class GitHubClient:
         )
         return review
 
-    async def find_open_pull_request_for_head(
-        self, repository: str, head: str
-    ) -> dict | None:
+    async def find_open_pull_request_for_head(self, repository: str, head: str) -> dict[str, Any] | None:
         """Return an open PR whose head branch matches ``head`` (branch name or owner:branch)."""
         head_branch = head.split(":", 1)[-1]
         owner = repository.split("/", 1)[0]
         candidates = {head_branch, f"{owner}:{head_branch}", head}
-        async with httpx.AsyncClient(timeout=20) as client:
-            resp = await client.get(
-                f"{self.api_url}/repos/{repository}/pulls",
-                headers=self._headers(),
-                params={"state": "open", "head": f"{owner}:{head_branch}", "per_page": 10},
-            )
-            if resp.status_code == 200:
-                for item in resp.json() or []:
-                    item_head = ((item.get("head") or {}).get("ref") or "")
-                    item_label = ((item.get("head") or {}).get("label") or "")
-                    if item_head in candidates or item_label in candidates:
+
+        async def find() -> dict[str, Any] | None:
+            async with httpx.AsyncClient(timeout=20) as client:
+                resp = await client.get(
+                    f"{self.api_url}/repos/{repository}/pulls",
+                    headers=self._headers(),
+                    params={"state": "open", "head": f"{owner}:{head_branch}", "per_page": 10},
+                )
+                if resp.status_code == 200:
+                    matches: list[dict[str, Any]] = resp.json() or []
+                    for item in matches:
+                        item_head = (item.get("head") or {}).get("ref") or ""
+                        item_label = (item.get("head") or {}).get("label") or ""
+                        if item_head in candidates or item_label in candidates:
+                            return item
+                # Fallback: list open PRs and match by branch name.
+                resp = await client.get(
+                    f"{self.api_url}/repos/{repository}/pulls",
+                    headers=self._headers(),
+                    params={"state": "open", "per_page": 50},
+                )
+                resp.raise_for_status()
+                open_prs: list[dict[str, Any]] = resp.json() or []
+                for item in open_prs:
+                    item_head = (item.get("head") or {}).get("ref") or ""
+                    if item_head == head_branch:
                         return item
-            # Fallback: list open PRs and match by branch name.
-            resp = await client.get(
-                f"{self.api_url}/repos/{repository}/pulls",
-                headers=self._headers(),
-                params={"state": "open", "per_page": 50},
-            )
-            resp.raise_for_status()
-            for item in resp.json() or []:
-                item_head = ((item.get("head") or {}).get("ref") or "")
-                if item_head == head_branch:
-                    return item
-        return None
+            return None
 
-    async def get_pull_request(self, repository: str, pr_number: int) -> dict:
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.get(
-                f"{self.api_url}/repos/{repository}/pulls/{pr_number}",
-                headers=self._headers(),
-            )
-            resp.raise_for_status()
-            return resp.json()
+        return await retry_with_backoff(find)
 
-    async def list_pull_request_reviews(self, repository: str, pr_number: int) -> list[dict]:
+    async def get_pull_request(self, repository: str, pr_number: int) -> dict[str, Any]:
+        """Fetch one PR. Retries transient failures; raises after 3 attempts."""
+
+        async def fetch() -> dict[str, Any]:
+            async with httpx.AsyncClient(timeout=15) as client:
+                resp = await client.get(
+                    f"{self.api_url}/repos/{repository}/pulls/{pr_number}",
+                    headers=self._headers(),
+                )
+                resp.raise_for_status()
+                data: dict[str, Any] = resp.json()
+                return data
+
+        return await retry_with_backoff(fetch)
+
+    async def list_pull_request_reviews(self, repository: str, pr_number: int) -> list[dict[str, Any]]:
         """Return submitted reviews on a pull request (paginated)."""
-        reviews: list[dict] = []
+        reviews: list[dict[str, Any]] = []
         page = 1
         per_page = 100
         async with httpx.AsyncClient(timeout=20) as client:
@@ -541,11 +565,11 @@ class GitHubClient:
         pr_number: int,
         merge_method: str = "squash",
         commit_title: str | None = None,
-    ) -> dict:
+    ) -> dict[str, Any]:
         """Merge a pull request via the GitHub REST API."""
         if not self.token:
             raise RuntimeError("GitHub token is not configured")
-        payload: dict = {"merge_method": merge_method}
+        payload: dict[str, Any] = {"merge_method": merge_method}
         if commit_title:
             payload["commit_title"] = commit_title
         async with httpx.AsyncClient(timeout=30) as client:
@@ -555,7 +579,7 @@ class GitHubClient:
                 json=payload,
             )
             resp.raise_for_status()
-            data = resp.json()
+            data: dict[str, Any] = resp.json()
         log_event(
             logger,
             logging.INFO,
@@ -566,9 +590,7 @@ class GitHubClient:
         )
         return data
 
-    async def enable_auto_merge(
-        self, repository: str, pr_number: int, merge_method: str = "SQUASH"
-    ) -> bool:
+    async def enable_auto_merge(self, repository: str, pr_number: int, merge_method: str = "SQUASH") -> bool:
         """Enable GitHub auto-merge via GraphQL. Returns True on success."""
         if not self.token:
             return False

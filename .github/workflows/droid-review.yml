@@ -1,0 +1,47 @@
+name: Droid PR review
+
+# Automated AI code review: every PR gets a review comment from a Droid agent.
+# Requires a repo secret FACTORY_API_KEY (Settings → Secrets → Actions).
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  pull_request_target:
+    types: [ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Droid CLI
+        run: curl -fsSL https://app.factory.ai/cli | sh
+
+      - name: Review the PR diff
+        env:
+          FACTORY_API_KEY: ${{ secrets.FACTORY_API_KEY }}
+        run: |
+          BRANCH="${{ github.event.pull_request.head.ref }}"
+          BASE="${{ github.event.pull_request.base.ref }}"
+          DIFF=$(git diff "origin/$BASE"..."origin/$BRANCH" | head -c 60000)
+          {
+            echo "## Automated Droid review"
+            echo
+            droid exec --auto medium "You are a code reviewer. Review this pull request diff for correctness, security issues, and test coverage. Be concise; list findings with severity (high/medium/low). If the diff is fine, say so.
+          ---DIFF START---
+          $DIFF
+          ---DIFF END---"
+          } > review.md
+
+      - name: Post review comment
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh pr comment "$NUMBER" --repo "$GITHUB_REPOSITORY" --body-file review.md
+        if: always()

@@ -337,6 +337,11 @@ Structured single-line logs with ISO-8601 **SGT** timestamps and key=value conte
 2026-09-28T11:30:00.123+08:00 | INFO | app.droid | droid.turn_finished | session_id=sess-… kind=fix success=True events=142 duration_seconds=734.0
 ```
 
+Operational docs:
+
+- [Runbook](docs/runbooks.md) — health triage and incident procedures (webhook 401s, stuck tasks, PR failures).
+- [OpenAPI schema](docs/openapi.json) — committed API contract; regenerate with `python scripts/export_openapi.py` (CI verifies freshness).
+
 ## Droid SDK (local sessions)
 
 | Concept | Droid Forge usage |

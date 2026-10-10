@@ -27,9 +27,7 @@ from app.models import TaskStatus
 
 
 def make_result(*, success=True, text="Done", duration=90.0, credits=1.5, subtype="success"):
-    usage = SimpleNamespace(
-        input_tokens=10, output_tokens=5, cache_read_tokens=0, factory_credits=credits
-    )
+    usage = SimpleNamespace(input_tokens=10, output_tokens=5, cache_read_tokens=0, factory_credits=credits)
     return SimpleNamespace(
         success=success,
         subtype=subtype,
@@ -112,9 +110,7 @@ class TestPrompts:
         assert "(no description provided)" in prompt
 
     def test_review_prompt(self):
-        prompt = build_review_prompt(
-            "https://github.com/org/repo", "https://github.com/org/repo/pull/3", "main"
-        )
+        prompt = build_review_prompt("https://github.com/org/repo", "https://github.com/org/repo/pull/3", "main")
         assert "pull/3" in prompt
         assert "VERDICT: APPROVE" in prompt
         assert "review" in prompt.lower()
@@ -187,16 +183,12 @@ class TestWorkspaces:
         monkeypatch.setattr(droid_client, "_remote_url", lambda repository, token: str(bare))
 
         client = DroidClient(api_key="fk_test")
-        ws = await client.prepare_fix_workspace(
-            repository="jan21deepak/demo", task_id=5, starting_ref="main"
-        )
+        ws = await client.prepare_fix_workspace(repository="jan21deepak/demo", task_id=5, starting_ref="main")
         assert (ws / ".git").exists()
         assert (ws / "README.md").read_text() == "hello"
 
         # Second prepare for the same task reuses the workspace, not a re-clone.
-        ws2 = await client.prepare_fix_workspace(
-            repository="jan21deepak/demo", task_id=5, starting_ref="main"
-        )
+        ws2 = await client.prepare_fix_workspace(repository="jan21deepak/demo", task_id=5, starting_ref="main")
         assert ws2 == ws
         assert (ws2 / "README.md").exists()
 
@@ -229,13 +221,9 @@ class TestWorkspaces:
         (work / "feature.txt").write_text("new")
         run("add", ".")
         run("-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-qm", "feature")
-        head = subprocess.run(
-            ["git", "rev-parse", "HEAD"], cwd=work, capture_output=True, text=True
-        ).stdout.strip()
+        head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=work, capture_output=True, text=True).stdout.strip()
         subprocess.run(["git", "push", "-q", "origin", "feature"], cwd=work, check=True)
-        subprocess.run(
-            ["git", "-C", str(bare), "update-ref", "refs/pull/7/head", head], check=True
-        )
+        subprocess.run(["git", "-C", str(bare), "update-ref", "refs/pull/7/head", head], check=True)
 
         monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path / "ws"))
         get_settings.cache_clear()
@@ -245,9 +233,7 @@ class TestWorkspaces:
         ws = await client.prepare_review_workspace(
             repository="jan21deepak/demo", review_id=1, pr_number=7, base_ref="main"
         )
-        diff = subprocess.run(
-            ["git", "diff", "main...HEAD", "--stat"], cwd=ws, capture_output=True, text=True
-        )
+        diff = subprocess.run(["git", "diff", "main...HEAD", "--stat"], cwd=ws, capture_output=True, text=True)
         assert diff.returncode == 0, diff.stderr
         assert "feature.txt" in diff.stdout
 
@@ -298,12 +284,8 @@ class TestClient:
     async def test_list_available_models(self, monkeypatch):
         async def fake_models(**kwargs):
             return [
-                SimpleNamespace(
-                    id="auto", display_name="Auto Model", model_provider="FACTORY", disabled=False
-                ),
-                SimpleNamespace(
-                    id="hidden", display_name="Hidden", model_provider="FACTORY", disabled=True
-                ),
+                SimpleNamespace(id="auto", display_name="Auto Model", model_provider="FACTORY", disabled=False),
+                SimpleNamespace(id="hidden", display_name="Hidden", model_provider="FACTORY", disabled=True),
             ]
 
         monkeypatch.setattr(droid_client, "list_models", fake_models)

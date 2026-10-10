@@ -1,6 +1,6 @@
 """Tests for worker runtime helpers (formatting, parsing, completion comments)."""
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from app.database import db_session
 from app.models import Task, TaskStatus
@@ -31,7 +31,7 @@ def test_build_completion_comment():
         pull_request_url="https://github.com/jan21deepak/omnigent/pull/7",
         summary="Fixed the guard clause and added tests.",
         duration_seconds=734.0,
-        completed_at=datetime(2026, 9, 28, 4, 0, tzinfo=timezone.utc),
+        completed_at=datetime(2026, 9, 28, 4, 0, tzinfo=UTC),
     )
     comment = build_completion_comment(task)
     assert "sess-abc" in comment

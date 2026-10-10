@@ -8,9 +8,12 @@ now only reconciles GitHub-side state (PR open/merged, auto-merge).
 """
 
 import asyncio
+import contextlib
 import logging
-from datetime import datetime, timezone
+from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime
 from functools import partial
+from typing import Any
 
 import httpx
 
@@ -84,6 +87,7 @@ def _persist_task_pr_url(task_id: int, pr_url: str) -> None:
 # Fix runs
 # ---------------------------------------------------------------------------
 
+
 async def launch_fix_task(
     task_id: int,
     *,
@@ -95,9 +99,7 @@ async def launch_fix_task(
 ) -> None:
     """Background launcher: prepare the workspace and start the Droid fix session."""
     droid = get_droid_client()
-    launch = resolve_agent_launch_config(
-        repository=repository, repository_url=repository_url
-    )
+    launch = resolve_agent_launch_config(repository=repository, repository_url=repository_url)
     try:
         result = await droid.start_fix_run(
             repository=repository,
@@ -146,7 +148,7 @@ async def launch_fix_task(
     )
 
 
-def spawn_fix_launch(task_id: int, **launch_kwargs) -> asyncio.Task:
+def spawn_fix_launch(task_id: int, **launch_kwargs: Any) -> asyncio.Task[None]:
     """Fire the launcher in the background so webhook handlers stay fast."""
     droid = get_droid_client()
     task = asyncio.create_task(launch_fix_task(task_id, **launch_kwargs))
@@ -173,6 +175,7 @@ async def ensure_pull_request_for_task(
     repository = task.repository
     existing = await github.find_open_pull_request_for_head(repository, branch)
     if existing and existing.get("html_url"):
+        html_url: str = existing["html_url"]
         log_event(
             logger,
             logging.INFO,
@@ -180,14 +183,12 @@ async def ensure_pull_request_for_task(
             task_id=task.id,
             repo=repository,
             branch=branch,
-            url=existing.get("html_url"),
+            url=html_url,
         )
-        _persist_task_pr_url(task.id, existing["html_url"])
-        return existing["html_url"]
+        _persist_task_pr_url(task.id, html_url)
+        return html_url
 
-    launch = resolve_agent_launch_config(
-        repository=repository, repository_url=task.repository_url
-    )
+    launch = resolve_agent_launch_config(repository=repository, repository_url=task.repository_url)
     base = launch.get("starting_ref")
     if not base:
         try:
@@ -223,8 +224,9 @@ async def ensure_pull_request_for_task(
         if exc.response.status_code == 422:
             existing = await github.find_open_pull_request_for_head(repository, branch)
             if existing and existing.get("html_url"):
-                _persist_task_pr_url(task.id, existing["html_url"])
-                return existing["html_url"]
+                reused_url: str = existing["html_url"]
+                _persist_task_pr_url(task.id, reused_url)
+                return reused_url
         log_event(
             logger,
             logging.WARNING,
@@ -249,18 +251,68 @@ async def ensure_pull_request_for_task(
         )
         return None
 
-    pr_url = pr.get("html_url")
+    pr_url: str | None = pr.get("html_url")
     # Persist before anything else so a crash still leaves the PR link on the task.
     if pr_url:
         _persist_task_pr_url(task.id, pr_url)
     return pr_url
 
 
-async def finalize_fix_task(task_id: int, outcome: dict) -> None:
+def _apply_outcome_to_task(task: Task | ReviewTask, outcome: dict[str, Any], status: str, summary: str | None) -> None:
+    """Persist turn outcome fields (status, summary, runtime, tokens, cost) onto a task row."""
+    settings = get_settings()
+    task.status = status
+    if summary:
+        task.summary = summary
+    if outcome.get("duration_seconds") is not None:
+        task.duration_seconds = outcome["duration_seconds"]
+    if outcome.get("credits") is not None:
+        task.factory_credits = outcome["credits"]
+    if outcome.get("tokens") is not None and isinstance(task, Task):
+        # Only fix tasks track estimated_tokens; ReviewTask has no such column.
+        task.estimated_tokens = outcome["tokens"]
+    cost = settings.droid_usd_per_agent_run or None
+    if status == TaskStatus.COMPLETED and cost is not None:
+        task.cost_usd = cost
+    if status == TaskStatus.FAILED:
+        task.error = outcome.get("error") or (f"Droid run ended with status: {outcome.get('subtype')}")
+    if task.completed_at is None:
+        task.completed_at = datetime.now(UTC)
+
+
+async def _resolve_pr_url(task: Task, summary: str | None, droid: DroidClient, github: GitHubClient) -> str | None:
+    """Best-effort fallback: ensure the agent's branch is pushed and a PR exists."""
+    branch = extract_branch_name(summary) or await droid.current_branch(task.repository, task.id)
+    if not branch:
+        return None
+    try:
+        await droid.ensure_branch_pushed(task.repository, task.id, branch)
+    except DroidRunError as exc:
+        log_event(
+            logger,
+            logging.WARNING,
+            "droid.branch_push_error",
+            task_id=task.id,
+            branch=branch,
+            error=str(exc),
+        )
+    try:
+        return await ensure_pull_request_for_task(task, branch, github)
+    except Exception as exc:
+        log_event(
+            logger,
+            logging.WARNING,
+            "polling.pr_fallback_error",
+            task_id=task.id,
+            error=str(exc),
+        )
+        return None
+
+
+async def finalize_fix_task(task_id: int, outcome: dict[str, Any]) -> None:
     """Turn-completion handler for issue-fix / follow-up / recovery runs."""
     github = GitHubClient()
     droid = get_droid_client()
-    settings = get_settings()
     status = map_outcome_status(outcome)
     summary = (outcome.get("text") or "").strip() or None
 
@@ -270,24 +322,7 @@ async def finalize_fix_task(task_id: int, outcome: dict) -> None:
             log_event(logger, logging.WARNING, "droid.task_missing", task_id=task_id)
             return
         old_status = task.status
-        task.status = status
-        if summary:
-            task.summary = summary
-        if outcome.get("duration_seconds") is not None:
-            task.duration_seconds = outcome["duration_seconds"]
-        if outcome.get("credits") is not None:
-            task.factory_credits = outcome["credits"]
-        if outcome.get("tokens") is not None:
-            task.estimated_tokens = outcome["tokens"]
-        cost = settings.droid_usd_per_agent_run or None
-        if status == TaskStatus.COMPLETED and cost is not None:
-            task.cost_usd = cost
-        if status == TaskStatus.FAILED:
-            task.error = outcome.get("error") or (
-                f"Droid run ended with status: {outcome.get('subtype')}"
-            )
-        if task.completed_at is None:
-            task.completed_at = datetime.now(timezone.utc)
+        _apply_outcome_to_task(task, outcome, status, summary)
         refreshed = task
 
     log_event(
@@ -321,34 +356,7 @@ async def finalize_fix_task(task_id: int, outcome: dict) -> None:
         runtime_seconds=refreshed.duration_seconds,
     )
 
-    pr_url = refreshed.pull_request_url
-    if not pr_url:
-        branch = extract_branch_name(summary) or await droid.current_branch(
-            refreshed.repository, task_id
-        )
-        if branch:
-            try:
-                await droid.ensure_branch_pushed(refreshed.repository, task_id, branch)
-            except DroidRunError as exc:
-                log_event(
-                    logger,
-                    logging.WARNING,
-                    "droid.branch_push_error",
-                    task_id=task_id,
-                    branch=branch,
-                    error=str(exc),
-                )
-            try:
-                pr_url = await ensure_pull_request_for_task(refreshed, branch, github)
-            except Exception as exc:
-                log_event(
-                    logger,
-                    logging.WARNING,
-                    "polling.pr_fallback_error",
-                    task_id=task_id,
-                    error=str(exc),
-                )
-
+    pr_url = refreshed.pull_request_url or await _resolve_pr_url(refreshed, summary, droid, github)
     # Keep the completion comment accurate: the PR may have just been created
     # above, and `refreshed` is a detached snapshot that does not see it.
     if pr_url and not refreshed.pull_request_url:
@@ -375,6 +383,7 @@ async def finalize_fix_task(task_id: int, outcome: dict) -> None:
 # ---------------------------------------------------------------------------
 # Review runs
 # ---------------------------------------------------------------------------
+
 
 def ensure_review_task_row(
     *,
@@ -431,9 +440,9 @@ async def start_pr_review(
     pr_number: int,
     pr_url: str = "",
     pr_title: str = "",
-) -> dict:
+) -> dict[str, Any]:
     """Ensure a review row exists and launch a Droid review session (non-blocking)."""
-    review_id, created = ensure_review_task_row(
+    review_id, _created = ensure_review_task_row(
         repository=repository,
         repository_url=repository_url,
         pr_number=pr_number,
@@ -474,9 +483,7 @@ async def launch_review_task(
 ) -> None:
     """Background launcher for the Droid PR review session."""
     droid = get_droid_client()
-    launch = resolve_agent_launch_config(
-        repository=repository, repository_url=repository_url
-    )
+    launch = resolve_agent_launch_config(repository=repository, repository_url=repository_url)
     base_ref = launch.get("starting_ref")
     if not base_ref:
         try:
@@ -502,7 +509,7 @@ async def launch_review_task(
             if review is not None:
                 review.status = TaskStatus.FAILED
                 review.error = f"Droid review session failed to start: {exc}"
-                review.completed_at = datetime.now(timezone.utc)
+                review.completed_at = datetime.now(UTC)
         log_event(
             logger,
             logging.ERROR,
@@ -531,7 +538,48 @@ async def launch_review_task(
     )
 
 
-async def finalize_review_task(review_id: int, outcome: dict) -> None:
+async def _post_review_verdict(github: GitHubClient, review: ReviewTask, body: str, event: str) -> tuple[bool, str]:
+    """Post a PR review, falling back to COMMENT when GitHub rejects the verdict.
+
+    Returns ``(posted, event)``.
+    """
+    try:
+        await github.create_pull_request_review(review.repository, review.pr_number, body, event=event)
+        return True, event
+    except httpx.HTTPStatusError as exc:
+        # GitHub rejects APPROVE / REQUEST_CHANGES on the token owner's own PRs.
+        if exc.response.status_code in (403, 422):
+            try:
+                await github.create_pull_request_review(review.repository, review.pr_number, body, event="COMMENT")
+                return True, "COMMENT"
+            except Exception as fallback_exc:
+                log_event(
+                    logger,
+                    logging.WARNING,
+                    "github.review_post_failed",
+                    review_id=review.id,
+                    error=str(fallback_exc),
+                )
+        else:
+            log_event(
+                logger,
+                logging.WARNING,
+                "github.review_post_failed",
+                review_id=review.id,
+                error=str(exc),
+            )
+    except Exception as exc:
+        log_event(
+            logger,
+            logging.WARNING,
+            "github.review_post_failed",
+            review_id=review.id,
+            error=str(exc),
+        )
+    return False, event
+
+
+async def finalize_review_task(review_id: int, outcome: dict[str, Any]) -> None:
     """Turn-completion handler for Droid PR review sessions."""
     github = GitHubClient()
     settings = get_settings()
@@ -544,22 +592,7 @@ async def finalize_review_task(review_id: int, outcome: dict) -> None:
             log_event(logger, logging.WARNING, "droid.review_missing", review_id=review_id)
             return
         old_status = review.status
-        review.status = status
-        if summary:
-            review.summary = summary
-        if outcome.get("duration_seconds") is not None:
-            review.duration_seconds = outcome["duration_seconds"]
-        if outcome.get("credits") is not None:
-            review.factory_credits = outcome["credits"]
-        cost = settings.droid_usd_per_agent_run or None
-        if status == TaskStatus.COMPLETED and cost is not None:
-            review.cost_usd = cost
-        if status == TaskStatus.FAILED:
-            review.error = outcome.get("error") or (
-                f"Droid review ended with status: {outcome.get('subtype')}"
-            )
-        if review.completed_at is None:
-            review.completed_at = datetime.now(timezone.utc)
+        _apply_outcome_to_task(review, outcome, status, summary)
         refreshed = review
 
     log_event(
@@ -582,49 +615,9 @@ async def finalize_review_task(review_id: int, outcome: dict) -> None:
         return
 
     verdict = extract_verdict(summary)
-    event = {"APPROVE": "APPROVE", "REQUEST_CHANGES": "REQUEST_CHANGES"}.get(
-        verdict or "", "COMMENT"
-    )
+    event = {"APPROVE": "APPROVE", "REQUEST_CHANGES": "REQUEST_CHANGES"}.get(verdict or "", "COMMENT")
     body = summary[:REVIEW_BODY_LIMIT]
-    posted = False
-    try:
-        await github.create_pull_request_review(
-            refreshed.repository, refreshed.pr_number, body, event=event
-        )
-        posted = True
-    except httpx.HTTPStatusError as exc:
-        # GitHub rejects APPROVE / REQUEST_CHANGES on the token owner's own PRs.
-        if exc.response.status_code in (403, 422):
-            try:
-                await github.create_pull_request_review(
-                    refreshed.repository, refreshed.pr_number, body, event="COMMENT"
-                )
-                posted = True
-                event = "COMMENT"
-            except Exception as fallback_exc:
-                log_event(
-                    logger,
-                    logging.WARNING,
-                    "github.review_post_failed",
-                    review_id=review_id,
-                    error=str(fallback_exc),
-                )
-        else:
-            log_event(
-                logger,
-                logging.WARNING,
-                "github.review_post_failed",
-                review_id=review_id,
-                error=str(exc),
-            )
-    except Exception as exc:
-        log_event(
-            logger,
-            logging.WARNING,
-            "github.review_post_failed",
-            review_id=review_id,
-            error=str(exc),
-        )
+    posted, event = await _post_review_verdict(github, refreshed, body, event)
 
     log_event(
         logger,
@@ -658,6 +651,7 @@ async def finalize_review_task(review_id: int, outcome: dict) -> None:
 # ---------------------------------------------------------------------------
 # GitHub state reconciliation (worker loop)
 # ---------------------------------------------------------------------------
+
 
 async def refresh_pr_states(github: GitHubClient, tasks: list[Task]) -> int:
     """Sync each Droid-opened PR's open/closed/merged state from GitHub."""
@@ -693,12 +687,13 @@ async def refresh_pr_states(github: GitHubClient, tasks: list[Task]) -> int:
 
         with db_session() as session:
             db_task = session.get(Task, task.id)
+            assert db_task is not None
             db_task.pr_state = state
             db_task.pr_merged_at = merged_at
             if state == "merged" and db_task.status in TaskStatus.ACTIVE:
                 db_task.status = TaskStatus.COMPLETED
                 if not db_task.completed_at:
-                    db_task.completed_at = datetime.now(timezone.utc)
+                    db_task.completed_at = datetime.now(UTC)
         updated += 1
         log_event(
             logger,
@@ -735,7 +730,7 @@ async def finalize_merged_running_tasks() -> int:
         for task in stuck:
             task.status = TaskStatus.COMPLETED
             if not task.completed_at:
-                task.completed_at = datetime.now(timezone.utc)
+                task.completed_at = datetime.now(UTC)
             updated += 1
             log_event(
                 logger,
@@ -785,11 +780,7 @@ async def poll_github_state(github: GitHubClient | None = None) -> int:
     updated = 0
 
     with db_session() as session:
-        tasks_with_pr = (
-            session.query(Task)
-            .filter(Task.pull_request_url.isnot(None))
-            .all()
-        )
+        tasks_with_pr = session.query(Task).filter(Task.pull_request_url.isnot(None)).all()
     updated += await refresh_pr_states(github, tasks_with_pr)
     updated += await finalize_merged_running_tasks()
 
@@ -816,9 +807,10 @@ async def poll_github_state(github: GitHubClient | None = None) -> int:
         if pr.get("merged") or (pr.get("state") == "closed" and pr.get("merged_at")):
             with db_session() as session:
                 db_review = session.get(ReviewTask, review.id)
+                assert db_review is not None
                 db_review.merged = True
                 if not db_review.completed_at:
-                    db_review.completed_at = datetime.now(timezone.utc)
+                    db_review.completed_at = datetime.now(UTC)
             updated += 1
             log_event(
                 logger,
@@ -834,10 +826,11 @@ async def poll_github_state(github: GitHubClient | None = None) -> int:
             if merged or auto_merge:
                 with db_session() as session:
                     db_review = session.get(ReviewTask, review.id)
+                    assert db_review is not None
                     if merged:
                         db_review.merged = True
                         if not db_review.completed_at:
-                            db_review.completed_at = datetime.now(timezone.utc)
+                            db_review.completed_at = datetime.now(UTC)
                     if auto_merge:
                         db_review.auto_merge_enabled = True
                 updated += 1
@@ -849,6 +842,63 @@ async def poll_github_state(github: GitHubClient | None = None) -> int:
 # Restart recovery
 # ---------------------------------------------------------------------------
 
+
+def _mark_row_failed[TaskOrReviewRow: Task | ReviewTask](
+    model: type[TaskOrReviewRow], row_id: int, error: str, *, stamp_completed: bool = False
+) -> None:
+    """Mark a Task/ReviewTask row failed with the given error message."""
+    with db_session() as session:
+        row = session.get(model, row_id)
+        if row is not None:
+            row.status = TaskStatus.FAILED
+            row.error = error
+            if stamp_completed:
+                row.completed_at = datetime.now(UTC)
+
+
+async def _resume_orphaned_row[TaskOrReviewRow: Task | ReviewTask](
+    model: type[TaskOrReviewRow],
+    row_id: int,
+    session_id: str | None,
+    droid: DroidClient,
+    finalize: Callable[[int, dict[str, Any]], Awaitable[None]],
+    *,
+    stamp_completed: bool,
+    id_key: str,
+) -> int:
+    """Resume one orphaned row's Droid session; fail the row if the session is lost.
+
+    Returns 1 when the row was resumed, 0 when it was marked failed.
+    """
+    if not session_id:
+        _mark_row_failed(model, row_id, "dispatch interrupted by service restart", stamp_completed=stamp_completed)
+        log_event(logger, logging.WARNING, "recovery.dispatch_lost", **{id_key: row_id})
+        return 0
+    try:
+        await droid.resume_interrupted(session_id, on_complete=partial(finalize, row_id))
+    except Exception as exc:
+        _mark_row_failed(
+            model,
+            row_id,
+            f"session lost after service restart: {exc}",
+            stamp_completed=stamp_completed,
+        )
+        log_event(
+            logger,
+            logging.WARNING,
+            "recovery.session_lost",
+            session_id=session_id,
+            error=str(exc),
+            **{id_key: row_id},
+        )
+        return 0
+    with db_session() as session:
+        row = session.get(model, row_id)
+        if row is not None:
+            row.status = TaskStatus.RUNNING
+    return 1
+
+
 async def recover_interrupted_tasks(droid: DroidClient | None = None) -> int:
     """Resume sessions orphaned by a service restart; fail rows that cannot run.
 
@@ -857,101 +907,41 @@ async def recover_interrupted_tasks(droid: DroidClient | None = None) -> int:
     session (dispatch interrupted) are marked failed.
     """
     droid = droid or get_droid_client()
-    recovered = 0
     if not droid.configured:
-        return recovered
+        return 0
 
     with db_session() as session:
-        fix_rows = (
-            session.query(Task)
-            .filter(Task.status.in_(TaskStatus.ACTIVE))
-            .all()
-        )
-        fix_snapshots = [
-            (t.id, t.droid_session_id) for t in fix_rows
-        ]
-        review_rows = (
-            session.query(ReviewTask)
-            .filter(ReviewTask.status.in_(TaskStatus.ACTIVE))
-            .all()
-        )
+        fix_rows = session.query(Task).filter(Task.status.in_(TaskStatus.ACTIVE)).all()
+        fix_snapshots = [(t.id, t.droid_session_id) for t in fix_rows]
+        review_rows = session.query(ReviewTask).filter(ReviewTask.status.in_(TaskStatus.ACTIVE)).all()
         review_snapshots = [(r.id, r.droid_session_id) for r in review_rows]
 
+    recovered = 0
     for task_id, session_id in fix_snapshots:
         if session_id and session_id in droid.active_sessions:
             continue
-        if not session_id:
-            with db_session() as session:
-                db_task = session.get(Task, task_id)
-                if db_task is not None:
-                    db_task.status = TaskStatus.FAILED
-                    db_task.error = "dispatch interrupted by service restart"
-            log_event(
-                logger, logging.WARNING, "recovery.dispatch_lost", task_id=task_id
-            )
-            continue
-        try:
-            await droid.resume_interrupted(
-                session_id, on_complete=partial(finalize_fix_task, task_id)
-            )
-            with db_session() as session:
-                db_task = session.get(Task, task_id)
-                if db_task is not None:
-                    db_task.status = TaskStatus.RUNNING
-            recovered += 1
-        except Exception as exc:
-            with db_session() as session:
-                db_task = session.get(Task, task_id)
-                if db_task is not None:
-                    db_task.status = TaskStatus.FAILED
-                    db_task.error = f"session lost after service restart: {exc}"
-            log_event(
-                logger,
-                logging.WARNING,
-                "recovery.session_lost",
-                task_id=task_id,
-                session_id=session_id,
-                error=str(exc),
-            )
+        recovered += await _resume_orphaned_row(
+            Task,
+            task_id,
+            session_id,
+            droid,
+            finalize_fix_task,
+            stamp_completed=False,
+            id_key="task_id",
+        )
 
     for review_id, session_id in review_snapshots:
         if session_id and session_id in droid.active_sessions:
             continue
-        if not session_id:
-            with db_session() as session:
-                db_review = session.get(ReviewTask, review_id)
-                if db_review is not None:
-                    db_review.status = TaskStatus.FAILED
-                    db_review.error = "dispatch interrupted by service restart"
-                    db_review.completed_at = datetime.now(timezone.utc)
-            log_event(
-                logger, logging.WARNING, "recovery.dispatch_lost", review_id=review_id
-            )
-            continue
-        try:
-            await droid.resume_interrupted(
-                session_id, on_complete=partial(finalize_review_task, review_id)
-            )
-            with db_session() as session:
-                db_review = session.get(ReviewTask, review_id)
-                if db_review is not None:
-                    db_review.status = TaskStatus.RUNNING
-            recovered += 1
-        except Exception as exc:
-            with db_session() as session:
-                db_review = session.get(ReviewTask, review_id)
-                if db_review is not None:
-                    db_review.status = TaskStatus.FAILED
-                    db_review.error = f"session lost after service restart: {exc}"
-                    db_review.completed_at = datetime.now(timezone.utc)
-            log_event(
-                logger,
-                logging.WARNING,
-                "recovery.session_lost",
-                review_id=review_id,
-                session_id=session_id,
-                error=str(exc),
-            )
+        recovered += await _resume_orphaned_row(
+            ReviewTask,
+            review_id,
+            session_id,
+            droid,
+            finalize_review_task,
+            stamp_completed=True,
+            id_key="review_id",
+        )
 
     if recovered or fix_snapshots or review_snapshots:
         log_event(
@@ -974,8 +964,6 @@ async def worker_loop(stop_event: asyncio.Event) -> None:
             await poll_github_state()
         except Exception as exc:
             log_event(logger, logging.ERROR, "worker.iteration_error", error=str(exc))
-        try:
+        with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(stop_event.wait(), timeout=interval)
-        except asyncio.TimeoutError:
-            pass
     log_event(logger, logging.INFO, "worker.stopped")

@@ -70,13 +70,13 @@ class TestTriggerRules:
         assert not should_trigger(parse_issue_event(issue_payload("opened", labels=())), TRIGGER_LABEL)
 
     def test_labeled_with_trigger_label(self):
-        event = parse_issue_event(
-            issue_payload("labeled", labels=(TRIGGER_LABEL,), label_added=TRIGGER_LABEL)
-        )
+        event = parse_issue_event(issue_payload("labeled", labels=(TRIGGER_LABEL,), label_added=TRIGGER_LABEL))
         assert should_trigger(event, TRIGGER_LABEL)
 
     def test_labeled_with_other_label(self):
-        assert not should_trigger(parse_issue_event(issue_payload("labeled", labels=("bug",), label_added="bug")), TRIGGER_LABEL)
+        assert not should_trigger(
+            parse_issue_event(issue_payload("labeled", labels=("bug",), label_added="bug")), TRIGGER_LABEL
+        )
 
     def test_closed_does_not_trigger(self):
         assert not should_trigger(parse_issue_event(issue_payload("closed")), TRIGGER_LABEL)

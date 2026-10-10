@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint-type-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      # Install into .venv: mypy config pins python_executable to it.
+      - name: Install dependencies
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Lint (ruff)
+        run: .venv/bin/ruff check app/ tests/ scripts/
+
+      - name: Format check (ruff format)
+        run: .venv/bin/ruff format --check app/ tests/ scripts/
+
+      - name: Type check (mypy strict)
+        run: .venv/bin/mypy app/
+
+      - name: File size guard
+        run: .venv/bin/python scripts/check_file_size.py
+
+      - name: Debt marker guard (TODOs must link issues)
+        run: .venv/bin/python scripts/check_todos.py
+
+      - name: Dead code scan (vulture)
+        run: .venv/bin/vulture app/ --min-confidence 80
+
+      - name: Duplicate code detection (jscpd)
+        run: |
+          npx --yes jscpd app/ \
+            --min-tokens 70 --threshold 2 \
+            --reporters consoleOnly --silent \
+            --format "python"
+
+      - name: OpenAPI schema freshness
+        run: |
+          .venv/bin/python scripts/export_openapi.py
+          git diff --exit-code docs/openapi.json \
+            || (echo "::error::docs/openapi.json is stale — run scripts/export_openapi.py" && exit 1)
+
+      - name: Tests (coverage threshold from pyproject.toml, retry once on flake)
+        run: .venv/bin/pytest --cov=app --reruns 1
+        env:
+          # Tests must not reach real services; per-test DBs come from conftest.
+          GITHUB_TOKEN: ""
+          FACTORY_API_KEY: ""
+
+  secrets-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

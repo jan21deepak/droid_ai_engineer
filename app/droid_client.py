@@ -11,12 +11,14 @@ and makes post-restart recovery possible via ``Session.resume``.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import re
 import shutil
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from droid_sdk import Autonomy, Session, SessionConfig, list_models
 
@@ -112,9 +114,7 @@ def build_fix_prompt(
     )
 
 
-def build_review_prompt(
-    repository_url: str, pr_url: str, base_ref: str
-) -> str:
+def build_review_prompt(repository_url: str, pr_url: str, base_ref: str) -> str:
     return REVIEW_PROMPT_TEMPLATE.format(
         repository_url=repository_url,
         pr_url=pr_url,
@@ -123,9 +123,7 @@ def build_review_prompt(
 
 
 def build_follow_up_prompt(instruction: str) -> str:
-    return FOLLOW_UP_PROMPT_TEMPLATE.format(
-        instruction=instruction.strip() or "Continue."
-    )
+    return FOLLOW_UP_PROMPT_TEMPLATE.format(instruction=instruction.strip() or "Continue.")
 
 
 def extract_branch_name(text: str | None) -> str | None:
@@ -144,7 +142,7 @@ def extract_verdict(text: str | None) -> str | None:
     return match.group(1).upper() if match else None
 
 
-def map_outcome_status(outcome: dict) -> str:
+def map_outcome_status(outcome: dict[str, Any]) -> str:
     """Map a Droid turn outcome to an internal TaskStatus."""
     return TaskStatus.COMPLETED if outcome.get("success") else TaskStatus.FAILED
 
@@ -177,7 +175,7 @@ async def _git(args: list[str], *, cwd: Path | str | None = None, timeout: float
     )
     try:
         out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         proc.kill()
         raise DroidRunError(f"git {' '.join(args[:3])} … timed out after {timeout}s") from None
     if proc.returncode != 0:
@@ -207,7 +205,7 @@ class DroidClient:
         self.model = (model if model is not None else settings.droid_model) or "auto"
         self.timeout_seconds = float(settings.droid_turn_timeout_seconds or 3600.0)
         # Background asyncio tasks: session_id / "launch:<id>" -> Task
-        self._tasks: dict[str, asyncio.Task] = {}
+        self._tasks: dict[str, asyncio.Task[Any]] = {}
 
     @property
     def configured(self) -> bool:
@@ -220,15 +218,11 @@ class DroidClient:
 
     @property
     def active_sessions(self) -> set[str]:
-        return {
-            key
-            for key, task in self._tasks.items()
-            if not key.startswith("launch:") and not task.done()
-        }
+        return {key for key, task in self._tasks.items() if not key.startswith("launch:") and not task.done()}
 
     # ---- registry -------------------------------------------------------
 
-    def track(self, key: str, task: asyncio.Task) -> asyncio.Task:
+    def track(self, key: str, task: asyncio.Task[Any]) -> asyncio.Task[Any]:
         existing = self._tasks.get(key)
         if existing and not existing.done():
             raise DroidSessionBusyError(f"run {key} is already in flight")
@@ -242,7 +236,7 @@ class DroidClient:
 
     async def shutdown(self) -> None:
         """Cancel in-flight runs; Droid sessions save state and stay resumable."""
-        for key, task in list(self._tasks.items()):
+        for task in list(self._tasks.values()):
             if not task.done():
                 task.cancel()
         pending = [t for t in self._tasks.values() if not t.done()]
@@ -279,7 +273,7 @@ class DroidClient:
         except Exception:
             return False
 
-    async def list_available_models(self) -> list[dict]:
+    async def list_available_models(self) -> list[dict[str, Any]]:
         if not self.configured:
             return []
         try:
@@ -315,7 +309,7 @@ class DroidClient:
         )
         try:
             out, _ = await asyncio.wait_for(proc.communicate(), timeout=SETUP_TIMEOUT_SECONDS)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             proc.kill()
             log_event(
                 logger,
@@ -430,9 +424,7 @@ class DroidClient:
 
     async def current_branch(self, repository: str, task_id: int) -> str | None:
         try:
-            branch = await _git(
-                ["rev-parse", "--abbrev-ref", "HEAD"], cwd=task_workspace_dir(repository, task_id)
-            )
+            branch = await _git(["rev-parse", "--abbrev-ref", "HEAD"], cwd=task_workspace_dir(repository, task_id))
         except DroidRunError:
             return None
         return branch or None
@@ -468,14 +460,14 @@ class DroidClient:
         prompt: str,
         *,
         kind: str,
-        on_complete: Callable[[dict], Any] | None,
-    ) -> dict:
+        on_complete: Callable[[dict[str, Any]], Any] | None,
+    ) -> dict[str, Any]:
         session_id = session.id
-        outcome: dict = {"session_id": session_id, "kind": kind}
+        outcome: dict[str, Any] = {"session_id": session_id, "kind": kind}
         events = 0
         try:
             async with session.stream(prompt, timeout=self.timeout_seconds) as stream:
-                async for message in stream:
+                async for _message in stream:
                     events += 1
                     if events % 25 == 0:
                         log_event(
@@ -489,9 +481,7 @@ class DroidClient:
             usage = getattr(result, "usage", None)
             tokens = None
             if usage is not None:
-                tokens = (getattr(usage, "input_tokens", 0) or 0) + (
-                    getattr(usage, "output_tokens", 0) or 0
-                )
+                tokens = (getattr(usage, "input_tokens", 0) or 0) + (getattr(usage, "output_tokens", 0) or 0)
             duration = getattr(result, "duration", None)
             outcome.update(
                 success=bool(result.success),
@@ -513,10 +503,8 @@ class DroidClient:
                 error=str(exc),
             )
         finally:
-            try:
+            with contextlib.suppress(Exception):
                 await session.close()
-            except Exception:
-                pass
 
         log_event(
             logger,
@@ -542,12 +530,10 @@ class DroidClient:
         prompt: str,
         *,
         kind: str,
-        on_complete: Callable[[dict], Any] | None,
+        on_complete: Callable[[dict[str, Any]], Any] | None,
     ) -> str:
         session_id = session.id
-        task = asyncio.create_task(
-            self._run_turn(session, prompt, kind=kind, on_complete=on_complete)
-        )
+        task = asyncio.create_task(self._run_turn(session, prompt, kind=kind, on_complete=on_complete))
         self.track(session_id, task)
         return session_id
 
@@ -563,8 +549,8 @@ class DroidClient:
         starting_ref: str | None = None,
         setup_command: str = "",
         model: str | None = None,
-        on_complete: Callable[[dict], Any] | None = None,
-    ) -> dict:
+        on_complete: Callable[[dict[str, Any]], Any] | None = None,
+    ) -> dict[str, Any]:
         """Prepare the workspace, open a Droid session and stream the fix turn.
 
         Returns ``{"session_id": str, "status": "running"}`` once the session
@@ -578,9 +564,7 @@ class DroidClient:
             starting_ref=starting_ref,
             setup_command=setup_command,
         )
-        prompt = build_fix_prompt(
-            repository_url, issue_number, issue_title, issue_body, starting_ref or ""
-        )
+        prompt = build_fix_prompt(repository_url, issue_number, issue_title, issue_body, starting_ref or "")
         session = Session(
             cwd=str(ws),
             model=model or self.model,
@@ -591,9 +575,7 @@ class DroidClient:
             await session.open()
         except Exception as exc:
             raise DroidRunError(f"failed to open Droid session: {exc}") from exc
-        session_id = self._spawn_turn(
-            session, prompt, kind="fix", on_complete=on_complete
-        )
+        session_id = self._spawn_turn(session, prompt, kind="fix", on_complete=on_complete)
         log_event(
             logger,
             logging.INFO,
@@ -618,8 +600,8 @@ class DroidClient:
         pr_url: str,
         base_ref: str | None = None,
         model: str | None = None,
-        on_complete: Callable[[dict], Any] | None = None,
-    ) -> dict:
+        on_complete: Callable[[dict[str, Any]], Any] | None = None,
+    ) -> dict[str, Any]:
         """Open a read-only review session on the PR head branch."""
         if not self.configured:
             raise DroidRunError("Droid is not configured (FACTORY_API_KEY missing)")
@@ -640,9 +622,7 @@ class DroidClient:
             await session.open()
         except Exception as exc:
             raise DroidRunError(f"failed to open Droid review session: {exc}") from exc
-        session_id = self._spawn_turn(
-            session, prompt, kind="review", on_complete=on_complete
-        )
+        session_id = self._spawn_turn(session, prompt, kind="review", on_complete=on_complete)
         log_event(
             logger,
             logging.INFO,
@@ -660,8 +640,8 @@ class DroidClient:
         session_id: str,
         instruction: str,
         *,
-        on_complete: Callable[[dict], Any] | None = None,
-    ) -> dict:
+        on_complete: Callable[[dict[str, Any]], Any] | None = None,
+    ) -> dict[str, Any]:
         """Resume a saved session and run a follow-up turn in the background."""
         if not self.configured:
             raise DroidRunError("Droid is not configured (FACTORY_API_KEY missing)")
@@ -674,17 +654,15 @@ class DroidClient:
         except Exception as exc:
             raise DroidRunError(f"failed to resume session {session_id}: {exc}") from exc
         self._spawn_turn(session, prompt, kind="follow_up", on_complete=on_complete)
-        log_event(
-            logger, logging.INFO, "droid.follow_up_sent", session_id=session_id
-        )
+        log_event(logger, logging.INFO, "droid.follow_up_sent", session_id=session_id)
         return {"session_id": session_id, "status": "running"}
 
     async def resume_interrupted(
         self,
         session_id: str,
         *,
-        on_complete: Callable[[dict], Any] | None = None,
-    ) -> dict:
+        on_complete: Callable[[dict[str, Any]], Any] | None = None,
+    ) -> dict[str, Any]:
         """Resume a session orphaned by a service restart and nudge it forward."""
         if not self.configured:
             raise DroidRunError("Droid is not configured (FACTORY_API_KEY missing)")
@@ -696,9 +674,7 @@ class DroidClient:
         except Exception as exc:
             raise DroidRunError(f"failed to resume session {session_id}: {exc}") from exc
         self._spawn_turn(session, RECOVERY_PROMPT_TEMPLATE, kind="recovery", on_complete=on_complete)
-        log_event(
-            logger, logging.INFO, "droid.session_recovered", session_id=session_id
-        )
+        log_event(logger, logging.INFO, "droid.session_recovered", session_id=session_id)
         return {"session_id": session_id, "status": "running"}
 
 

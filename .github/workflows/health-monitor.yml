@@ -1,0 +1,40 @@
+# Scheduled external health monitor. On failure it opens (or updates) a GitHub
+# issue — the error-to-insight pipeline that turns failed checks into work items.
+# Configure the deployed URL in the repo variable HEALTH_URL (Settings → Variables).
+name: Health monitor
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions:
+  issues: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check service health
+        id: health
+        run: |
+          URL="${{ vars.HEALTH_URL }}"
+          if [ -z "$URL" ]; then
+            echo "HEALTH_URL repo variable is not set; skipping." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          CODE=$(curl -s -o /tmp/health.json -w "%{http_code}" --max-time 20 "$URL/health" || echo 000)
+          echo "code=$CODE" >> "$GITHUB_OUTPUT"
+          cat /tmp/health.json 2>/dev/null || true
+          [ "$CODE" = "200" ]
+
+      - name: Open an issue when unhealthy
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TITLE="🚨 Health check failed (${{ steps.health.outputs.code || 'unreachable' }})"
+          BODY="Automated health check of \`${{ vars.HEALTH_URL }}/health\` failed at $(date -u +%FT%TZ).
+          See docs/runbooks.md for triage steps."
+          gh issue create --title "$TITLE" --body "$BODY" --label bug --repo "$GITHUB_REPOSITORY" \
+            || echo "issue creation failed (dedup or permissions); check logs"

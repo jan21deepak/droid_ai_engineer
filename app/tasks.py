@@ -2,9 +2,9 @@
 
 import json
 import logging
+from typing import Any
 
 from app import worker
-from app.config import get_settings
 from app.database import db_session
 from app.droid_client import get_droid_client
 from app.logging_conf import log_event
@@ -29,7 +29,7 @@ async def create_and_dispatch_task(
     issue_title: str,
     issue_body: str,
     labels: list[str] | None = None,
-) -> dict:
+) -> dict[str, Any]:
     """Persist a Task and launch a local Droid fix session when configured.
 
     Returns ``{"task_id": int, "session_id": str | None, "status": str}``.
@@ -67,8 +67,12 @@ async def create_and_dispatch_task(
         task_id = task.id
 
     log_event(
-        logger, logging.INFO, "task.created",
-        task_id=task_id, repo=repository, issue=issue_number,
+        logger,
+        logging.INFO,
+        "task.created",
+        task_id=task_id,
+        repo=repository,
+        issue=issue_number,
     )
 
     droid = get_droid_client()

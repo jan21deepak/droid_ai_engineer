@@ -1,0 +1,29 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended", ":enablePreCommit"],
+  "pip_requirements": {
+    "fileMatch": ["^requirements(-dev)?\\.txt$"]
+  },
+  "rangeStrategy": "pin",
+  "minimumReleaseAge": "7 days",
+  "prCreation": "pending",
+  "vulnerabilityAlerts": {
+    "enabled": true,
+    "labels": ["security"]
+  },
+  "packageRules": [
+    {
+      "description": "Batch minor/patch runtime bumps into one PR per week",
+      "matchManagers": ["pip_requirements"],
+      "matchUpdateTypes": ["minor", "patch"],
+      "groupName": "python minor/patch updates",
+      "schedule": ["weekly"]
+    },
+    {
+      "description": "Droid SDK updates get their own PR for closer review",
+      "matchManagers": ["pip_requirements"],
+      "matchPackageNames": ["droid-sdk"],
+      "groupName": "droid-sdk"
+    }
+  ]
+}

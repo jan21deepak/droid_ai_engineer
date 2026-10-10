@@ -3,31 +3,36 @@
 import asyncio
 import json
 import logging
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
+from typing import Any
 
 import httpx
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 
 from app import __version__
+from app.analytics import fire_and_forget
 from app.config import get_settings
 from app.database import check_db_connectivity, db_session, init_db
 from app.droid_client import (
     DroidSessionBusyError,
     get_droid_client,
 )
+from app.error_tracking import init_error_tracking
 from app.github import GitHubClient, parse_issue_event, should_trigger, verify_signature
 from app.logging_conf import log_event, setup_logging
 from app.metrics import compute_metrics, recent_activity
 from app.models import Repository, ReviewTask, SyncedIssue, SyncedPullRequest, Task, TaskStatus
 from app.repos import parse_repository_ref
 from app.tasks import TaskCreateError, create_and_dispatch_task
+from app.tracing import RequestIDMiddleware
 from app.worker import recover_interrupted_tasks, start_pr_review, worker_loop
 
 logger = logging.getLogger("app.api")
@@ -50,10 +55,10 @@ def asset_version() -> str:
     return f"{__version__}-{int(newest)}"
 
 
-async def _ensure_repo_automation(github: GitHubClient, full_name: str) -> dict:
+async def _ensure_repo_automation(github: GitHubClient, full_name: str) -> dict[str, Any]:
     """Ensure trigger label + issues webhook exist for a registered repository."""
     settings = get_settings()
-    out: dict = {"label": None, "webhook": None}
+    out: dict[str, Any] = {"label": None, "webhook": None}
     try:
         out["label"] = await github.ensure_label(full_name, settings.trigger_label)
     except Exception as exc:
@@ -87,9 +92,10 @@ async def _ensure_repo_automation(github: GitHubClient, full_name: str) -> dict:
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = get_settings()
     setup_logging(settings.log_level)
+    init_error_tracking(settings.sentry_dsn, settings.sentry_environment)
     init_db()
     droid = get_droid_client()
     await recover_interrupted_tasks(droid)
@@ -103,6 +109,8 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="droid-ai-engineer", version=__version__, lifespan=lifespan)
+# Request tracing: every request gets an X-Request-ID echoed into logs.
+app.add_middleware(RequestIDMiddleware)
 app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
 
 
@@ -154,13 +162,13 @@ class FollowUpRequest(BaseModel):
 
 
 @app.get("/")
-async def root():
+async def root() -> RedirectResponse:
     """Send browsers to the dashboard UI (JSON API discovery lives under /health)."""
     return RedirectResponse(url="/dashboard", status_code=307)
 
 
 @app.get("/health")
-async def health():
+async def health() -> JSONResponse:
     settings = get_settings()
     db_ok = check_db_connectivity()
     github_ok = await GitHubClient().check_connectivity()
@@ -191,8 +199,8 @@ async def health():
     )
 
 
-@app.post("/webhook")
-async def webhook(request: Request):
+@app.post("/webhook", response_model=None)
+async def webhook(request: Request) -> JSONResponse | dict[str, Any]:
     settings = get_settings()
     body = await request.body()
     signature = request.headers.get("X-Hub-Signature-256")
@@ -207,8 +215,7 @@ async def webhook(request: Request):
     except json.JSONDecodeError:
         return JSONResponse(status_code=422, content={"detail": "invalid JSON payload"})
 
-    log_event(logger, logging.INFO, "webhook.received", github_event=event_type,
-              action=payload.get("action"))
+    log_event(logger, logging.INFO, "webhook.received", github_event=event_type, action=payload.get("action"))
 
     if event_type == "ping":
         return {"detail": "pong"}
@@ -220,9 +227,15 @@ async def webhook(request: Request):
         return JSONResponse(status_code=422, content={"detail": "malformed issues payload"})
 
     if not should_trigger(event, settings.trigger_label):
-        log_event(logger, logging.INFO, "webhook.ignored", repo=event.repository,
-                  issue=event.issue_number, action=event.action,
-                  reason=f"no trigger (label '{settings.trigger_label}' required)")
+        log_event(
+            logger,
+            logging.INFO,
+            "webhook.ignored",
+            repo=event.repository,
+            issue=event.issue_number,
+            action=event.action,
+            reason=f"no trigger (label '{settings.trigger_label}' required)",
+        )
         return {"detail": "ignored: trigger conditions not met"}
 
     try:
@@ -246,28 +259,28 @@ async def webhook(request: Request):
 
 
 @app.get("/metrics")
-async def metrics():
+async def metrics() -> dict[str, Any]:
     with db_session() as session:
         return compute_metrics(session)
 
 
 @app.get("/api/repositories")
-async def list_repositories():
+async def list_repositories() -> dict[str, Any]:
     with db_session() as session:
         repos = session.query(Repository).order_by(Repository.created_at.desc()).all()
         return {"repositories": [r.to_dict() for r in repos]}
 
 
 @app.get("/api/droid/models")
-async def list_droid_models():
+async def list_droid_models() -> dict[str, Any]:
     """Model catalog for the dashboard dropdown (Factory Router = "auto")."""
     droid = get_droid_client()
     models = await droid.list_available_models() if droid.configured else []
     return {"models": models, "count": len(models)}
 
 
-@app.post("/api/repositories")
-async def add_repository(payload: AddRepositoryRequest):
+@app.post("/api/repositories", response_model=None)
+async def add_repository(payload: AddRepositoryRequest) -> JSONResponse | dict[str, Any]:
     full_name = parse_repository_ref(payload.url)
     if not full_name:
         return JSONResponse(status_code=422, content={"detail": "invalid GitHub repository URL or slug"})
@@ -291,9 +304,7 @@ async def add_repository(payload: AddRepositoryRequest):
             description=(meta.get("description") or "")[:2000],
             droid_model=(payload.droid_model or "").strip(),
             setup_command=(payload.setup_command or "").strip(),
-            starting_ref=(payload.starting_ref or "").strip()
-            or (meta.get("default_branch") or "main")
-            or "main",
+            starting_ref=(payload.starting_ref or "").strip() or (meta.get("default_branch") or "main") or "main",
         )
         session.add(repo)
         session.flush()
@@ -314,8 +325,8 @@ async def add_repository(payload: AddRepositoryRequest):
     )
 
 
-@app.patch("/api/repositories/{repo_id}")
-async def update_repository(repo_id: int, payload: UpdateRepositoryRequest):
+@app.patch("/api/repositories/{repo_id}", response_model=None)
+async def update_repository(repo_id: int, payload: UpdateRepositoryRequest) -> JSONResponse | dict[str, Any]:
     """Update Droid model / setup command / starting ref for a registered repository."""
     with db_session() as session:
         repo = session.get(Repository, repo_id)
@@ -340,8 +351,8 @@ async def update_repository(repo_id: int, payload: UpdateRepositoryRequest):
         return {"repository": repo.to_dict()}
 
 
-@app.delete("/api/repositories/{repo_id}")
-async def delete_repository(repo_id: int):
+@app.delete("/api/repositories/{repo_id}", response_model=None)
+async def delete_repository(repo_id: int) -> JSONResponse | dict[str, Any]:
     with db_session() as session:
         repo = session.get(Repository, repo_id)
         if not repo:
@@ -354,16 +365,16 @@ async def delete_repository(repo_id: int):
     return {"detail": "removed"}
 
 
-def _persist_synced_issues(full_name: str, repo_url: str, issues: list[dict]) -> int:
+def _persist_synced_issues(full_name: str, repo_url: str, issues: list[dict[str, Any]]) -> int:
     """Replace the synced issues for a repository with the supplied open issues."""
-    deduped: dict[int, dict] = {}
+    deduped: dict[int, dict[str, Any]] = {}
     for item in issues:
         number = int(item.get("number") or 0)
         if not number or (item.get("state") or "open") != "open":
             continue
         deduped[number] = item
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     with db_session() as session:
         session.query(SyncedIssue).filter(SyncedIssue.repository == full_name).delete()
         for number, item in sorted(deduped.items(), reverse=True):
@@ -384,9 +395,9 @@ def _persist_synced_issues(full_name: str, repo_url: str, issues: list[dict]) ->
     return len(deduped)
 
 
-def _persist_synced_pulls(full_name: str, repo_url: str, pulls: list[dict]) -> int:
+def _persist_synced_pulls(full_name: str, repo_url: str, pulls: list[dict[str, Any]]) -> int:
     """Replace synced open, non-draft PRs for a repository."""
-    deduped: dict[int, dict] = {}
+    deduped: dict[int, dict[str, Any]] = {}
     for item in pulls:
         number = int(item.get("number") or 0)
         if not number or item.get("draft"):
@@ -395,7 +406,7 @@ def _persist_synced_pulls(full_name: str, repo_url: str, pulls: list[dict]) -> i
             continue
         deduped[number] = item
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     with db_session() as session:
         session.query(SyncedPullRequest).filter(SyncedPullRequest.repository == full_name).delete()
         for number, item in sorted(deduped.items(), reverse=True):
@@ -418,7 +429,7 @@ def _persist_synced_pulls(full_name: str, repo_url: str, pulls: list[dict]) -> i
     return len(deduped)
 
 
-async def _sync_repository_pulls(repo_id: int) -> dict:
+async def _sync_repository_pulls(repo_id: int) -> dict[str, Any]:
     with db_session() as session:
         repo = session.get(Repository, repo_id)
         if not repo:
@@ -437,8 +448,8 @@ async def _sync_repository_pulls(repo_id: int) -> dict:
     return {"detail": "synced", "repository": full_name, "count": synced}
 
 
-@app.post("/api/repositories/{repo_id}/sync-issues")
-async def sync_repository_issues(repo_id: int):
+@app.post("/api/repositories/{repo_id}/sync-issues", response_model=None)
+async def sync_repository_issues(repo_id: int) -> JSONResponse | dict[str, Any]:
     with db_session() as session:
         repo = session.get(Repository, repo_id)
         if not repo:
@@ -463,8 +474,8 @@ async def sync_repository_issues(repo_id: int):
     }
 
 
-@app.post("/api/repositories/{repo_id}/issues")
-async def create_repository_issues(repo_id: int):
+@app.post("/api/repositories/{repo_id}/issues", response_model=None)
+async def create_repository_issues(repo_id: int) -> JSONResponse | dict[str, Any]:
     """Copy five new open issues from a fork's parent into the repository."""
     with db_session() as session:
         repo = session.get(Repository, repo_id)
@@ -493,11 +504,7 @@ async def create_repository_issues(repo_id: int):
         )
 
     existing_bodies = "\n".join(item.get("body") or "" for item in existing_issues)
-    candidates = [
-        item
-        for item in parent_issues
-        if f"Source issue: {item.get('html_url')}" not in existing_bodies
-    ][:5]
+    candidates = [item for item in parent_issues if f"Source issue: {item.get('html_url')}" not in existing_bodies][:5]
     if not candidates:
         return {
             "detail": "no_new_parent_issues",
@@ -508,12 +515,10 @@ async def create_repository_issues(repo_id: int):
         }
 
     created = []
-    created_payloads: list[dict] = []
+    created_payloads: list[dict[str, Any]] = []
     try:
         for source in candidates:
-            source_url = source.get("html_url") or (
-                f"https://github.com/{parent}/issues/{source.get('number')}"
-            )
+            source_url = source.get("html_url") or (f"https://github.com/{parent}/issues/{source.get('number')}")
             source_body = (source.get("body") or "").strip()
             body = (
                 f"{source_body}\n\n"
@@ -566,12 +571,10 @@ async def create_repository_issues(repo_id: int):
 
 
 @app.get("/api/issues")
-async def list_synced_issues():
+async def list_synced_issues() -> dict[str, Any]:
     with db_session() as session:
         issues = (
-            session.query(SyncedIssue)
-            .order_by(SyncedIssue.repository.asc(), SyncedIssue.issue_number.desc())
-            .all()
+            session.query(SyncedIssue).order_by(SyncedIssue.repository.asc(), SyncedIssue.issue_number.desc()).all()
         )
         active_keys = {
             (t.repository, t.issue_number)
@@ -579,20 +582,16 @@ async def list_synced_issues():
                 Task.status.in_((TaskStatus.QUEUED, TaskStatus.RUNNING, TaskStatus.COMPLETED))
             )
         }
-        grouped: dict[str, list] = {}
+        grouped: dict[str, list[dict[str, Any]]] = {}
         for issue in issues:
             payload = issue.to_dict()
             payload["assigned"] = (issue.repository, issue.issue_number) in active_keys
             grouped.setdefault(issue.repository, []).append(payload)
-        return {
-            "repositories": [
-                {"repository": repo, "issues": items} for repo, items in grouped.items()
-            ]
-        }
+        return {"repositories": [{"repository": repo, "issues": items} for repo, items in grouped.items()]}
 
 
-@app.post("/api/issues/assign")
-async def assign_issues_to_droid(payload: AssignIssuesRequest):
+@app.post("/api/issues/assign", response_model=None)
+async def assign_issues_to_droid(payload: AssignIssuesRequest) -> JSONResponse | dict[str, Any]:
     """Add the trigger label on GitHub so the webhook (flow 1) launches the agent.
 
     Always applies the trigger label on the issue. When ``PUBLIC_BASE_URL`` is
@@ -606,16 +605,16 @@ async def assign_issues_to_droid(payload: AssignIssuesRequest):
     prefer_webhook = bool(public)
 
     with db_session() as session:
-        issues = (
-            session.query(SyncedIssue)
-            .filter(SyncedIssue.id.in_(payload.issue_ids))
-            .all()
-        )
+        issues = session.query(SyncedIssue).filter(SyncedIssue.id.in_(payload.issue_ids)).all()
         snapshots = [issue.to_dict() for issue in issues]
 
     if not snapshots:
         return JSONResponse(status_code=404, content={"detail": "no matching issues"})
 
+    fire_and_forget(
+        "issues_assigned",
+        {"count": len(payload.issue_ids), "via_webhook": bool(settings.public_base_url)},
+    )
     results = []
     for issue in snapshots:
         labels = []
@@ -627,10 +626,8 @@ async def assign_issues_to_droid(payload: AssignIssuesRequest):
         await github.ensure_label(issue["repository"], settings.trigger_label)
         labeled = True
         if settings.trigger_label not in labels:
-            labeled = await github.add_issue_label(
-                issue["repository"], issue["issue_number"], settings.trigger_label
-            )
-            labels = list(labels) + [settings.trigger_label]
+            labeled = await github.add_issue_label(issue["repository"], issue["issue_number"], settings.trigger_label)
+            labels = [*labels, settings.trigger_label]
             # Keep local sync in sync for the Issues UI "assigned" badge path.
             with db_session() as session:
                 row = session.get(SyncedIssue, issue["id"])
@@ -658,9 +655,7 @@ async def assign_issues_to_droid(payload: AssignIssuesRequest):
                         .filter(
                             Task.repository == issue["repository"],
                             Task.issue_number == issue["issue_number"],
-                            Task.status.in_(
-                                (TaskStatus.QUEUED, TaskStatus.RUNNING, TaskStatus.COMPLETED)
-                            ),
+                            Task.status.in_((TaskStatus.QUEUED, TaskStatus.RUNNING, TaskStatus.COMPLETED)),
                         )
                         .order_by(Task.id.desc())
                         .first()
@@ -710,8 +705,8 @@ async def assign_issues_to_droid(payload: AssignIssuesRequest):
     return {"detail": "processed", "accepted": accepted, "results": results}
 
 
-@app.post("/api/webhooks/sync")
-async def sync_github_webhooks():
+@app.post("/api/webhooks/sync", response_model=None)
+async def sync_github_webhooks() -> JSONResponse | dict[str, Any]:
     """Ensure trigger label + issues webhook exist on every registered repository."""
     settings = get_settings()
     if not (settings.public_base_url or "").strip():
@@ -732,16 +727,14 @@ async def sync_github_webhooks():
 
 
 @app.get("/api/pulls")
-async def list_synced_pulls():
+async def list_synced_pulls() -> dict[str, Any]:
     """Return review-ready PRs, refreshing from GitHub for every registered repo."""
     with db_session() as session:
         repos = session.query(Repository).all()
         repo_ids = [r.id for r in repos]
         active_reviews = {
             (r.repository, r.pr_number)
-            for r in session.query(ReviewTask)
-            .filter(ReviewTask.status.in_(TaskStatus.ACTIVE))
-            .all()
+            for r in session.query(ReviewTask).filter(ReviewTask.status.in_(TaskStatus.ACTIVE)).all()
         }
 
     for repo_id in repo_ids:
@@ -761,27 +754,19 @@ async def list_synced_pulls():
             .order_by(SyncedPullRequest.repository.asc(), SyncedPullRequest.pr_number.desc())
             .all()
         )
-        grouped: dict[str, list] = {}
+        grouped: dict[str, list[dict[str, Any]]] = {}
         for pull in pulls:
             payload = pull.to_dict()
             payload["assigned"] = (pull.repository, pull.pr_number) in active_reviews
             grouped.setdefault(pull.repository, []).append(payload)
-        return {
-            "repositories": [
-                {"repository": repo, "pulls": items} for repo, items in grouped.items()
-            ]
-        }
+        return {"repositories": [{"repository": repo, "pulls": items} for repo, items in grouped.items()]}
 
 
-@app.post("/api/pulls/assign")
-async def assign_pulls_to_droid(payload: AssignPullsRequest):
+@app.post("/api/pulls/assign", response_model=None)
+async def assign_pulls_to_droid(payload: AssignPullsRequest) -> JSONResponse | dict[str, Any]:
     """Launch a Droid review session on the selected pull requests."""
     with db_session() as session:
-        pulls = (
-            session.query(SyncedPullRequest)
-            .filter(SyncedPullRequest.id.in_(payload.pull_ids))
-            .all()
-        )
+        pulls = session.query(SyncedPullRequest).filter(SyncedPullRequest.id.in_(payload.pull_ids)).all()
         snapshots = [p.to_dict() for p in pulls]
 
     if not snapshots:
@@ -836,13 +821,13 @@ async def assign_pulls_to_droid(payload: AssignPullsRequest):
 
 
 @app.get("/api/tasks")
-async def list_tasks(page: int = 1, page_size: int = 10):
+async def list_tasks(page: int = 1, page_size: int = 10) -> dict[str, Any]:
     with db_session() as session:
         return recent_activity(session, page=page, page_size=page_size)
 
 
-@app.post("/api/tasks/{task_id}/follow-up")
-async def follow_up_task(task_id: int, payload: FollowUpRequest):
+@app.post("/api/tasks/{task_id}/follow-up", response_model=None)
+async def follow_up_task(task_id: int, payload: FollowUpRequest) -> JSONResponse | dict[str, Any]:
     """Send a follow-up prompt to the task's Droid session (SDK resume + send).
 
     Live-extend hook for interview demos — e.g. \"fix failing CI\" or
@@ -902,7 +887,7 @@ async def follow_up_task(task_id: int, payload: FollowUpRequest):
 
 
 @app.get("/dashboard", response_class=HTMLResponse)
-async def dashboard(request: Request):
+async def dashboard(request: Request) -> Response:
     with db_session() as session:
         stats = compute_metrics(session)
         activity = recent_activity(session, page=1, page_size=10)
