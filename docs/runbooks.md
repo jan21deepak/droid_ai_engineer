@@ -4,8 +4,9 @@ Operational procedures for running Droid Forge. Read before on-call work.
 
 ## Health triage
 
-Start every incident with `GET /health` — it reports `database`, `github`, and
-`droid` independently:
+Start every incident with `GET /health` (public, database only), then the
+operator-only `GET /api/health` (bearer or signed-in session), which reports
+`database`, `github`, and `droid` independently:
 
 | Status | Meaning | First action |
 |---|---|---|

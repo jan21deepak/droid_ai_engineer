@@ -16,10 +16,13 @@ logger = logging.getLogger("app.github")
 
 
 def verify_signature(secret: str, body: bytes, signature_header: str | None) -> bool:
-    """Validate the X-Hub-Signature-256 header using HMAC SHA-256."""
+    """Validate the X-Hub-Signature-256 header using HMAC SHA-256.
+
+    Fails closed: without a configured secret no payload is considered signed.
+    """
     if not secret:
-        log_event(logger, logging.WARNING, "webhook.signature_skipped", reason="no secret configured")
-        return True
+        log_event(logger, logging.WARNING, "webhook.signature_rejected", reason="no secret configured")
+        return False
     if not signature_header or not signature_header.startswith("sha256="):
         return False
     expected = "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()

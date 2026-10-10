@@ -2,6 +2,23 @@
   const $ = (sel, root = document) => root.querySelector(sel);
   const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
 
+  const CSRF_TOKEN = document.querySelector('meta[name="csrf-token"]')?.getAttribute("content") || "";
+
+  // Same-origin API calls: send the session CSRF token on writes and return
+  // to the sign-in page when the operator session has ended.
+  async function apiFetch(url, options = {}) {
+    const opts = { credentials: "same-origin", ...options };
+    const method = (opts.method || "GET").toUpperCase();
+    if (method !== "GET" && method !== "HEAD" && CSRF_TOKEN) {
+      opts.headers = { ...(opts.headers || {}), "X-CSRF-Token": CSRF_TOKEN };
+    }
+    const res = await fetch(url, opts);
+    if (res.status === 401) {
+      window.location.assign(`/login?next=${encodeURIComponent(window.location.pathname)}`);
+    }
+    return res;
+  }
+
   function showAlert(el, message, type = "success") {
     if (!el) return;
     el.className = `alert alert-${type}`;
@@ -84,7 +101,7 @@
 
   async function loadDroidModels() {
     try {
-      const res = await fetch("/api/droid/models");
+      const res = await apiFetch("/api/droid/models");
       const data = await res.json();
       if (!res.ok) throw new Error(data.detail || "Failed to load models");
       droidModels = data.models || [];
@@ -97,7 +114,7 @@
     const tbody = $("#repos-tbody");
     tbody.innerHTML = `<tr><td colspan="5" class="text-center text-muted py-4">Loading…</td></tr>`;
     try {
-      const res = await fetch("/api/repositories");
+      const res = await apiFetch("/api/repositories");
       const data = await res.json();
       const repos = data.repositories || [];
       if (!repos.length) {
@@ -148,7 +165,7 @@
     const url = $("#repo-url").value.trim();
     btn.disabled = true;
     try {
-      const res = await fetch("/api/repositories", {
+      const res = await apiFetch("/api/repositories", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ url }),
@@ -179,7 +196,7 @@
       saveBtn.disabled = true;
       saveBtn.textContent = "Saving…";
       try {
-        const res = await fetch(`/api/repositories/${id}`, {
+        const res = await apiFetch(`/api/repositories/${id}`, {
           method: "PATCH",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ droid_model, setup_command }),
@@ -207,7 +224,7 @@
       createBtn.disabled = true;
       createBtn.textContent = "Adding 5…";
       try {
-        const response = await fetch(
+        const response = await apiFetch(
           `/api/repositories/${createBtn.dataset.id}/issues`,
           { method: "POST" }
         );
@@ -229,7 +246,7 @@
     if (removeBtn) {
       const id = removeBtn.dataset.id;
       if (!confirm("Remove this repository and its synced issues?")) return;
-      await fetch(`/api/repositories/${id}`, { method: "DELETE" });
+      await apiFetch(`/api/repositories/${id}`, { method: "DELETE" });
       await loadRepos();
       await loadIssues();
     }
@@ -331,7 +348,7 @@
     const container = $("#issues-container");
     container.innerHTML = `<div class="text-center text-muted py-5">Loading…</div>`;
     try {
-      const res = await fetch("/api/issues");
+      const res = await apiFetch("/api/issues");
       const data = await res.json();
       issueGroups = data.repositories || [];
       renderIssues();
@@ -374,7 +391,7 @@
     btn.disabled = true;
     btn.textContent = "Assigning…";
     try {
-      const res = await fetch("/api/issues/assign", {
+      const res = await apiFetch("/api/issues/assign", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ issue_ids: ids }),
@@ -623,7 +640,7 @@
   }
 
   async function loadActivity(page = activityPage) {
-    const res = await fetch(
+    const res = await apiFetch(
       `/api/tasks?page=${encodeURIComponent(page)}&page_size=${encodeURIComponent(ACTIVITY_PAGE_SIZE)}`
     );
     const payload = await res.json();
@@ -633,7 +650,7 @@
 
   async function refreshMetrics() {
     try {
-      const metricsRes = await fetch("/metrics");
+      const metricsRes = await apiFetch("/metrics");
       const stats = await metricsRes.json();
 
       const set = (key, value) => {

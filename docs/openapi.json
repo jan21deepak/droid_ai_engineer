@@ -223,6 +223,23 @@
         "summary": "List Droid Models"
       }
     },
+    "/api/health": {
+      "get": {
+        "description": "Operator-only component status, including GitHub and Droid connectivity.",
+        "operationId": "health_details_api_health_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Health Details"
+      }
+    },
     "/api/issues": {
       "get": {
         "operationId": "list_synced_issues_api_issues_get",
@@ -550,6 +567,27 @@
         "summary": "Sync Repository Issues"
       }
     },
+    "/api/session": {
+      "get": {
+        "description": "Describe the caller's access mode and session expiry (never returns credentials).",
+        "operationId": "session_info_api_session_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Session Info Api Session Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Session Info"
+      }
+    },
     "/api/tasks": {
       "get": {
         "operationId": "list_tasks_api_tasks_get",
@@ -687,6 +725,7 @@
     },
     "/health": {
       "get": {
+        "description": "Minimal public liveness: database reachability only, no external probes or versions.",
         "operationId": "health_health_get",
         "responses": {
           "200": {
@@ -699,6 +738,81 @@
           }
         },
         "summary": "Health"
+      }
+    },
+    "/login": {
+      "get": {
+        "description": "Operator sign-in page (public).",
+        "operationId": "login_form_login_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "next",
+            "required": false,
+            "schema": {
+              "default": "/dashboard",
+              "title": "Next",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Login Form"
+      },
+      "post": {
+        "description": "Exchange the operator credential for a session cookie (form-encoded `token`, `next`).",
+        "operationId": "login_submit_login_post",
+        "responses": {
+          "200": {
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Login Submit"
+      }
+    },
+    "/logout": {
+      "post": {
+        "description": "End the operator session (form-encoded `csrf_token`).",
+        "operationId": "logout_logout_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Logout"
       }
     },
     "/metrics": {
@@ -723,6 +837,7 @@
     },
     "/webhook": {
       "post": {
+        "description": "GitHub `issues` webhook; requires its own HMAC (`X-Hub-Signature-256`), not operator auth.",
         "operationId": "webhook_webhook_post",
         "responses": {
           "200": {

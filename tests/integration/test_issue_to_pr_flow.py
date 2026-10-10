@@ -18,8 +18,9 @@ import httpx
 import pytest
 
 from app import tasks, worker
+from app.config import get_settings
 from app.database import db_session
-from app.models import Task, TaskStatus
+from app.models import Repository, Task, TaskStatus
 
 SECRET = "test-secret"
 TRIGGER_LABEL = "Droid-complete"
@@ -128,6 +129,14 @@ def flow(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
 
     async def fake_start_pr_review(**kwargs: Any) -> dict[str, Any]:
         return record_review(**kwargs)
+
+    # Intake only accepts signed events for registered, policy-approved repositories.
+    monkeypatch.setenv("FORGE_ACCESS_MODE", "protected")
+    monkeypatch.setenv("FORGE_OPERATOR_TOKEN", "integration-operator-token-0123456789abcdef")
+    monkeypatch.setenv("FORGE_ALLOWED_REPOSITORIES", "jan21deepak/superset")
+    get_settings.cache_clear()
+    with db_session() as session:
+        session.add(Repository(full_name="jan21deepak/superset", url="https://github.com/jan21deepak/superset"))
 
     monkeypatch.setattr(worker, "get_droid_client", lambda: droid)
     # tasks.py imports get_droid_client directly and short-circuits dispatch

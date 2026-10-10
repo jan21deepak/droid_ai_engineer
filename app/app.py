@@ -19,14 +19,17 @@ from pydantic import BaseModel, Field
 
 from app import __version__
 from app.analytics import fire_and_forget
-from app.config import get_settings
+from app.auth import AccessControlMiddleware, operator_context, operator_credential_problem
+from app.auth_routes import router as auth_router
+from app.config import ACCESS_MODE_PROTECTED, effective_access_mode, get_settings
 from app.database import check_db_connectivity, db_session, init_db
 from app.droid_client import (
     DroidSessionBusyError,
     get_droid_client,
 )
 from app.error_tracking import init_error_tracking
-from app.github import GitHubClient, parse_issue_event, should_trigger, verify_signature
+from app.github import GitHubClient
+from app.intake import router as intake_router
 from app.logging_conf import log_event, setup_logging
 from app.metrics import compute_metrics, recent_activity
 from app.models import Repository, ReviewTask, SyncedIssue, SyncedPullRequest, Task, TaskStatus
@@ -97,6 +100,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     setup_logging(settings.log_level)
     init_error_tracking(settings.sentry_dsn, settings.sentry_environment)
     init_db()
+    mode = effective_access_mode(settings)
+    credential_problem = operator_credential_problem(settings) if mode == ACCESS_MODE_PROTECTED else None
+    log_event(
+        logger,
+        logging.ERROR if credential_problem else logging.INFO,
+        "auth.mode",
+        mode=mode,
+        operator_access="unavailable" if credential_problem else "ready",
+        problem=credential_problem,
+    )
     droid = get_droid_client()
     await recover_interrupted_tasks(droid)
     stop_event = asyncio.Event()
@@ -109,9 +122,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 
 app = FastAPI(title="droid-ai-engineer", version=__version__, lifespan=lifespan)
+# Default-deny operator access; added first so request tracing wraps rejections too.
+app.add_middleware(AccessControlMiddleware)
 # Request tracing: every request gets an X-Request-ID echoed into logs.
 app.add_middleware(RequestIDMiddleware)
 app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
+app.include_router(auth_router)
+app.include_router(intake_router)
 
 
 class AddRepositoryRequest(BaseModel):
@@ -169,6 +186,17 @@ async def root() -> RedirectResponse:
 
 @app.get("/health")
 async def health() -> JSONResponse:
+    """Minimal public liveness: database reachability only, no external probes or versions."""
+    db_ok = check_db_connectivity()
+    return JSONResponse(
+        status_code=200 if db_ok else 503,
+        content={"status": "ok" if db_ok else "unhealthy", "checks": {"database": "ok" if db_ok else "error"}},
+    )
+
+
+@app.get("/api/health")
+async def health_details() -> JSONResponse:
+    """Operator-only component status, including GitHub and Droid connectivity."""
     settings = get_settings()
     db_ok = check_db_connectivity()
     github_ok = await GitHubClient().check_connectivity()
@@ -197,65 +225,6 @@ async def health() -> JSONResponse:
             },
         },
     )
-
-
-@app.post("/webhook", response_model=None)
-async def webhook(request: Request) -> JSONResponse | dict[str, Any]:
-    settings = get_settings()
-    body = await request.body()
-    signature = request.headers.get("X-Hub-Signature-256")
-    event_type = request.headers.get("X-GitHub-Event", "")
-
-    if not verify_signature(settings.github_webhook_secret, body, signature):
-        log_event(logger, logging.WARNING, "webhook.signature_invalid", github_event=event_type)
-        return JSONResponse(status_code=401, content={"detail": "invalid signature"})
-
-    try:
-        payload = json.loads(body)
-    except json.JSONDecodeError:
-        return JSONResponse(status_code=422, content={"detail": "invalid JSON payload"})
-
-    log_event(logger, logging.INFO, "webhook.received", github_event=event_type, action=payload.get("action"))
-
-    if event_type == "ping":
-        return {"detail": "pong"}
-    if event_type != "issues":
-        return {"detail": f"ignored event type: {event_type or 'unknown'}"}
-
-    event = parse_issue_event(payload)
-    if not event.repository or not event.issue_number:
-        return JSONResponse(status_code=422, content={"detail": "malformed issues payload"})
-
-    if not should_trigger(event, settings.trigger_label):
-        log_event(
-            logger,
-            logging.INFO,
-            "webhook.ignored",
-            repo=event.repository,
-            issue=event.issue_number,
-            action=event.action,
-            reason=f"no trigger (label '{settings.trigger_label}' required)",
-        )
-        return {"detail": "ignored: trigger conditions not met"}
-
-    try:
-        result = await create_and_dispatch_task(
-            repository=event.repository,
-            repository_url=event.repository_url,
-            issue_number=event.issue_number,
-            issue_title=event.issue_title,
-            issue_body=event.issue_body,
-            labels=event.labels,
-        )
-    except TaskCreateError as exc:
-        if exc.status_code == 200:
-            return {"detail": exc.message, "task_id": exc.task_id}
-        return JSONResponse(
-            status_code=exc.status_code,
-            content={"detail": exc.message, "task_id": exc.task_id},
-        )
-
-    return JSONResponse(status_code=202, content={"detail": "accepted", **result})
 
 
 @app.get("/metrics")
@@ -891,6 +860,7 @@ async def dashboard(request: Request) -> Response:
     with db_session() as session:
         stats = compute_metrics(session)
         activity = recent_activity(session, page=1, page_size=10)
+    operator = operator_context(request)
     return templates.TemplateResponse(
         request,
         "dashboard.html",
@@ -899,5 +869,7 @@ async def dashboard(request: Request) -> Response:
             "tasks": activity["tasks"],
             "activity": activity,
             "asset_version": asset_version(),
+            "csrf_token": operator.csrf_token if operator else "",
+            "auth_method": operator.method if operator else "",
         },
     )

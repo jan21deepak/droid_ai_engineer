@@ -21,14 +21,17 @@ pre-commit install                         # quality gates on commit
 cp .env.example .env                       # then fill in tokens (see .env.example)
 ```
 
-The service boots without API keys (reports `degraded` on `/health`); only the
-webhook trigger flow needs real tokens and a tunnel.
+The service boots without API keys (reports `degraded` on `/api/health`); only the
+webhook trigger flow needs real tokens and a tunnel. Operator access defaults to
+`FORGE_ACCESS_MODE=protected` and needs `FORGE_OPERATOR_TOKEN` (32+ chars);
+`FORGE_ACCESS_MODE=local_dev` explicitly disables sign-in for local work. See
+"Operator access" in `README.md`.
 
 ## Build / run / test commands
 
 | Task | Command |
 |---|---|
-| Run the service | `.venv/bin/uvicorn app.app:app --host 0.0.0.0 --port 8000` |
+| Run the service | `.venv/bin/uvicorn app.app:app --host 127.0.0.1 --port 8000 --no-proxy-headers` |
 | Run the service in Docker | `docker compose up --build` |
 | Run all tests | `.venv/bin/python -m pytest -q` |
 | Run tests with coverage (threshold enforced in `pyproject.toml`) | `.venv/bin/python -m pytest --cov=app` |
@@ -50,17 +53,20 @@ Before declaring any change done: run `ruff check`, `ruff format --check`,
 
 ## Interactive QA
 
-1. Start the service: `.venv/bin/uvicorn app.app:app --port 8000`.
+1. Start the service: `.venv/bin/uvicorn app.app:app --host 127.0.0.1 --port 8000 --no-proxy-headers`.
 2. `curl -s http://localhost:8000/health` must return `200` with
-   `checks.database == "ok"` (github/droid may read `unconfigured` without tokens).
-3. `curl -s http://localhost:8000/metrics` must return JSON totals.
-4. Open `http://localhost:8000/dashboard` — the dashboard must render.
+   `checks.database == "ok"`. Operator-only `/api/health` adds github/droid
+   (they may read `unconfigured` without tokens).
+3. `/metrics` (with `Authorization: Bearer <operator token>`, or in `local_dev`) must return JSON totals.
+4. Open `http://localhost:8000/dashboard` — sign in at `/login`; the dashboard must render.
 5. To exercise the full issue-to-PR pipeline, see
    `tests/integration/test_issue_to_pr_flow.py` (the same flow, stubbed externals).
 
 ## Project layout
 
-- `app/app.py` — FastAPI app: `/webhook`, dashboard, repositories, issues, follow-up APIs
+- `app/app.py` — FastAPI app: dashboard, repositories, issues, follow-up APIs
+- `app/auth.py` / `app/auth_routes.py` — default-deny operator access middleware, sessions, CSRF/Origin/Host checks, login/logout
+- `app/intake.py` — HMAC-signed `/webhook` intake; `app/policy.py` — repository approval policy
 - `app/worker.py` — background finalization (fix/review), PR state reconciliation, restart recovery
 - `app/droid_client.py` — Droid SDK wrapper: workspaces, fix/review sessions, resume
 - `app/github.py` — GitHub REST client: comments, PRs, reviews, webhook signature
@@ -79,7 +85,9 @@ Before declaring any change done: run `ruff check`, `ruff format --check`,
 - Errors from external calls surface as `DroidRunError` / `httpx.HTTPStatusError`;
   finalize paths log-and-continue rather than crash the worker.
 - Tests set up isolated per-test SQLite DBs via the autouse `clean_db` fixture in
-  `tests/conftest.py` — don't touch the real `data/tasks.db` in tests.
+  `tests/conftest.py` — don't touch the real `data/tasks.db` in tests. The legacy
+  `client` fixture runs in explicit `local_dev` mode; use `protected_client` for
+  access-control behavior.
 - Every commit message should explain *why*; PRs use `.github/pull_request_template.md`.
 - Debt markers must link an issue: `TODO(#123) ...` — bare `TODO` fails `scripts/check_todos.py`.
 

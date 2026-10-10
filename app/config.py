@@ -4,6 +4,9 @@ from functools import lru_cache
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+ACCESS_MODE_PROTECTED = "protected"
+ACCESS_MODE_LOCAL_DEV = "local_dev"
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
@@ -59,6 +62,21 @@ class Settings(BaseSettings):
     # Droid review agent approves. Leave False so humans can review too.
     review_auto_merge: bool = False
 
+    # Operator access. Anything other than the literal "local_dev" is treated
+    # as protected so a typo can never silently disable authentication.
+    forge_access_mode: str = ACCESS_MODE_PROTECTED
+    # Shared single-operator credential (login form or `Authorization: Bearer`).
+    forge_operator_token: str = ""
+    # Absolute lifetime of a browser session created by /login.
+    forge_session_ttl_seconds: int = 8 * 3600
+    # Comma-separated Host header values the app answers to (DNS-rebinding and
+    # spoofed-host defense). PUBLIC_BASE_URL's host is added automatically.
+    forge_trusted_hosts: str = "127.0.0.1,localhost,::1"
+    # Session cookie Secure flag: auto (Secure except plain-HTTP loopback) | true | false
+    forge_cookie_secure: str = "auto"
+    # Comma-separated owner/repo slugs approved for intake and automation.
+    forge_allowed_repositories: str = ""
+
     # ROI / productivity assumptions (leadership dashboard)
     junior_swe_annual_cost_usd: float = 150_000.0
     junior_hours_per_issue: float = 4.0
@@ -71,3 +89,14 @@ class Settings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     return Settings()
+
+
+def effective_access_mode(settings: Settings) -> str:
+    """Resolve the access mode, failing closed to protected on any unknown value."""
+    if (settings.forge_access_mode or "").strip().lower() == ACCESS_MODE_LOCAL_DEV:
+        return ACCESS_MODE_LOCAL_DEV
+    return ACCESS_MODE_PROTECTED
+
+
+def split_csv(value: str) -> list[str]:
+    return [item.strip() for item in (value or "").replace("\n", ",").split(",") if item.strip()]

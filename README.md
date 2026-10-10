@@ -125,7 +125,14 @@ GITHUB_WEBHOOK_SECRET=some-long-random-secret
 GITHUB_TOKEN=<your-github-pat>
 FACTORY_API_KEY=<your-factory-api-key>
 TRIGGER_LABEL=Droid-complete
+FORGE_ACCESS_MODE=protected
+FORGE_OPERATOR_TOKEN=<at-least-32-random-characters>
+FORGE_ALLOWED_REPOSITORIES=<owner>/<repo>
 ```
+
+Generate the operator token locally and keep it out of commits, logs and
+screenshots, e.g. `python3 -c 'import secrets; print(secrets.token_urlsafe(36))'`.
+See [Operator access](#operator-access) for the full access model.
 
 Optional: `DROID_MODEL` (default `auto` = Factory Router), `DROID_AUTONOMY` (default `high`, needed for git push), `DROID_REVIEW_AUTONOMY` (default `high`, review sessions), `DROID_USD_PER_AGENT_RUN` for ROI estimates, `DROID_TURN_TIMEOUT_SECONDS` (default 3600) for the per-turn wall-clock budget.
 
@@ -154,7 +161,7 @@ source .venv/bin/activate          # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 
 mkdir -p data
-.venv/bin/uvicorn app.app:app --host 0.0.0.0 --port 8000
+.venv/bin/uvicorn app.app:app --host 127.0.0.1 --port 8000 --no-proxy-headers
 ```
 
 **Option B — Docker (recommended for a clean replicate)**
@@ -176,22 +183,15 @@ pytest -q
 ### 4. Verify the app is healthy
 
 ```bash
-curl -s http://localhost:8000/health | python3 -m json.tool
-curl -s http://localhost:8000/metrics | python3 -m json.tool
-open http://localhost:8000/dashboard   # or visit in a browser
+curl -s http://localhost:8000/health                       # public liveness
+open http://localhost:8000/dashboard                       # redirects to /login; sign in with the operator token
+# API clients authenticate with the bearer header (never put the token in a URL):
+curl -s -H "Authorization: Bearer $FORGE_OPERATOR_TOKEN" http://localhost:8000/api/health | python3 -m json.tool
 ```
 
-Healthy response looks like:
-
-```json
-{
-  "status": "healthy",
-  "application": "ok",
-  "checks": { "database": "ok", "github": "ok", "droid": "ok" }
-}
-```
-
-If `github` or `droid` show as unreachable/unconfigured, the app still serves traffic (`degraded`) — fix the tokens in `.env` and restart.
+`/health` returns only `{"status": "ok", "checks": {"database": "ok"}}`. The operator-only
+`/api/health` adds GitHub/Droid connectivity; if `github` or `droid` show as
+unreachable/unconfigured, the app still serves traffic (`degraded`) — fix the tokens in `.env` and restart.
 
 ### 5. Expose a public webhook URL (label-trigger flow)
 
@@ -245,12 +245,13 @@ gh issue create --repo <owner>/<repo> \
 
 ### GitHub Webhook Flow
 
-1. GitHub delivers an `issues` event to `POST /webhook`.
-2. The service verifies `X-Hub-Signature-256` with the shared secret (constant-time HMAC compare). Invalid → **401**.
+1. GitHub delivers an `issues` event to `POST /webhook`. This route does not use operator login or bearer credentials; its only authentication is the webhook HMAC.
+2. Without `GITHUB_WEBHOOK_SECRET` intake is disabled (**503**). The service verifies `X-Hub-Signature-256` with the shared secret (constant-time HMAC compare). Missing/invalid → **401**; malformed JSON or issue payload → **422**.
 3. Non-issue events are acknowledged and ignored (**200**).
-4. Trigger rule: issue `opened` with the `Droid-complete` label, or the label being added (`labeled`). Anything else is ignored.
-5. Duplicate protection: an active or completed task for the same repo + issue is not recreated.
-6. A `Task` row is written to SQLite and the launch is fired in a background asyncio task (**202** — the response returns fast because GitHub kills webhook deliveries after ~10 seconds; workspace clones take longer).
+4. The repository must be both registered in Forge and listed in `FORGE_ALLOWED_REPOSITORIES` → otherwise **403**, and no task is created.
+5. Trigger rule: issue `opened` with the `Droid-complete` label, or the label being added (`labeled`). Anything else is ignored.
+6. Duplicate protection: an active or completed task for the same repo + issue is not recreated, and a redelivered `X-GitHub-Delivery` id is not executed twice.
+7. A `Task` row is written to SQLite and the launch is fired in a background asyncio task (**202** — the response returns fast because GitHub kills webhook deliveries after ~10 seconds; workspace clones take longer).
 
 ### Droid Session Workflow
 
@@ -271,10 +272,49 @@ A second, read-only Droid session checks out the PR head branch (blobless full c
 
 Droid sessions persist on disk (`~/.factory`). On startup, forge finds RUNNING rows whose session is no longer streaming and resumes them with a continuation prompt ("continue where you left off, push your branch, report `BRANCH:`"). Rows that never got a session (dispatch interrupted) are marked failed.
 
+## Operator access
+
+Droid Forge is a private, single-operator console. Every route is protected by
+default except `GET /health` (database liveness only), `GET|POST /login`,
+`POST /logout`, `POST /webhook` (authenticated separately by HMAC) and `/static/*`.
+The dashboard, all `/api/*` data and actions, `/metrics`, and the API docs
+(`/docs`, `/redoc`, `/openapi.json`) require the operator.
+
+- **Modes.** `FORGE_ACCESS_MODE=protected` is the default, and any unknown value is
+  treated as protected. `FORGE_ACCESS_MODE=local_dev` explicitly disables operator
+  sign-in for local development; the dashboard shows a warning badge. Missing
+  GitHub/Factory keys never disable authentication.
+- **Fail closed.** In protected mode, a missing `FORGE_OPERATOR_TOKEN` or one shorter
+  than 32 characters makes protected routes return **503** instead of allowing
+  anonymous access.
+- **Browser sessions.** `/login` exchanges the token for a random server-side session
+  cookie (`forge_session`): host-only, `HttpOnly`, `SameSite=Strict`, `Path=/`, and
+  expiring after `FORGE_SESSION_TTL_SECONDS` (default 8 hours). Sessions live in
+  process memory, so a restart or token rotation signs everyone out. Logout revokes
+  the session immediately. The cookie is `Secure` except for plain-HTTP loopback
+  (`127.0.0.1`/`localhost`/`::1`), which is the documented local demo exception;
+  override it with `FORGE_COOKIE_SECURE=true|false`.
+- **Request forgery.** Cookie-authenticated writes must carry the per-session
+  `X-CSRF-Token` header (the dashboard reads it from a `<meta>` tag) and a
+  same-origin `Origin` (or `Referer`) header. Login and logout also verify the origin.
+- **API clients.** Send `Authorization: Bearer <FORGE_OPERATOR_TOKEN>`. Bearer requests
+  do not need CSRF tokens. Credentials in query strings are never accepted.
+- **Hosts and proxies.** Requests whose `Host` is not in `FORGE_TRUSTED_HOSTS`
+  (default `127.0.0.1,localhost,::1`, plus the host of `PUBLIC_BASE_URL`) get **400**.
+  `X-Forwarded-*` and `Forwarded` headers are never trusted; run Uvicorn with
+  `--no-proxy-headers`.
+- **Scope.** This is a trusted single-operator deployment, not multi-user IAM or SSO.
+
 ## Environment Variables
 
 | Variable | Description | Default |
 |---|---|---|
+| `FORGE_ACCESS_MODE` | `protected` (operator sign-in required) or `local_dev` (explicitly unauthenticated). Unknown values are treated as `protected` | `protected` |
+| `FORGE_OPERATOR_TOKEN` | Single-operator credential (min. 32 chars) for `/login` and `Authorization: Bearer` | — |
+| `FORGE_SESSION_TTL_SECONDS` | Absolute browser-session lifetime | `28800` |
+| `FORGE_TRUSTED_HOSTS` | Comma-separated `Host` values the app answers to | `127.0.0.1,localhost,::1` |
+| `FORGE_COOKIE_SECURE` | `auto` (Secure except plain-HTTP loopback), `true` or `false` | `auto` |
+| `FORGE_ALLOWED_REPOSITORIES` | Comma-separated `owner/repo` slugs approved for intake. Empty approves nothing in protected mode | — |
 | `GITHUB_WEBHOOK_SECRET` | Shared secret for webhook HMAC validation | — |
 | `PUBLIC_BASE_URL` | Public tunnel URL GitHub can reach (e.g. `https://….trycloudflare.com`). Enables label→webhook dispatch and `POST /api/webhooks/sync` | — |
 | `GITHUB_TOKEN` | PAT used to clone/push branches, open same-repo PRs, comment and review | — |
@@ -295,7 +335,7 @@ Droid sessions persist on disk (`~/.factory`). On startup, forge finds RUNNING r
 | `JUNIOR_HOURS_PER_REVIEW` | Hours a junior would spend per review | `1.0` |
 | `DROID_USD_PER_AGENT_RUN` | Flat USD attributed per completed run when real credit usage is unavailable | `0` |
 
-Time-to-Dollar Savings divides annual cost by **1,920** working hours/year. The service boots without API keys, logs warnings, and reports `degraded` on `/health`.
+Time-to-Dollar Savings divides annual cost by **1,920** working hours/year. The service boots without API keys, logs warnings, and reports `degraded` on `/api/health`.
 
 > **Schema note**: v2.0 renamed the task columns (`cursor_agent_id`→`droid_session_id`, etc.). Point `DATABASE_URL` at a fresh database; existing v1 SQLite files are not migrated (the lightweight migration system adds the new columns but old data is ignored).
 
@@ -316,7 +356,15 @@ Time-to-Dollar Savings divides annual cost by **1,920** working hours/year. The 
 
 ## Health Endpoint
 
-`GET /health` — suitable for orchestration platforms (Kubernetes, ECS, Docker healthchecks):
+`GET /health` — public liveness for orchestration platforms (Kubernetes, ECS, Docker healthchecks). It makes no external calls and reveals no versions or configuration:
+
+```json
+{ "status": "ok", "checks": { "database": "ok" } }
+```
+
+**503** with `"status": "unhealthy"` means the database is unreachable.
+
+`GET /api/health` — operator-only component detail:
 
 ```json
 {

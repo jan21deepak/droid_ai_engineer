@@ -11,8 +11,14 @@ def test_dashboard_html(client):
     assert b"Droid Forge" in resp.content
 
 
-def test_health_reports_components(client):
+def test_public_health_is_minimal(client):
     resp = client.get("/health")
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "ok", "checks": {"database": "ok"}}
+
+
+def test_health_details_report_components(client):
+    resp = client.get("/api/health")
     assert resp.status_code == 200
     data = resp.json()
     assert data["application"] == "ok"
