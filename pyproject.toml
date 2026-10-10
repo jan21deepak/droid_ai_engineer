@@ -36,6 +36,8 @@ max-complexity = 12
 [tool.ruff.lint.per-file-ignores]
 # Tests legitimately use fixtures/asserts patterns and long data blocks
 "tests/*" = ["B011"]
+# Vulture whitelist references intentionally-undefined names to silence false positives
+"scripts/vulture_whitelist.py" = ["B018", "F821"]
 
 [tool.mypy]
 python_version = "3.12"

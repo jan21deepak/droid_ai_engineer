@@ -38,7 +38,7 @@ jobs:
         run: .venv/bin/python scripts/check_todos.py
 
       - name: Dead code scan (vulture)
-        run: .venv/bin/vulture app/ --min-confidence 80
+        run: .venv/bin/vulture app/ scripts/vulture_whitelist.py --min-confidence 80
 
       - name: Duplicate code detection (jscpd)
         run: |
