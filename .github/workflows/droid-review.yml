@@ -25,6 +25,9 @@ jobs:
         run: curl -fsSL https://app.factory.ai/cli | sh
 
       - name: Review the PR diff
+        # Soft-fail while FACTORY_API_KEY is not yet configured; harden by
+        # removing continue-on-error once the repo secret is set.
+        continue-on-error: true
         env:
           FACTORY_API_KEY: ${{ secrets.FACTORY_API_KEY }}
         run: |
@@ -43,5 +46,7 @@ jobs:
       - name: Post review comment
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh pr comment "$NUMBER" --repo "$GITHUB_REPOSITORY" --body-file review.md
+          # Detached checkout: pin the repo so gh doesn't probe git for context.
+          GH_REPO: ${{ github.repository }}
+        run: gh pr comment "$NUMBER" --body-file review.md
         if: always()
