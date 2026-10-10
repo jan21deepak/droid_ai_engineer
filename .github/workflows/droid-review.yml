@@ -25,6 +25,7 @@ jobs:
         run: curl -fsSL https://app.factory.ai/cli | sh
 
       - name: Review the PR diff
+        id: review
         env:
           FACTORY_API_KEY: ${{ secrets.FACTORY_KEY }}
         run: |
@@ -47,4 +48,5 @@ jobs:
           GH_REPO: ${{ github.repository }}
           NUMBER: ${{ github.event.pull_request.number }}
         run: gh pr comment "$NUMBER" --body-file review.md
-        if: always()
+        # Only post a review that actually ran; never post an empty comment on failure.
+        if: always() && steps.review.outcome == 'success'
