@@ -10,4 +10,16 @@ data/
 .DS_Store
 .screenshots/
 .tmp-test-screenshots/
+# IDE / editor configs
+.idea/
+.vscode/
+*.swp
+# Build and coverage artifacts
+build/
+dist/
+htmlcov/
+.coverage
+coverage.xml
+# Dependencies (not used at runtime, but protect contributors with node tooling)
+node_modules/
 

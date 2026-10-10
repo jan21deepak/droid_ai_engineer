@@ -1,13 +1,27 @@
 """Aggregate metrics computed dynamically from SQLite."""
 
-from datetime import datetime, timedelta, timezone
+from collections.abc import Callable
+from datetime import UTC, date, datetime, timedelta
+from typing import Any, TypedDict
 
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from app.config import get_settings
+from app.config import Settings, get_settings
 from app.models import ReviewTask, Task, TaskStatus
 from app.timeutil import now_sgt, sgt_date
+
+
+class _DayBucket(TypedDict):
+    """One SGT-calendar-day activity bucket for the dashboard chart."""
+
+    date: str
+    label: str
+    fixes_completed: int
+    fixes_failed: int
+    reviews_completed: int
+    prs_opened: int
+    runtime_minutes: float
 
 
 def _round(value: float | None, digits: int = 2) -> float:
@@ -16,7 +30,7 @@ def _round(value: float | None, digits: int = 2) -> float:
     return round(float(value), digits)
 
 
-def task_cost_usd(task: Task, settings=None) -> float:
+def task_cost_usd(task: Task, settings: Settings | None = None) -> float:
     """Return cost from stored cost_usd or flat Droid per-run estimate."""
     settings = settings or get_settings()
     if task.cost_usd is not None:
@@ -26,7 +40,7 @@ def task_cost_usd(task: Task, settings=None) -> float:
     return 0.0
 
 
-def _bucket_stats(durations: list[float], counts: dict[str, int]) -> dict:
+def _bucket_stats(durations: list[float], counts: dict[str, int]) -> dict[str, int | float]:
     running = counts.get(TaskStatus.RUNNING, 0) + counts.get(TaskStatus.QUEUED, 0)
     completed = counts.get(TaskStatus.COMPLETED, 0)
     failed = counts.get(TaskStatus.FAILED, 0)
@@ -52,7 +66,7 @@ def _aware(dt: datetime | None) -> datetime | None:
     if dt is None:
         return None
     if dt.tzinfo is None:
-        return dt.replace(tzinfo=timezone.utc)
+        return dt.replace(tzinfo=UTC)
     return dt
 
 
@@ -60,8 +74,8 @@ def _engineering_kpis(
     all_fixes: list[Task],
     completed_fixes: list[Task],
     finished_fixes: list[Task],
-    review_stats: dict,
-) -> dict:
+    review_stats: dict[str, int | float],
+) -> dict[str, int | float]:
     """Delivery KPIs computed only from observed issue-fix and review records.
 
     Every value here is a direct count or average over rows in the database.
@@ -81,7 +95,7 @@ def _engineering_kpis(
 
     # A PR counts as delivered once it exists, regardless of whether the Droid
     # session is still open.
-    cutoff = datetime.now(timezone.utc) - timedelta(days=7)
+    cutoff = datetime.now(UTC) - timedelta(days=7)
     pr_first_seen: dict[str, datetime | None] = {}
     pr_state: dict[str, str | None] = {}
     for task in all_fixes:
@@ -94,9 +108,7 @@ def _engineering_kpis(
             pr_first_seen[url] = stamp
         if task.pr_state == "merged" or url not in pr_state:
             pr_state[url] = task.pr_state
-    prs_last_7_days = sum(
-        1 for stamp in pr_first_seen.values() if stamp and stamp >= cutoff
-    )
+    prs_last_7_days = sum(1 for stamp in pr_first_seen.values() if stamp and stamp >= cutoff)
     prs = list(pr_first_seen)
 
     # Merge rate is measured against every PR Droid opened, not just the ones
@@ -117,9 +129,7 @@ def _engineering_kpis(
     change_failure = round(runs_failed / runs_finished * 100, 2) if runs_finished else 0.0
 
     return {
-        "pr_cycle_time_hours": _round(
-            sum(cycle_hours) / len(cycle_hours) if cycle_hours else 0.0
-        ),
+        "pr_cycle_time_hours": _round(sum(cycle_hours) / len(cycle_hours) if cycle_hours else 0.0),
         "pr_cycle_time_sample": len(cycle_hours),
         "prs_last_7_days": prs_last_7_days,
         "prs_total": len(prs),
@@ -139,14 +149,13 @@ def _engineering_kpis(
     }
 
 
-def compute_metrics(session: Session) -> dict:
+def compute_metrics(session: Session) -> dict[str, Any]:
     settings = get_settings()
     # Fix metrics: Droid sessions dispatched for repository issue fixes.
     issue_tasks = session.query(Task).filter(Task.droid_session_id.isnot(None))
-    fix_counts = dict(
-        issue_tasks.with_entities(Task.status, func.count(Task.id))
-        .group_by(Task.status)
-        .all()
+    fix_counts: dict[str, int] = dict(
+        # SQLAlchemy Row objects are not recognized by mypy as Iterable[tuple[str, int]].
+        issue_tasks.with_entities(Task.status, func.count(Task.id)).group_by(Task.status).all()  # type: ignore[arg-type]
     )
     fix_durations = [
         float(d)
@@ -160,11 +169,7 @@ def compute_metrics(session: Session) -> dict:
     # Include failed durations in total runtime when present
     fix_total_durations = [
         float(d)
-        for (d,) in (
-            issue_tasks.with_entities(Task.duration_seconds)
-            .filter(Task.duration_seconds.isnot(None))
-            .all()
-        )
+        for (d,) in (issue_tasks.with_entities(Task.duration_seconds).filter(Task.duration_seconds.isnot(None)).all())
         if d is not None
     ]
     fix_stats = _bucket_stats(fix_durations, fix_counts)
@@ -173,10 +178,9 @@ def compute_metrics(session: Session) -> dict:
 
     # Review metrics: Droid review sessions against pull requests.
     review_q = session.query(ReviewTask)
-    review_counts = dict(
-        review_q.with_entities(ReviewTask.status, func.count(ReviewTask.id))
-        .group_by(ReviewTask.status)
-        .all()
+    review_counts: dict[str, int] = dict(
+        # SQLAlchemy Row objects are not recognized by mypy as Iterable[tuple[str, int]].
+        review_q.with_entities(ReviewTask.status, func.count(ReviewTask.id)).group_by(ReviewTask.status).all()  # type: ignore[arg-type]
     )
     review_durations = [
         float(d)
@@ -193,27 +197,19 @@ def compute_metrics(session: Session) -> dict:
     review_total_durations = [
         float(d)
         for (d,) in (
-            review_q.with_entities(ReviewTask.duration_seconds)
-            .filter(ReviewTask.duration_seconds.isnot(None))
-            .all()
+            review_q.with_entities(ReviewTask.duration_seconds).filter(ReviewTask.duration_seconds.isnot(None)).all()
         )
         if d is not None
     ]
     review_stats = _bucket_stats(review_durations, review_counts)
     review_stats["total_runtime_seconds"] = _round(sum(review_total_durations))
     review_stats["total_runtime_minutes"] = _round(sum(review_total_durations) / 60.0)
-    review_stats["merged"] = (
-        review_q.filter(ReviewTask.merged.is_(True)).count()
-    )
+    review_stats["merged"] = review_q.filter(ReviewTask.merged.is_(True)).count()
 
     all_fixes = issue_tasks.all()
     completed_fixes = [t for t in all_fixes if t.status == TaskStatus.COMPLETED]
-    all_finished_fixes = [
-        t for t in all_fixes if t.status in (TaskStatus.COMPLETED, TaskStatus.FAILED)
-    ]
-    all_finished_reviews = (
-        review_q.filter(ReviewTask.status.in_((TaskStatus.COMPLETED, TaskStatus.FAILED))).all()
-    )
+    all_finished_fixes = [t for t in all_fixes if t.status in (TaskStatus.COMPLETED, TaskStatus.FAILED)]
+    all_finished_reviews = review_q.filter(ReviewTask.status.in_((TaskStatus.COMPLETED, TaskStatus.FAILED))).all()
 
     tokens_used = sum(int(t.estimated_tokens or 0) for t in all_finished_fixes) or None
     fix_cost = sum(task_cost_usd(t, settings) for t in all_finished_fixes)
@@ -227,18 +223,12 @@ def compute_metrics(session: Session) -> dict:
     fix_completed = fix_stats["completed"]
     review_completed = review_stats["completed"]
     junior_fix_cost = fix_completed * settings.junior_hours_per_issue * junior_hourly
-    junior_review_cost = (
-        review_completed * settings.junior_hours_per_review * junior_hourly
-    )
+    junior_review_cost = review_completed * settings.junior_hours_per_review * junior_hourly
     junior_cost = junior_fix_cost + junior_review_cost
     productivity_gained = max(junior_cost - agent_cost, 0.0)
-    cost_avoidance_pct = (
-        round((productivity_gained / junior_cost) * 100, 2) if junior_cost else 0.0
-    )
+    cost_avoidance_pct = round((productivity_gained / junior_cost) * 100, 2) if junior_cost else 0.0
 
-    engineering = _engineering_kpis(
-        all_fixes, completed_fixes, all_finished_fixes, review_stats
-    )
+    engineering = _engineering_kpis(all_fixes, completed_fixes, all_finished_fixes, review_stats)
 
     # Combined top-line counts for the status cards.
     combined_running = fix_stats["running"] + review_stats["running"]
@@ -246,9 +236,7 @@ def compute_metrics(session: Session) -> dict:
     combined_failed = fix_stats["failed"] + review_stats["failed"]
     combined_total = fix_stats["total"] + review_stats["total"]
     combined_finished = combined_completed + combined_failed
-    combined_success = (
-        round(combined_completed / combined_finished * 100, 2) if combined_finished else 0.0
-    )
+    combined_success = round(combined_completed / combined_finished * 100, 2) if combined_finished else 0.0
 
     return {
         "total": combined_total,
@@ -290,35 +278,8 @@ def compute_metrics(session: Session) -> dict:
     }
 
 
-def daily_activity(session: Session, days: int = 14) -> list[dict]:
-    """Per-day activity buckets for the dashboard chart, keyed by SGT calendar day.
-
-    Fixes and reviews are bucketed on the day they finished; a PR is bucketed on
-    the day its fix task first reported it.
-    """
-    today = now_sgt().date()
-    window = [today - timedelta(days=offset) for offset in range(days - 1, -1, -1)]
-    buckets = {
-        day: {
-            "date": day.isoformat(),
-            "label": day.strftime("%d %b"),
-            "fixes_completed": 0,
-            "fixes_failed": 0,
-            "reviews_completed": 0,
-            "prs_opened": 0,
-            "runtime_minutes": 0.0,
-        }
-        for day in window
-    }
-    earliest = window[0]
-
-    def bucket_for(value) -> dict | None:
-        day = sgt_date(value)
-        if day is None or day < earliest or day > today:
-            return None
-        return buckets[day]
-
-    fixes = session.query(Task).filter(Task.droid_session_id.isnot(None)).all()
+def _bucket_fixes(fixes: list[Task], bucket_for: Callable[[datetime | None], _DayBucket | None]) -> None:
+    """Add fix outcomes and PR-open counts to their SGT day buckets."""
     seen_prs: set[str] = set()
     for task in fixes:
         finished = bucket_for(task.completed_at)
@@ -335,7 +296,10 @@ def daily_activity(session: Session, days: int = 14) -> list[dict]:
             if opened:
                 opened["prs_opened"] += 1
 
-    for review in session.query(ReviewTask).all():
+
+def _bucket_reviews(reviews: list[ReviewTask], bucket_for: Callable[[datetime | None], _DayBucket | None]) -> None:
+    """Add review outcomes to their SGT day buckets."""
+    for review in reviews:
         # Reviews discovered already-finished have no observed completion time;
         # fall back to when the review started so they still appear on the chart.
         finished = bucket_for(review.completed_at or review.created_at)
@@ -345,6 +309,39 @@ def daily_activity(session: Session, days: int = 14) -> list[dict]:
             finished["reviews_completed"] += 1
         if review.duration_seconds:
             finished["runtime_minutes"] += float(review.duration_seconds) / 60.0
+
+
+def daily_activity(session: Session, days: int = 14) -> list[_DayBucket]:
+    """Per-day activity buckets for the dashboard chart, keyed by SGT calendar day.
+
+    Fixes and reviews are bucketed on the day they finished; a PR is bucketed on
+    the day its fix task first reported it.
+    """
+    today = now_sgt().date()
+    window = [today - timedelta(days=offset) for offset in range(days - 1, -1, -1)]
+    buckets: dict[date, _DayBucket] = {
+        day: {
+            "date": day.isoformat(),
+            "label": day.strftime("%d %b"),
+            "fixes_completed": 0,
+            "fixes_failed": 0,
+            "reviews_completed": 0,
+            "prs_opened": 0,
+            "runtime_minutes": 0.0,
+        }
+        for day in window
+    }
+    earliest = window[0]
+
+    def bucket_for(value: datetime | None) -> _DayBucket | None:
+        day = sgt_date(value)
+        if day is None or day < earliest or day > today:
+            return None
+        return buckets[day]
+
+    fixes = session.query(Task).filter(Task.droid_session_id.isnot(None)).all()
+    _bucket_fixes(fixes, bucket_for)
+    _bucket_reviews(session.query(ReviewTask).all(), bucket_for)
 
     series = []
     for day in window:
@@ -361,13 +358,10 @@ def recent_tasks(session: Session, limit: int | None = None) -> list[Task]:
     return query.all()
 
 
-def all_activity(session: Session) -> list[dict]:
+def all_activity(session: Session) -> list[dict[str, Any]]:
     """Every fix and review task, newest first. No artificial trim."""
     fixes = [t.to_dict() for t in recent_tasks(session)]
-    reviews = [
-        r.to_dict()
-        for r in session.query(ReviewTask).order_by(ReviewTask.created_at.desc()).all()
-    ]
+    reviews = [r.to_dict() for r in session.query(ReviewTask).order_by(ReviewTask.created_at.desc()).all()]
     combined = fixes + reviews
     combined.sort(key=lambda item: item.get("created_at") or "", reverse=True)
     return combined
@@ -378,7 +372,7 @@ def recent_activity(
     *,
     page: int = 1,
     page_size: int = 10,
-) -> dict:
+) -> dict[str, Any]:
     """Paginated fix + review activity for the dashboard table.
 
     Returns every activity item across pages — nothing is discarded, only

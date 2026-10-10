@@ -1,0 +1,63 @@
+[project]
+name = "droid-forge"
+version = "2.0.0"
+description = "Self-hosted service that turns labeled GitHub issues into reviewed pull requests using local Factory Droid agents"
+requires-python = ">=3.12"
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+exclude = ["droid-wiki", "data", ".venv"]
+
+[tool.ruff.lint]
+select = [
+    "E",      # pycodestyle errors
+    "W",      # pycodestyle warnings
+    "F",      # pyflakes (unused imports/variables)
+    "I",      # isort import ordering
+    "B",      # flake8-bugbear (common bugs)
+    "C4",     # flake8-comprehensions
+    "UP",     # pyupgrade
+    "SIM",    # flake8-simplify
+    "RUF",    # ruff-specific rules
+    "N",      # pep8-naming (enforces naming conventions)
+    "C90",    # mccabe cyclomatic complexity
+]
+ignore = [
+    "E501",   # line length handled by formatter
+    "RUF001", # math symbols (×, −) are intentional in metric strings
+    "RUF002", # ditto in docstrings
+    "RUF003", # ditto in comments
+]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 12
+
+[tool.ruff.lint.per-file-ignores]
+# Tests legitimately use fixtures/asserts patterns and long data blocks
+"tests/*" = ["B011"]
+# Vulture whitelist references intentionally-undefined names to silence false positives
+"scripts/vulture_whitelist.py" = ["B018", "F821"]
+
+[tool.mypy]
+python_version = "3.12"
+python_executable = ".venv/bin/python"
+strict = true
+warn_unreachable = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+# Third-party packages without type stubs
+ignore_missing_imports = true
+exclude = ["droid-wiki", "data", "scripts"]
+
+[tool.coverage.run]
+source = ["app"]
+omit = ["app/__pycache__/*"]
+
+[tool.coverage.report]
+show_missing = true
+fail_under = 40
+
+[tool.vulture]
+exclude = ["droid-wiki", "data", ".venv", "tests"]
+min_confidence = 80

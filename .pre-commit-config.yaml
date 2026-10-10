@@ -1,0 +1,52 @@
+# Git pre-commit quality gates: format, lint, type-check, secrets, debt markers.
+# Install once per clone: `pip install -r requirements-dev.txt && pre-commit install`
+# Run against everything: `pre-commit run --all-files`
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: check-added-large-files
+        args: ["--maxkb=512"]
+      - id: end-of-file-fixer
+        exclude: ^droid-wiki/
+      - id: trailing-whitespace
+        exclude: ^droid-wiki/
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.8.4
+    hooks:
+      - id: ruff
+        args: [--fix]
+      - id: ruff-format
+
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.24.0
+    hooks:
+      - id: gitleaks
+
+  - repo: local
+    hooks:
+      - id: mypy
+        name: mypy (strict)
+        entry: .venv/bin/mypy app/
+        language: system
+        types: [python]
+        pass_filenames: false
+      - id: check-file-size
+        name: check file size (max 1000 lines)
+        entry: python scripts/check_file_size.py
+        language: system
+        types: [python]
+        pass_filenames: false
+      - id: check-todos
+        name: TODO/FIXME must link an issue
+        entry: python scripts/check_todos.py
+        language: system
+        types: [python]
+        pass_filenames: false
+      - id: vulture
+        name: vulture (dead code)
+        entry: .venv/bin/vulture app/ --min-confidence 80
+        language: system
+        types: [python]
+        pass_filenames: false

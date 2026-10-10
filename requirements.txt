@@ -1,11 +1,14 @@
-fastapi>=0.115.6
-uvicorn[standard]>=0.34.0
-sqlalchemy>=2.0.36
-httpx>=0.28.1
-python-dotenv>=1.0.1
-pydantic-settings>=2.7.1
-jinja2>=3.1.5
-droid-sdk>=0.4.0
-pytest>=8.3.4
-pytest-asyncio>=0.25.2
-respx>=0.22.0
+# Runtime dependencies, pinned to tested versions.
+# Updates are automated by Renovate (renovate.json); do not bump manually
+# without running the test suite.
+fastapi==0.141.1
+uvicorn[standard]==0.53.0
+sqlalchemy==2.0.54
+httpx==0.28.1
+python-dotenv==1.2.3
+pydantic-settings==2.15.0
+jinja2==3.1.6
+droid-sdk==0.4.0
+pytest==9.1.1
+pytest-asyncio==1.4.0
+respx==0.23.1

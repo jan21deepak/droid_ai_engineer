@@ -4,7 +4,7 @@ Singapore has observed a constant UTC+08:00 offset since 1982 and no DST, so a
 fixed offset is used rather than a tz database lookup.
 """
 
-from datetime import date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta, timezone
 
 SGT = timezone(timedelta(hours=8), "SGT")
 
@@ -14,7 +14,7 @@ def as_utc(value: datetime | None) -> datetime | None:
     if value is None:
         return None
     if value.tzinfo is None:
-        return value.replace(tzinfo=timezone.utc)
+        return value.replace(tzinfo=UTC)
     return value
 
 
@@ -41,5 +41,3 @@ def sgt_date(value: datetime | None) -> date | None:
 
 def now_sgt() -> datetime:
     return datetime.now(SGT)
-
-

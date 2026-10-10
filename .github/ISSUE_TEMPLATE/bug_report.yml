@@ -1,0 +1,47 @@
+---
+name: Bug report
+description: Report something broken
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: Include the task id / session id and any log lines.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect instead?
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - webhook dispatch
+        - droid session (fix)
+        - droid session (review)
+        - github integration (PRs/comments)
+        - dashboard / metrics
+        - other
+    validations:
+      required: true
+  - type: dropdown
+    id: priority
+    attributes:
+      label: Priority
+      description: P0 blocks the whole pipeline; P3 is cosmetic.
+      options:
+        - P0
+        - P1
+        - P2
+        - P3
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction steps

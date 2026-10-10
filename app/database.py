@@ -2,9 +2,10 @@
 
 import logging
 import os
+from collections.abc import Iterator
 from contextlib import contextmanager
 
-from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import Engine, create_engine, inspect, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.config import get_settings
@@ -13,11 +14,11 @@ from app.models import Base
 
 logger = logging.getLogger("app.database")
 
-_engine = None
-_SessionLocal: sessionmaker | None = None
+_engine: Engine | None = None
+_SessionLocal: sessionmaker[Session] | None = None
 
 
-def get_engine():
+def get_engine() -> Engine:
     global _engine
     if _engine is None:
         settings = get_settings()
@@ -31,7 +32,7 @@ def get_engine():
     return _engine
 
 
-def get_session_factory() -> sessionmaker:
+def get_session_factory() -> sessionmaker[Session]:
     global _SessionLocal
     if _SessionLocal is None:
         _SessionLocal = sessionmaker(bind=get_engine(), expire_on_commit=False)
@@ -39,7 +40,7 @@ def get_session_factory() -> sessionmaker:
 
 
 @contextmanager
-def db_session() -> Session:
+def db_session() -> Iterator[Session]:
     session = get_session_factory()()
     try:
         yield session
@@ -51,7 +52,7 @@ def db_session() -> Session:
         session.close()
 
 
-def _run_lightweight_migrations(engine) -> None:
+def _run_lightweight_migrations(engine: Engine) -> None:
     """Add any columns present in models but missing from existing tables."""
     inspector = inspect(engine)
     for table_name, table in Base.metadata.tables.items():
@@ -62,12 +63,13 @@ def _run_lightweight_migrations(engine) -> None:
             if column.name not in existing:
                 col_type = column.type.compile(engine.dialect)
                 with engine.begin() as conn:
-                    conn.execute(
-                        text(f"ALTER TABLE {table_name} ADD COLUMN {column.name} {col_type}")
-                    )
+                    conn.execute(text(f"ALTER TABLE {table_name} ADD COLUMN {column.name} {col_type}"))
                 log_event(
-                    logger, logging.INFO, "db.migration_applied",
-                    table=table_name, column=column.name,
+                    logger,
+                    logging.INFO,
+                    "db.migration_applied",
+                    table=table_name,
+                    column=column.name,
                 )
 
 
@@ -93,5 +95,3 @@ def reset_for_tests() -> None:
     global _engine, _SessionLocal
     _engine = None
     _SessionLocal = None
-
-

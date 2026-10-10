@@ -1,0 +1,38 @@
+{
+  "name": "Droid Forge",
+  "image": "mcr.microsoft.com/devcontainers/python:3.12",
+  "features": {
+    "ghcr.io/devcontainers/features/github-cli:1": {},
+    "ghcr.io/devcontainers/features/docker-in-docker:2": {}
+  },
+  "postCreateCommand": "pip install -r requirements.txt -r requirements-dev.txt && pre-commit install",
+  "containerEnv": {
+    "DATABASE_URL": "sqlite:///./data/tasks.db",
+    "WORKSPACE_ROOT": "./data/workspace",
+    "TRIGGER_LABEL": "Droid-complete"
+  },
+  "forwardPorts": [8000],
+  "portsAttributes": {
+    "8000": {"label": "Droid Forge app", "onAutoForward": "notify"}
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "ms-python.vscode-pylance",
+        "charliermarsh.ruff",
+        "ms-python.mypy-type-checker",
+        "github.vscode-github-actions",
+        "bierner.markdown-mermaid"
+      ],
+      "settings": {
+        "python.defaultInterpreterPath": "/usr/local/bin/python",
+        "editor.formatOnSave": true,
+        "[python]": {
+          "editor.defaultFormatter": "charliermarsh.ruff",
+          "editor.codeActionsOnSave": {"source.organizeImports": "explicit"}
+        }
+      }
+    }
+  }
+}

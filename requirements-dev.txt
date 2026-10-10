@@ -1,0 +1,9 @@
+# Development and CI tooling.
+# Install: pip install -r requirements-dev.txt && pre-commit install
+# Versions are managed by Renovate (renovate.json); runtime pins live in requirements.txt.
+ruff>=0.8.0
+mypy>=1.13
+pytest-cov>=6.0
+pytest-rerunfailures>=15.0
+vulture>=2.11
+pre-commit>=4.0

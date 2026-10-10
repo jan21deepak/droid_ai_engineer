@@ -1,7 +1,6 @@
 """Tests for event-driven Droid run finalization and GitHub state polling."""
 
-from datetime import datetime, timedelta, timezone
-from types import SimpleNamespace
+from datetime import UTC, datetime
 
 import httpx
 import pytest
@@ -37,9 +36,7 @@ class StubGitHub:
     async def find_open_pull_request_for_head(self, repository, head):
         return None
 
-    async def create_pull_request(
-        self, repository, *, title, head, base, body="", draft=False, same_repo=True
-    ):
+    async def create_pull_request(self, repository, *, title, head, base, body="", draft=False, same_repo=True):
         owner = repository.split("/", 1)[0]
         head_ref = head
         if same_repo:
@@ -89,15 +86,15 @@ class StubDroid:
 
 
 def add_task(**overrides):
-    defaults = dict(
-        repository="jan21deepak/omnigent",
-        repository_url="https://github.com/jan21deepak/omnigent",
-        issue_number=2,
-        issue_title="[Bug] cold start can call StartCascade",
-        droid_session_id="sess-abc",
-        status=TaskStatus.RUNNING,
-        created_at=datetime.now(timezone.utc),
-    )
+    defaults = {
+        "repository": "jan21deepak/omnigent",
+        "repository_url": "https://github.com/jan21deepak/omnigent",
+        "issue_number": 2,
+        "issue_title": "[Bug] cold start can call StartCascade",
+        "droid_session_id": "sess-abc",
+        "status": TaskStatus.RUNNING,
+        "created_at": datetime.now(UTC),
+    }
     defaults.update(overrides)
     with db_session() as session:
         task = Task(**defaults)
@@ -218,22 +215,16 @@ async def test_finalize_fix_task_failure_marks_failed(client, monkeypatch):
 
 
 def test_ensure_review_task_row_dedupes_active():
-    first_id, created = worker.ensure_review_task_row(
-        repository="jan21deepak/omnigent", pr_number=5
-    )
+    first_id, created = worker.ensure_review_task_row(repository="jan21deepak/omnigent", pr_number=5)
     assert created is True
-    second_id, created_again = worker.ensure_review_task_row(
-        repository="jan21deepak/omnigent", pr_number=5
-    )
+    second_id, created_again = worker.ensure_review_task_row(repository="jan21deepak/omnigent", pr_number=5)
     assert created_again is False
     assert second_id == first_id
 
     # A completed review does not block a fresh review request.
     with db_session() as session:
         session.get(ReviewTask, first_id).status = TaskStatus.COMPLETED
-    third_id, created_third = worker.ensure_review_task_row(
-        repository="jan21deepak/omnigent", pr_number=5
-    )
+    third_id, created_third = worker.ensure_review_task_row(repository="jan21deepak/omnigent", pr_number=5)
     assert created_third is True
     assert third_id != first_id
 

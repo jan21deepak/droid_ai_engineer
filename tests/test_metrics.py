@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from app.database import db_session
 from app.models import Repository, ReviewTask, Task, TaskStatus
@@ -18,7 +18,7 @@ def add_task(session, status, duration=None, factory_credits=None, cost_usd=None
         cost_usd=cost_usd,
         pull_request_url=pr_url,
         pr_state=pr_state,
-        completed_at=datetime.now(timezone.utc) if duration else None,
+        completed_at=datetime.now(UTC) if duration else None,
     )
     session.add(task)
 
@@ -32,7 +32,7 @@ def add_review(session, status, duration=None, merged=False):
         status=status,
         duration_seconds=duration,
         merged=merged,
-        completed_at=datetime.now(timezone.utc) if duration else None,
+        completed_at=datetime.now(UTC) if duration else None,
     )
     session.add(review)
 
@@ -235,7 +235,7 @@ def test_metrics_include_engineering_kpis(client):
 
 
 def test_prs_outside_seven_day_window_excluded(client):
-    old = datetime.now(timezone.utc) - timedelta(days=30)
+    old = datetime.now(UTC) - timedelta(days=30)
     with db_session() as session:
         task = Task(
             repository="jan21deepak/superset",
@@ -342,7 +342,7 @@ def test_prs_deduplicated_across_tasks(client):
 
 def test_timestamps_are_rendered_in_sgt(client):
     # 2026-08-02 18:30 UTC is 2026-08-03 02:30 SGT — a different calendar day.
-    stamp = datetime(2026, 8, 2, 18, 30, tzinfo=timezone.utc)
+    stamp = datetime(2026, 8, 2, 18, 30, tzinfo=UTC)
     with db_session() as session:
         session.add(
             Task(
@@ -363,7 +363,7 @@ def test_timestamps_are_rendered_in_sgt(client):
 
 
 def test_daily_activity_buckets_by_sgt_day(client):
-    stamp = datetime(2026, 8, 2, 18, 30, tzinfo=timezone.utc)
+    stamp = datetime(2026, 8, 2, 18, 30, tzinfo=UTC)
     with db_session() as session:
         session.add(
             Task(
@@ -465,8 +465,7 @@ def test_add_issues_imports_five_from_parent_and_syncs(client, monkeypatch):
                     "number": number + 10,
                     "title": f"Parent issue {number + 100}",
                     "body": (
-                        "Acceptance criteria\n\n"
-                        f"Source issue: https://github.com/apache/superset/issues/{number + 100}"
+                        f"Acceptance criteria\n\nSource issue: https://github.com/apache/superset/issues/{number + 100}"
                     ),
                     "state": "open",
                     "labels": [],
@@ -476,9 +475,7 @@ def test_add_issues_imports_five_from_parent_and_syncs(client, monkeypatch):
             ]
         return []
 
-    async def fake_list_issues(
-        self, full_name, state="open", per_page=50, max_pages=5
-    ):
+    async def fake_list_issues(self, full_name, state="open", per_page=50, max_pages=5):
         return await fake_list_open_issues(self, full_name, per_page, max_pages)
 
     monkeypatch.setattr("app.github.GitHubClient.get_repository", fake_get_repository)
@@ -524,9 +521,7 @@ def test_list_and_assign_pulls_starts_droid_review(client, monkeypatch):
         review_calls.append(kwargs)
         return {"review_id": 55, "started": True, "detail": "droid_review_started"}
 
-    monkeypatch.setattr(
-        "app.github.GitHubClient.list_open_pull_requests", fake_list_open_pull_requests
-    )
+    monkeypatch.setattr("app.github.GitHubClient.list_open_pull_requests", fake_list_open_pull_requests)
     monkeypatch.setattr("app.app.start_pr_review", fake_start_pr_review)
 
     listed = client.get("/api/pulls").json()

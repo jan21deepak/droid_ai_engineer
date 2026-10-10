@@ -5,9 +5,7 @@ import re
 from app.database import db_session
 from app.models import Repository
 
-_GITHUB_REPO_RE = re.compile(
-    r"^(?:https?://)?(?:www\.)?github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?/?$"
-)
+_GITHUB_REPO_RE = re.compile(r"^(?:https?://)?(?:www\.)?github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?/?$")
 
 
 def parse_repository_ref(value: str) -> str | None:
@@ -33,27 +31,17 @@ def resolve_agent_launch_config(
     "starting_ref": str|None}``. Missing registrations yield empty config so
     callers fall back to the global model and a bare clone.
     """
-    full_name = parse_repository_ref(repository or "") or parse_repository_ref(
-        repository_url or ""
-    )
+    full_name = parse_repository_ref(repository or "") or parse_repository_ref(repository_url or "")
     if not full_name and repository and "/" in repository:
         full_name = repository.strip()
     if not full_name:
         return {"model": None, "setup_command": None, "starting_ref": None}
 
     with db_session() as session:
-        row = (
-            session.query(Repository)
-            .filter(Repository.full_name == full_name)
-            .first()
-        )
+        row = session.query(Repository).filter(Repository.full_name == full_name).first()
         if not row:
             # Case-insensitive fallback (GitHub full_name is usually canonical).
-            row = (
-                session.query(Repository)
-                .filter(Repository.full_name.ilike(full_name))
-                .first()
-            )
+            row = session.query(Repository).filter(Repository.full_name.ilike(full_name)).first()
         if not row:
             return {"model": None, "setup_command": None, "starting_ref": None}
         return {

@@ -1,6 +1,7 @@
 """SQLAlchemy ORM models and status constants."""
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
+from typing import Any
 
 from sqlalchemy import Boolean, DateTime, Float, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -38,11 +39,9 @@ class Repository(Base):
     droid_model: Mapped[str] = mapped_column(String(128), default="")
     # Optional starting git ref for fix workspaces when cloning.
     starting_ref: Mapped[str] = mapped_column(String(255), default="")
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
-    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "id": self.id,
             "full_name": self.full_name,
@@ -71,11 +70,9 @@ class SyncedIssue(Base):
     state: Mapped[str] = mapped_column(String(32), default="open")
     labels: Mapped[str] = mapped_column(Text, default="[]")
     html_url: Mapped[str] = mapped_column(String(512), default="")
-    synced_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
-    )
+    synced_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "id": self.id,
             "repository": self.repository,
@@ -114,13 +111,11 @@ class Task(Base):
     factory_credits: Mapped[float | None] = mapped_column(Float, nullable=True)
     estimated_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     cost_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
-    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     duration_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "id": self.id,
             "repository": self.repository,
@@ -163,11 +158,9 @@ class SyncedPullRequest(Base):
     head_sha: Mapped[str] = mapped_column(String(64), default="")
     author: Mapped[str] = mapped_column(String(128), default="")
     draft: Mapped[bool] = mapped_column(Boolean, default=False)
-    synced_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
-    )
+    synced_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "id": self.id,
             "repository": self.repository,
@@ -204,13 +197,11 @@ class ReviewTask(Base):
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     factory_credits: Mapped[float | None] = mapped_column(Float, nullable=True)
     cost_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
-    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     duration_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "id": self.id,
             "repository": self.repository,

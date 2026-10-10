@@ -46,6 +46,15 @@ class Settings(BaseSettings):
     poll_interval_seconds: int = 20
     trigger_label: str = "Droid-complete"
 
+    # Optional error tracking (Sentry). Empty = disabled (local/dev default).
+    sentry_dsn: str = ""
+    sentry_environment: str = "local"
+
+    # Optional product analytics (PostHog). Empty = disabled; events are
+    # fire-and-forget and never block or fail product flows.
+    posthog_key: str = ""
+    posthog_host: str = "https://us.i.posthog.com"
+
     # When True, forge squash-merges (or enables GitHub auto-merge) after the
     # Droid review agent approves. Leave False so humans can review too.
     review_auto_merge: bool = False
