@@ -1,8 +1,9 @@
 """GitHub-side state reconciliation run by the background worker loop.
 
 Every pass re-reads repository policy, so stored tasks for repositories that
-are no longer approved are skipped without any GitHub call, and merge requests
-are refused by outward-action policy.
+are no longer approved are skipped without any GitHub call. Polling only
+*observes* PR state: Forge never merges a pull request or enables GitHub
+auto-merge, whatever a review verdict, stored flag or setting says.
 """
 
 import asyncio
@@ -18,7 +19,7 @@ from app.database import db_session
 from app.github import GitHubClient
 from app.logging_conf import log_event
 from app.models import ReviewTask, Task, TaskStatus
-from app.policy import OutwardAction, outward_decision, repository_decision
+from app.policy import repository_decision
 
 logger = logging.getLogger("app.worker")
 
@@ -131,51 +132,6 @@ async def finalize_merged_running_tasks() -> int:
     return updated
 
 
-async def attempt_auto_merge(github: GitHubClient, review: ReviewTask) -> tuple[bool, bool, str | None]:
-    """Try to merge immediately; fall back to enabling GitHub auto-merge.
-
-    No-op when ``Settings.review_auto_merge`` is False (default) so humans can
-    review before merge. Merging is also never a permitted outward action, so
-    policy refuses it before any GitHub call.
-    """
-    if not get_settings().review_auto_merge:
-        return False, False, None
-    decision = outward_decision(OutwardAction.PULL_REQUEST_MERGE, review.repository)
-    if not decision.allowed:
-        log_event(
-            logger,
-            logging.WARNING,
-            "policy.outward_denied",
-            action=OutwardAction.PULL_REQUEST_MERGE,
-            repo=review.repository,
-            review_id=review.id,
-            reason=decision.reason,
-        )
-        return False, False, decision.reason
-    try:
-        await github.merge_pull_request(
-            review.repository,
-            review.pr_number,
-            merge_method="squash",
-            commit_title=f"{review.pr_title} (#{review.pr_number})",
-        )
-        return True, False, None
-    except httpx.HTTPStatusError as exc:
-        detail = ""
-        try:
-            detail = exc.response.json().get("message") or ""
-        except Exception:
-            detail = str(exc)
-        if exc.response.status_code in (405, 409, 422):
-            enabled = await github.enable_auto_merge(review.repository, review.pr_number)
-            if enabled:
-                return False, True, None
-            return False, False, detail or "merge blocked and auto-merge unavailable"
-        return False, False, detail or str(exc)
-    except (httpx.HTTPError, RuntimeError) as exc:
-        return False, False, str(exc)
-
-
 async def poll_github_state(github: GitHubClient | None = None) -> int:
     """One reconciliation pass over GitHub-side PR / merge state."""
     github = github or GitHubClient()
@@ -186,7 +142,6 @@ async def poll_github_state(github: GitHubClient | None = None) -> int:
     updated += await refresh_pr_states(github, tasks_with_pr)
     updated += await finalize_merged_running_tasks()
 
-    settings = get_settings()
     with db_session() as session:
         pending = (
             session.query(ReviewTask)
@@ -219,25 +174,10 @@ async def poll_github_state(github: GitHubClient | None = None) -> int:
             log_event(
                 logger,
                 logging.INFO,
-                "review.auto_merged",
+                "review.pr_merged_observed",
                 review_id=review.id,
                 pr=review.pr_url,
             )
-        elif pr.get("state") == "closed" and not pr.get("merged"):
-            continue
-        elif settings.review_auto_merge:
-            merged, auto_merge, _ = await attempt_auto_merge(github, review)
-            if merged or auto_merge:
-                with db_session() as session:
-                    db_review = session.get(ReviewTask, review.id)
-                    assert db_review is not None
-                    if merged:
-                        db_review.merged = True
-                        if not db_review.completed_at:
-                            db_review.completed_at = datetime.now(UTC)
-                    if auto_merge:
-                        db_review.auto_merge_enabled = True
-                updated += 1
 
     return updated
 

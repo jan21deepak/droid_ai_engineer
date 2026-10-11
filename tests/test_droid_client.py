@@ -16,9 +16,7 @@ from app.droid_client import (
     DroidSessionBusyError,
     build_fix_prompt,
     build_follow_up_prompt,
-    build_review_prompt,
     extract_branch_name,
-    extract_verdict,
     map_outcome_status,
     review_workspace_dir,
     task_workspace_dir,
@@ -120,21 +118,26 @@ class TestPrompts:
         prompt = build_fix_prompt("https://github.com/org/repo", 7, "Fix bug", "", "main")
         assert "(no description provided)" in prompt
 
-    def test_review_prompt(self):
-        prompt = build_review_prompt("https://github.com/org/repo", "https://github.com/org/repo/pull/3", "main")
-        assert "pull/3" in prompt
-        assert "VERDICT: APPROVE" in prompt
-        assert "review" in prompt.lower()
-        assert "origin/main...HEAD" in prompt
-
-    def test_review_prompt_defaults_base(self):
-        prompt = build_review_prompt("https://github.com/org/repo", "https://github.com/org/repo/pull/3", "")
-        assert "origin/main...HEAD" in prompt
-
     def test_follow_up_prompt(self):
         prompt = build_follow_up_prompt("Fix failing CI")
         assert "Fix failing CI" in prompt
         assert "BRANCH:" in prompt
+
+    @pytest.mark.parametrize(
+        "prompt",
+        [
+            build_fix_prompt("https://github.com/org/repo", 7, "Fix bug", "Details", "main"),
+            build_follow_up_prompt("Add a regression test"),
+            droid_client.RECOVERY_PROMPT_TEMPLATE,
+        ],
+        ids=["fix", "follow_up", "recovery"],
+    )
+    def test_agent_prompts_describe_a_local_candidate_without_publication_authority(self, prompt):
+        lowered = prompt.lower()
+        assert "do not push" in lowered
+        assert "open a pull request" in lowered  # only as a prohibition
+        for phrase in ("automation publishes", "publishes it when permitted", "pushes it", "opens a same-repo"):
+            assert phrase not in lowered
 
 
 class TestParsing:
@@ -145,11 +148,6 @@ class TestParsing:
     def test_extract_branch_missing(self):
         assert extract_branch_name("no branch line here") is None
         assert extract_branch_name(None) is None
-
-    def test_extract_verdict(self):
-        assert extract_verdict("Findings.\nVERDICT: APPROVE") == "APPROVE"
-        assert extract_verdict("verdict: request_changes") == "REQUEST_CHANGES"
-        assert extract_verdict("no verdict") is None
 
     def test_map_outcome_status(self):
         assert map_outcome_status({"success": True}) == TaskStatus.COMPLETED
@@ -183,6 +181,25 @@ def make_bare_repo(base: Path) -> Path:
     bare = base / "remote.git"
     subprocess.run(["git", "clone", "-q", "--bare", str(src), str(bare)], check=True)
     return bare
+
+
+def make_pull_request(base: Path, *, content: str) -> tuple[Path, str, str]:
+    """Bare repo with ``main`` plus a feature commit published as ``refs/pull/7/head``."""
+    bare = make_bare_repo(base)
+    work = base / "work"
+    subprocess.run(["git", "clone", "-q", str(bare), str(work)], check=True)
+    run = lambda *a: subprocess.run(  # noqa: E731
+        ["git", *a], cwd=work, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    base_sha = run("rev-parse", "HEAD")
+    run("checkout", "-q", "-b", "feature")
+    (work / "feature.txt").write_text(content)
+    run("add", ".")
+    run("-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-qm", "feature")
+    head = run("rev-parse", "HEAD")
+    run("push", "-q", "origin", "feature")
+    subprocess.run(["git", "-C", str(bare), "update-ref", "refs/pull/7/head", head], check=True)
+    return bare, base_sha, head
 
 
 class TestWorkspaces:
@@ -221,33 +238,131 @@ class TestWorkspaces:
         assert (ws / "setup_marker.txt").read_text().strip() == "setup-ok"
 
     @pytest.mark.asyncio
-    async def test_prepare_review_workspace_has_merge_base(self, tmp_path, monkeypatch):
-        """Review clone must carry history so `git diff base...HEAD` works."""
-        bare = make_bare_repo(tmp_path)
-        work = tmp_path / "work"
-        subprocess.run(["git", "clone", "-q", str(bare), str(work)], check=True)
-        run = lambda *a: subprocess.run(  # noqa: E731
-            ["git", *a], cwd=work, check=True, capture_output=True
-        )
-        run("checkout", "-q", "-b", "feature")
-        (work / "feature.txt").write_text("new")
-        run("add", ".")
-        run("-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-qm", "feature")
-        head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=work, capture_output=True, text=True).stdout.strip()
-        subprocess.run(["git", "push", "-q", "origin", "feature"], cwd=work, check=True)
-        subprocess.run(["git", "-C", str(bare), "update-ref", "refs/pull/7/head", head], check=True)
-
+    async def test_review_context_is_exact_clean_head_with_complete_diff(self, tmp_path, monkeypatch):
+        """The reviewer gets a clean detached checkout of the PR head SHA and the full base..head diff."""
+        bare, base_sha, head_sha = make_pull_request(tmp_path, content="new feature line\n")
         monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path / "ws"))
         get_settings.cache_clear()
         monkeypatch.setattr(droid_client, "_remote_url", lambda repository: str(bare))
 
         client = DroidClient(api_key="fk_test")
-        ws = await client.prepare_review_workspace(
+        ctx = await client.prepare_review_context(
             repository="jan21deepak/demo", review_id=1, pr_number=7, base_ref="main"
         )
-        diff = subprocess.run(["git", "diff", "main...HEAD", "--stat"], cwd=ws, capture_output=True, text=True)
-        assert diff.returncode == 0, diff.stderr
-        assert "feature.txt" in diff.stdout
+        assert ctx.complete, ctx.incomplete_reason
+        assert (ctx.base_sha, ctx.head_sha) == (base_sha, head_sha)
+        assert "+new feature line" in ctx.diff
+        assert "feature.txt" in ctx.diff
+        git = lambda *a: subprocess.run(  # noqa: E731
+            ["git", *a], cwd=ctx.workspace, capture_output=True, text=True, check=True
+        ).stdout.strip()
+        assert git("rev-parse", "HEAD") == head_sha
+        assert git("status", "--porcelain") == ""
+        assert (ctx.workspace / "feature.txt").exists()
+
+        # Stray files from an earlier attempt in the same review workspace are removed.
+        (ctx.workspace / "leftover.txt").write_text("stale")
+        ctx2 = await client.prepare_review_context(
+            repository="jan21deepak/demo", review_id=1, pr_number=7, base_ref="main"
+        )
+        assert ctx2.complete
+        assert not (ctx2.workspace / "leftover.txt").exists()
+
+    @pytest.mark.asyncio
+    async def test_reused_review_workspace_diffs_against_current_base(self, tmp_path, monkeypatch):
+        """A base branch that moved since the first review must not widen the diff."""
+        bare, _base_sha, _head = make_pull_request(tmp_path, content="first\n")
+        monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path / "ws"))
+        get_settings.cache_clear()
+        monkeypatch.setattr(droid_client, "_remote_url", lambda repository: str(bare))
+        client = DroidClient(api_key="fk_test")
+        await client.prepare_review_context(repository="jan21deepak/demo", review_id=4, pr_number=7, base_ref="main")
+
+        work = tmp_path / "work"
+        run = lambda *a: subprocess.run(  # noqa: E731
+            ["git", "-c", "user.name=test", "-c", "user.email=test@example.com", *a],
+            cwd=work,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        run("checkout", "-q", "main")
+        (work / "unrelated.txt").write_text("landed on main\n")
+        run("add", ".")
+        run("commit", "-qm", "unrelated")
+        new_base = run("rev-parse", "HEAD")
+        run("push", "-q", "origin", "main")
+        run("checkout", "-q", "feature")
+        run("rebase", "-q", "main")
+        (work / "feature.txt").write_text("second\n")
+        run("commit", "-qam", "update")
+        new_head = run("rev-parse", "HEAD")
+        run("push", "-q", "--force", "origin", "feature")
+        subprocess.run(["git", "-C", str(bare), "update-ref", "refs/pull/7/head", new_head], check=True)
+
+        ctx = await client.prepare_review_context(
+            repository="jan21deepak/demo", review_id=4, pr_number=7, base_ref="main"
+        )
+        assert ctx.complete, ctx.incomplete_reason
+        assert (ctx.base_sha, ctx.head_sha) == (new_base, new_head)
+        assert "unrelated.txt" not in ctx.diff
+        assert "+second" in ctx.diff
+
+    @pytest.mark.asyncio
+    async def test_oversized_diff_is_incomplete_not_truncated(self, tmp_path, monkeypatch):
+        bare, _base, _head = make_pull_request(tmp_path, content="x" * 400 + "\n")
+        monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path / "ws"))
+        get_settings.cache_clear()
+        monkeypatch.setattr(droid_client, "_remote_url", lambda repository: str(bare))
+        monkeypatch.setattr("app.review_policy.REVIEW_DIFF_MAX_CHARS", 200)
+
+        ctx = await DroidClient(api_key="fk_test").prepare_review_context(
+            repository="jan21deepak/demo", review_id=2, pr_number=7, base_ref="main"
+        )
+        assert not ctx.complete
+        assert "above the 200-character review limit" in ctx.incomplete_reason
+        assert len(ctx.diff) > 200  # kept whole for the record, never cut down to fit
+
+    @pytest.mark.asyncio
+    async def test_missing_base_branch_is_incomplete(self, tmp_path, monkeypatch):
+        bare, _base, _head = make_pull_request(tmp_path, content="change\n")
+        monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path / "ws"))
+        get_settings.cache_clear()
+        monkeypatch.setattr(droid_client, "_remote_url", lambda repository: str(bare))
+
+        ctx = await DroidClient(api_key="fk_test").prepare_review_context(
+            repository="jan21deepak/demo", review_id=3, pr_number=7, base_ref="does-not-exist"
+        )
+        assert not ctx.complete
+        assert ctx.base_sha is None
+        assert "base commit" in ctx.incomplete_reason
+
+    @pytest.mark.asyncio
+    async def test_inspect_workspace_reports_candidate_commit_and_dirty_state(self, tmp_path, monkeypatch):
+        bare = make_bare_repo(tmp_path)
+        monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path / "ws"))
+        get_settings.cache_clear()
+        monkeypatch.setattr(droid_client, "_remote_url", lambda repository: str(bare))
+        client = DroidClient(api_key="fk_test")
+        ws = await client.prepare_fix_workspace(repository="jan21deepak/demo", task_id=4, starting_ref="main")
+        git = lambda *a: subprocess.run(  # noqa: E731
+            ["git", *a], cwd=ws, capture_output=True, text=True, check=True
+        ).stdout.strip()
+        git("checkout", "-q", "-b", "droid/fix-4")
+        (ws / "fix.txt").write_text("fixed")
+        git("add", ".")
+        git("-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-qm", "fix")
+        head = git("rev-parse", "HEAD")
+
+        state = await client.inspect_workspace("jan21deepak/demo", 4, "droid/fix-4")
+        assert (state.head_sha, state.branch, state.dirty) == (head, "droid/fix-4", False)
+
+        (ws / "fix.txt").write_text("edited but not committed")
+        state = await client.inspect_workspace("jan21deepak/demo", 4, "no-such-branch")
+        assert (state.head_sha, state.branch, state.dirty) == (head, "droid/fix-4", True)
+
+        missing = await client.inspect_workspace("jan21deepak/demo", 999, None)
+        assert missing.head_sha is None
 
 
 class TestClient:
@@ -255,14 +370,10 @@ class TestClient:
         assert not DroidClient(api_key="").configured
         assert DroidClient(api_key="fk_test").configured
 
-    def test_review_autonomy_is_not_off(self, monkeypatch):
-        """Headless review runs auto-reject permission requests; OFF aborts them."""
-        monkeypatch.setenv("DROID_AUTONOMY", "high")
-        monkeypatch.setenv("DROID_REVIEW_AUTONOMY", "high")
+    def test_fix_autonomy_follows_setting(self, monkeypatch):
+        monkeypatch.setenv("DROID_AUTONOMY", "medium")
         get_settings.cache_clear()
-        client = DroidClient(api_key="fk_test")
-        assert client.autonomy(review=True) != droid_client.Autonomy.OFF
-        assert client.autonomy(review=False) != droid_client.Autonomy.OFF
+        assert DroidClient(api_key="fk_test").autonomy() == droid_client.Autonomy.MEDIUM
 
     def test_configured_via_cli_auth(self, monkeypatch):
         from app.config import get_settings

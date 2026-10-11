@@ -7,8 +7,10 @@ Instructions for autonomous agents (Droid and humans) working in this repository
 Droid Forge is a FastAPI service that turns labeled GitHub issues into reviewed pull
 requests using local Droid SDK sessions. When an issue is labeled `Droid-complete`
 (or assigned via the dashboard), the service clones the target repo, runs a Droid
-agent to fix it, opens a same-repo PR, runs a second Droid review session, and posts
-results back to GitHub.
+agent to fix it and records the resulting commit as a local candidate. Agent success
+never pushes, opens a PR or merges; publishing is a separate policy-gated step
+(`app/publishing.py`). PRs assigned for review get a fresh Droid review session
+restricted to Read/Grep/Glob over the exact base..head diff.
 
 ## Setup
 
@@ -67,7 +69,8 @@ Before declaring any change done: run `ruff check`, `ruff format --check`,
 - `app/app.py` — FastAPI app: dashboard, repositories, issues, follow-up APIs
 - `app/auth.py` / `app/auth_routes.py` — default-deny operator access middleware, sessions, CSRF/Origin/Host checks, login/logout
 - `app/intake.py` — HMAC-signed `/webhook` intake; `app/policy.py` — repository approval policy
-- `app/worker.py` — background finalization (fix/review), PR state reconciliation, restart recovery
+- `app/worker.py` — background finalization (fix/review), restart recovery
+- `app/candidates.py` — local candidate recording; `app/review_policy.py` — restricted review config, diff checks, verdict parsing; `app/publishing.py` — policy-gated PR creation (not called automatically)
 - `app/droid_client.py` — Droid SDK wrapper: workspaces, fix/review sessions, resume
 - `app/github.py` — GitHub REST client: comments, PRs, reviews, webhook signature
 - `app/models.py` — SQLAlchemy `Task` / `ReviewTask` / `Repository` models

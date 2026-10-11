@@ -34,13 +34,10 @@ class Settings(BaseSettings):
     droid_allow_cli_auth: bool = False
     # Model id for new sessions; "auto" = Factory Router. Overridable per repo.
     droid_model: str = "auto"
-    # Autonomy for fix sessions: off | low | medium | high
+    # Autonomy for fix sessions: off | low | medium | high. Review sessions do
+    # not use autonomy; they are restricted to Read/Grep/Glob (app.review_policy),
+    # so a legacy DROID_REVIEW_AUTONOMY value is ignored.
     droid_autonomy: str = "high"
-    # Autonomy for PR review sessions. Must not be "off": headless runs
-    # auto-reject permission requests, and OFF makes the review agent ask for
-    # permission on ordinary read commands, which aborts the run. The review
-    # prompt keeps the agent read-only; this only controls prompting.
-    droid_review_autonomy: str = "high"
     # Wall-clock budget for a single Droid turn (fix, review, follow-up)
     droid_turn_timeout_seconds: float = 3600.0
     # Where per-task repository workspace clones live
@@ -58,9 +55,8 @@ class Settings(BaseSettings):
     posthog_key: str = ""
     posthog_host: str = "https://us.i.posthog.com"
 
-    # When True, forge squash-merges (or enables GitHub auto-merge) after the
-    # Droid review agent approves. Leave False so humans can review too.
-    review_auto_merge: bool = False
+    # There is deliberately no auto-merge setting: Forge never merges or enables
+    # GitHub auto-merge, and a legacy REVIEW_AUTO_MERGE value is ignored.
 
     # Operator access. Anything other than the literal "local_dev" is treated
     # as protected so a typo can never silently disable authentication.

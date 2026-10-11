@@ -1,6 +1,6 @@
 # Droid Forge — The AI Engineer That Delivers
 
-A production-ready automation service that turns **GitHub Issues into merged Pull Requests** using the official [Factory Droid SDK](https://docs.factory.ai/sdk/python) (`droid-sdk`) running local [Droid](https://docs.factory.ai/droid-cli/overview) sessions. Label an issue, and the system dispatches a Droid agent to implement the fix, run the tests, push a branch, open a PR, review it with a second Droid agent, and report back on the issue — with full lifecycle tracking, metrics, and an operations dashboard.
+A production-ready automation service that turns **GitHub Issues into reviewed local change candidates** using the official [Factory Droid SDK](https://docs.factory.ai/sdk/python) (`droid-sdk`) running local [Droid](https://docs.factory.ai/droid-cli/overview) sessions. Label an issue, and the system dispatches a Droid agent to implement the fix, run the tests and commit on a branch, records that commit as a candidate, and can review pull requests with a second, read-only Droid agent — with full lifecycle tracking, metrics, and an operations dashboard. Agent success never pushes, opens a pull request or merges anything.
 
 > Previously "Cursor Forge": this service used Cursor Cloud Agents. It has been fully refactored onto Factory's Droid: every Cursor SDK call is now a `droid-sdk` call running where the app runs.
 
@@ -12,10 +12,10 @@ When a GitHub Issue is labeled `Droid-complete` in a configured repository (e.g.
 
 1. Receives the webhook and validates its HMAC signature.
 2. Persists a **Task** record in SQLite.
-3. Launches a **local Droid session** via the Python SDK (`droid-sdk`) inside a fresh clone of the target repo. The clone's `origin` is authenticated with your GitHub token so the agent can push branches; an optional per-repo **setup command** (e.g. `npm ci`) runs before the session starts.
-4. Streams the agent turn in a background asyncio task; Droid makes the requested changes, runs the project's tests, fixes failures, pushes a new branch, and reports `BRANCH: <name>` plus a summary.
-5. On completion, forge opens a **same-repo pull request** with the forge `GITHUB_TOKEN` (`head=owner:branch`), stores the PR URL, summary, runtime, tokens and Factory credits, and posts a ✅ comment back on the original issue.
-6. A **second Droid session** reviews the PR head branch, and forge posts its findings as a **GitHub PR review** (`APPROVE` / `REQUEST_CHANGES`, falling back to a comment when GitHub rejects self-approval).
+3. Launches a **local Droid session** via the Python SDK (`droid-sdk`) inside a fresh clone of the target repo. The clone's `origin` is credential-free, so the agent cannot push; an optional per-repo **setup command** (e.g. `npm ci`) runs only when privileged setup is enabled.
+4. Streams the agent turn in a background asyncio task; Droid makes the requested changes, runs the project's tests, fixes failures, commits on a new branch, and reports `BRANCH: <name>` plus a summary.
+5. On completion, forge records the **local candidate** (base SHA, candidate commit SHA, branch, and whether the tree was clean), stores the summary, runtime, tokens and Factory credits, and, only when GitHub writes are enabled, posts a ✅ comment on the issue saying nothing was pushed. Publishing is a separate, later step (`app/publishing.py`) that no automatic path calls.
+6. A **second Droid session** reviews a pull request assigned for review. It is restricted to the `Read`, `Grep` and `Glob` tools and sees the exact base-to-head diff; forge stores its structured verdict and findings and posts them as a **GitHub PR review** pinned to the reviewed commit.
 7. Exposes a live **dashboard**, a **metrics endpoint**, an orchestration-grade **health endpoint**, and a **follow-up** API (`POST /api/tasks/{id}/follow-up`) for SDK `Session.resume` + stream.
 
 **Two equivalent triggers**
@@ -34,13 +34,14 @@ flowchart LR
     ISSUE["GitHub Issue<br/>labeled Droid-complete"]
     WEB["Droid Forge FastAPI<br/>POST /webhook / Assign"]
     DB[("SQLite<br/>Task + Repo store<br/>per-repo model + setup cmd")]
-    WS["Workspace Clones<br/>token-authenticated origin"]
+    WS["Workspace Clones<br/>credential-free origin"]
     SDK["droid-sdk Sessions<br/>autonomy HIGH"]
-    FIX["Droid Fix Agent<br/>code, test, push branch"]
-    PR["Same-repo Pull Request<br/>via GitHub PAT"]
-    REV["Droid Review Session<br/>on PR head branch"]
+    FIX["Droid Fix Agent<br/>code, test, commit"]
+    CAND["Local candidate<br/>base + head SHA"]
+    PR["Pull Request<br/>assigned for review"]
+    REV["Restricted Droid Review<br/>Read / Grep / Glob"]
     GRV["GitHub PR Review<br/>approve / request changes"]
-    WORK["Worker loop<br/>PR state + merge tracking"]
+    WORK["Worker loop<br/>PR state observation"]
     DASH["Dashboard<br/>GET /dashboard"]
     METRICS["Metrics<br/>GET /metrics"]
 
@@ -50,7 +51,8 @@ flowchart LR
     WEB -->|"launch background task"| SDK
     WS -->|"session cwd"| SDK
     SDK --> FIX
-    FIX -->|"BRANCH: pushed"| PR
+    FIX -->|"BRANCH: committed"| CAND
+    CAND -.->|"separate delivery step"| PR
     PR --> REV --> GRV
     FIX -->|"summary, duration, credits"| DB
     WORK -->|"PR open/merged"| DB
@@ -137,7 +139,7 @@ Generate the operator token locally and keep it out of commits, logs and
 screenshots, e.g. `python3 -c 'import secrets; print(secrets.token_urlsafe(36))'`.
 See [Operator access](#operator-access) for the full access model.
 
-Optional: `DROID_MODEL` (default `auto` = Factory Router), `DROID_AUTONOMY` (default `high`), `DROID_REVIEW_AUTONOMY` (default `high`, review sessions), `DROID_USD_PER_AGENT_RUN` for ROI estimates, `DROID_TURN_TIMEOUT_SECONDS` (default 3600) for the per-turn wall-clock budget.
+Optional: `DROID_MODEL` (default `auto` = Factory Router), `DROID_AUTONOMY` (default `high`, fix sessions; reviews always use the restricted tool set), `DROID_USD_PER_AGENT_RUN` for ROI estimates, `DROID_TURN_TIMEOUT_SECONDS` (default 3600) for the per-turn wall-clock budget.
 
 Verify the Droid key (the SDK uses the same key):
 
@@ -239,7 +241,7 @@ gh issue create --repo <owner>/<repo> \
 
 - **Dashboard** tab: fix + review stats, engineering KPIs, daily activity chart (times in **SGT**).
 - Original GitHub issue: ✅ completion comment with session id, PR URL, runtime, summary.
-- Droid commits on a branch; when outward-action policy permits, forge pushes it with its own credential and opens the **same-repo** PR via PAT; a review session posts a **PR review**; merge state is refreshed from GitHub.
+- Droid commits on a branch and forge records it as a local candidate; nothing is pushed and no PR is opened automatically. A review session on an assigned PR posts a **PR review**; merge state is observed from GitHub but never changed.
 - Follow-ups: `POST /api/tasks/{id}/follow-up` resumes the same Droid session (blocked with 409 while a turn is streaming).
 
 ---
@@ -263,17 +265,23 @@ Each fix run:
 1. **Workspace**: shallow clone of the target repo into `WORKSPACE_ROOT/<owner>/<repo>/task-<id>` with the credential-free `https://github.com/<owner>/<repo>.git` as `origin`. The existing Git identity is kept (a Droid Forge identity is only filled in when none is configured). The optional per-repo setup command runs only with `FORGE_ALLOW_PRIVILEGED_SETUP=true`.
 2. **Session**: `Session(cwd=<workspace>, model=<per-repo or DROID_MODEL>, config=SessionConfig(autonomy=HIGH, auto_reject_permission_requests=True))`, opened via the SDK on a clean-environment `droid` process (see [Execution boundary](#execution-boundary)) and streamed in a background task.
 3. **Turn**: the prompt includes the issue title/body and requires only the requested changes, running the test suite, committing on a new branch, *not* pushing or opening a PR, and ending with `BRANCH: <name>`.
-4. **Completion**: `RunResult` gives success/failure, text summary, `duration`, token usage and `factory_credits`; forge persists all of it (credentials redacted), extracts the branch (from the `BRANCH:` line or `git rev-parse`), and, only when outward-action policy permits, pushes it with the app's credential and opens the same-repo PR via PAT (`head=owner:branch`, base = repo default / starting ref).
+4. **Completion**: `RunResult` gives success/failure, text summary, `duration`, token usage and `factory_credits`; forge persists all of it (credentials redacted) and inspects the workspace with app-owned Git to record the candidate: `base_sha` (the starting commit), `candidate_sha`, `candidate_branch` and `candidate_status` (`ready`, `dirty`, `no_changes` or `unavailable`). The task API exposes these under `candidate`. Success does not push, open a PR, start a review or grant publication approval.
 
 Failure mapping: `RunSuccess` → completed; `RunInterrupted` / `RunFailure` / timeout → failed (with the SDK error stored on the task).
 
 ### PR Review
 
-A second, read-only Droid session checks out the PR head branch (blobless full clone, then `git fetch origin pull/N/head`) and reviews the diff for production readiness. Review sessions run at `DROID_REVIEW_AUTONOMY` (default `high`); they must not be `off`, because headless turns auto-reject permission requests and an `off` review aborts on its first read command. Forge parses the `VERDICT: APPROVE | REQUEST_CHANGES` line and posts a GitHub PR review with the full findings. If GitHub rejects the verdict event (e.g. the token owner opened the PR), forge falls back to a plain review comment. `REVIEW_AUTO_MERGE=false` by default; set it to `true` to squash-merge after an approving verdict.
+Each review is a fresh SDK session (never a resumed one) built from an exact, app-prepared context:
+
+- **Context.** Forge makes a blobless full clone, fetches `pull/N/head`, checks out the head SHA detached, runs `git clean -ffdx`, refreshes the PR's base branch from `origin`, and computes the merge base and the complete `base..head` diff. The base SHA, head SHA, whether the diff was complete, and the review policy are stored on the review row.
+- **Incomplete diffs.** A missing base, missing head, empty diff or diff above `REVIEW_DIFF_MAX_CHARS` in `app/review_policy.py` (150,000 characters) is never truncated: the review is marked failed before any session starts.
+- **Restricted tools.** `SessionConfig(restrict_tools=["Read", "Grep", "Glob"], disable_builtin_skills=True, auto_reject_permission_requests=True)`, with no extra enabled or disabled tool lists. The reviewer cannot run commands, edit files or use Git; tests remain the app's job.
+- **Verdict.** The prompt embeds the diff and asks for a JSON findings block plus a `VERDICT: APPROVE | REQUEST_CHANGES` line. Malformed or conflicting output is `INCONCLUSIVE`. An approval counts only for a restricted review of a complete diff with a recorded head SHA, and only if GitHub still reports that head; otherwise forge posts a plain comment. Reviews are posted with `commit_id` pinned to the reviewed SHA. If GitHub rejects the verdict event (e.g. the token owner opened the PR), forge falls back to a comment.
+- **No merging.** Forge has no merge or auto-merge code path. The poller only records that a PR was merged by someone else (`review.pr_merged_observed`); legacy `REVIEW_AUTO_MERGE` and `DROID_REVIEW_AUTONOMY` settings are ignored.
 
 ### Restart recovery
 
-Droid sessions persist on disk (`~/.factory`). On startup, forge finds RUNNING rows whose session is no longer streaming and resumes them in their own workspace with a continuation prompt ("continue where you left off, commit your work, report `BRANCH:`"), after re-checking repository policy. Rows that never got a session (dispatch interrupted) are marked failed.
+Droid sessions persist on disk (`~/.factory`). On startup, forge finds RUNNING fix rows whose session is no longer streaming and resumes them in their own workspace with a continuation prompt ("continue where you left off, commit your work, do not push, report `BRANCH:`"), after re-checking repository policy. The resumed turn finishes like any fix run: it records a local candidate and publishes nothing. Rows that never got a session (dispatch interrupted) are marked failed. Interrupted reviews are never resumed: they are marked failed and must be reassigned, which starts a fresh restricted review.
 
 ## Operator access
 
@@ -373,13 +381,11 @@ applies to tasks and reviews stored earlier.
 | `DROID_ALLOW_CLI_AUTH` | Use the local droid CLI's login when `FACTORY_API_KEY` is empty (local runs) | `false` |
 | `DROID_MODEL` | Model id for sessions (`auto` = Factory Router) | `auto` |
 | `DROID_AUTONOMY` | Autonomy for fix sessions: `off` / `low` / `medium` / `high` | `high` |
-| `DROID_REVIEW_AUTONOMY` | Autonomy for PR review sessions. Do not set `off`: headless runs auto-reject permission requests, which aborts the review on ordinary read commands | `high` |
 | `DROID_TURN_TIMEOUT_SECONDS` | Wall-clock budget for one Droid turn | `3600` |
 | `WORKSPACE_ROOT` | Where per-task repository clones live | `./data/workspace` |
 | `DATABASE_URL` | SQLAlchemy URL | `sqlite:///./data/tasks.db` |
 | `POLL_INTERVAL_SECONDS` | GitHub state poll interval | `20` |
 | `TRIGGER_LABEL` | Issue label that triggers automation | `Droid-complete` |
-| `REVIEW_AUTO_MERGE` | Squash-merge after the Droid review approves (`true`/`false`) | `false` |
 | `LOG_LEVEL` | Logging level | `INFO` |
 | `JUNIOR_SWE_ANNUAL_COST_USD` | Assumed junior SWE fully-loaded cost | `150000` |
 | `JUNIOR_HOURS_PER_ISSUE` | Hours a junior would spend per fix | `4.0` |

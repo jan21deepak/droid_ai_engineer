@@ -494,21 +494,26 @@ class GitHubClient:
         body: str,
         *,
         event: str = "COMMENT",
+        commit_id: str | None = None,
     ) -> dict[str, Any]:
         """Post a PR review on behalf of the forge token (Droid review agent).
 
         ``event`` is one of COMMENT, APPROVE, REQUEST_CHANGES. GitHub rejects
         APPROVE / REQUEST_CHANGES when the token owner authored the PR; callers
-        should retry with COMMENT on 403/422.
+        should retry with COMMENT on 403/422. ``commit_id`` pins the review to
+        the exact commit that was reviewed.
         """
         self._require_outward(OutwardAction.PULL_REQUEST_REVIEW, repository)
         if not self.token:
             raise RuntimeError("GitHub token is not configured")
+        payload: dict[str, Any] = {"body": body, "event": event}
+        if commit_id:
+            payload["commit_id"] = commit_id
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(
                 f"{self.api_url}/repos/{repository}/pulls/{pr_number}/reviews",
                 headers=self._headers(),
-                json={"body": body, "event": event},
+                json=payload,
             )
             resp.raise_for_status()
             review: dict[str, Any] = resp.json()
@@ -593,115 +598,6 @@ class GitHubClient:
                     break
                 page += 1
         return reviews
-
-    async def merge_pull_request(
-        self,
-        repository: str,
-        pr_number: int,
-        merge_method: str = "squash",
-        commit_title: str | None = None,
-    ) -> dict[str, Any]:
-        """Merge a pull request via the GitHub REST API."""
-        self._require_outward(OutwardAction.PULL_REQUEST_MERGE, repository)
-        if not self.token:
-            raise RuntimeError("GitHub token is not configured")
-        payload: dict[str, Any] = {"merge_method": merge_method}
-        if commit_title:
-            payload["commit_title"] = commit_title
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.put(
-                f"{self.api_url}/repos/{repository}/pulls/{pr_number}/merge",
-                headers=self._headers(),
-                json=payload,
-            )
-            resp.raise_for_status()
-            data: dict[str, Any] = resp.json()
-        log_event(
-            logger,
-            logging.INFO,
-            "github.pr_merged",
-            repo=repository,
-            pr=pr_number,
-            sha=data.get("sha"),
-        )
-        return data
-
-    async def enable_auto_merge(self, repository: str, pr_number: int, merge_method: str = "SQUASH") -> bool:
-        """Enable GitHub auto-merge via GraphQL. Returns True on success."""
-        if self._outward_denied(OutwardAction.AUTO_MERGE_ENABLE, repository):
-            return False
-        if not self.token:
-            return False
-        try:
-            pr = await self.get_pull_request(repository, pr_number)
-        except httpx.HTTPError as exc:
-            log_event(
-                logger,
-                logging.WARNING,
-                "github.auto_merge_failed",
-                repo=repository,
-                pr=pr_number,
-                error=str(exc),
-            )
-            return False
-
-        node_id = pr.get("node_id")
-        if not node_id:
-            return False
-
-        query = """
-        mutation($pullRequestId: ID!, $mergeMethod: PullRequestMergeMethod!) {
-          enablePullRequestAutoMerge(input: {
-            pullRequestId: $pullRequestId,
-            mergeMethod: $mergeMethod
-          }) {
-            pullRequest { number autoMergeRequest { enabledAt } }
-          }
-        }
-        """
-        try:
-            async with httpx.AsyncClient(timeout=20) as client:
-                resp = await client.post(
-                    "https://api.github.com/graphql",
-                    headers=self._headers(),
-                    json={
-                        "query": query,
-                        "variables": {
-                            "pullRequestId": node_id,
-                            "mergeMethod": merge_method,
-                        },
-                    },
-                )
-                resp.raise_for_status()
-                payload = resp.json()
-            if payload.get("errors"):
-                log_event(
-                    logger,
-                    logging.WARNING,
-                    "github.auto_merge_failed",
-                    repo=repository,
-                    pr=pr_number,
-                    error=payload["errors"],
-                )
-                return False
-            log_event(
-                logger,
-                logging.INFO,
-                "github.auto_merge_enabled",
-                repo=repository,
-                pr=pr_number,
-            )
-            return True
-        except httpx.HTTPError as exc:
-            log_event(
-                logger,
-                logging.WARNING,
-                "github.auto_merge_failed",
-                repo=repository,
-                pr=pr_number,
-                error=str(exc),
-            )
-            return False
 
     async def check_connectivity(self) -> bool:
         try:

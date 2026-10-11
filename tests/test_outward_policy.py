@@ -11,6 +11,7 @@ import httpx
 import pytest
 
 from app import droid_client, worker
+from app.candidates import WorkspaceState
 from app.config import get_settings
 from app.database import db_session
 from app.droid_client import DroidClient, task_workspace_dir
@@ -104,8 +105,8 @@ class RecordingDroid:
     def track(self, key, task):
         return task
 
-    async def current_branch(self, repository, task_id):
-        return self.branch
+    async def inspect_workspace(self, repository, task_id, reported_branch):
+        return WorkspaceState(head_sha="c" * 40, branch=self.branch, dirty=False)
 
     async def ensure_branch_pushed(self, repository, task_id, branch):
         self.pushed.append(branch)
@@ -202,15 +203,12 @@ class TestGitHubClientGate:
         assert await github.post_issue_comment(ALLOWED, 1, "hi") is False
         assert await github.add_issue_label(ALLOWED, 1, "x") is False
         assert await github.ensure_label(ALLOWED, "x") is False
-        assert await github.enable_auto_merge(ALLOWED, 1) is False
         with pytest.raises(OutwardActionDeniedError):
             await github.create_issue(ALLOWED, "t")
         with pytest.raises(OutwardActionDeniedError):
             await github.create_pull_request(ALLOWED, title="t", head="droid/x", base="main")
         with pytest.raises(OutwardActionDeniedError):
             await github.create_pull_request_review(ALLOWED, 1, "body")
-        with pytest.raises(OutwardActionDeniedError):
-            await github.merge_pull_request(ALLOWED, 1)
         with pytest.raises(OutwardActionDeniedError):
             await github.ensure_issues_webhook(ALLOWED, webhook_url="https://x", secret="s" * 20)
         assert outbound == []
@@ -220,9 +218,11 @@ class TestGitHubClientGate:
         configure(monkeypatch, FORGE_ALLOW_GITHUB_WRITES="true", FORGE_ALLOWED_BRANCHES="droid/ok")
         with pytest.raises(OutwardActionDeniedError):
             await GitHubClient().create_pull_request(ALLOWED, title="t", head="main", base="droid/ok")
-        with pytest.raises(OutwardActionDeniedError):
-            await GitHubClient().merge_pull_request(ALLOWED, 1)
         assert outbound == []
+
+    def test_client_has_no_merge_or_auto_merge_capability(self):
+        for name in ("merge_pull_request", "enable_auto_merge"):
+            assert not hasattr(GitHubClient, name), name
 
 
 class TestRegistrationAndRoutes:
@@ -422,38 +422,24 @@ class TestBackgroundPaths:
             assert task.pull_request_url is None
 
     @pytest.mark.asyncio
-    async def test_finalize_refuses_branch_outside_allowlist(self, monkeypatch, allowlist):
-        configure(monkeypatch, FORGE_ALLOW_GITHUB_WRITES="true", FORGE_ALLOWED_BRANCHES="droid/approved")
-        github = RecordingGitHub()
-        droid = RecordingDroid()
-        monkeypatch.setattr(worker, "GitHubClient", lambda: github)
-        monkeypatch.setattr(worker, "get_droid_client", lambda: droid)
-        task_id = add_task()
-
-        await worker.finalize_fix_task(task_id, outcome())
-
-        assert droid.pushed == []
-        assert [c[0] for c in github.calls] == ["post_issue_comment"]
-        assert github.calls[0][1][0] == ALLOWED
-
-    @pytest.mark.asyncio
-    async def test_finalize_publishes_follow_up_commits_on_existing_pull_request(self, monkeypatch, allowlist):
+    async def test_finalize_with_writes_enabled_records_candidate_but_never_publishes(self, monkeypatch, allowlist):
         configure(monkeypatch, FORGE_ALLOW_GITHUB_WRITES="true", FORGE_ALLOWED_BRANCHES="droid/fix-branch")
         github = RecordingGitHub()
         droid = RecordingDroid()
         monkeypatch.setattr(worker, "GitHubClient", lambda: github)
         monkeypatch.setattr(worker, "get_droid_client", lambda: droid)
+        fresh = add_task()
+        follow_up = add_task(issue_number=4, pull_request_url=f"https://github.com/{ALLOWED}/pull/7")
 
-        async def no_review(**kwargs):
-            return {"review_id": None, "started": False, "detail": "skipped"}
+        for task_id in (fresh, follow_up):
+            await worker.finalize_fix_task(task_id, outcome())
 
-        monkeypatch.setattr(worker, "start_pr_review", no_review)
-        task_id = add_task(pull_request_url=f"https://github.com/{ALLOWED}/pull/7")
-
-        await worker.finalize_fix_task(task_id, outcome())
-
-        assert droid.pushed == ["droid/fix-branch"]
-        assert "create_pull_request" not in [c[0] for c in github.calls]
+        assert droid.pushed == []
+        # The only GitHub write is the policy-permitted progress comment on each issue.
+        assert [c[0] for c in github.calls] == ["post_issue_comment", "post_issue_comment"]
+        with db_session() as session:
+            assert session.get(Task, fresh).pull_request_url is None
+            assert session.get(Task, fresh).candidate_sha == "c" * 40
 
     @pytest.mark.asyncio
     async def test_review_verdict_is_not_posted_without_write_permission(self, monkeypatch, allowlist):

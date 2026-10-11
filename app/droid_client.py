@@ -26,12 +26,20 @@ from typing import Any
 from droid_sdk import Autonomy, Runtime, Session, SessionConfig, list_models
 
 from app.agent_env import agent_environment, close_runtime, git_environment, open_agent_runtime
+from app.candidates import WorkspaceState
 from app.config import get_settings
 from app.logging_conf import log_event
 from app.models import TaskStatus
 from app.policy import OutwardAction, outward_decision, privileged_setup_allowed
 from app.redaction import safe_error
 from app.repos import parse_repository_ref
+from app.review_policy import (
+    ReviewContext,
+    ReviewContextIncompleteError,
+    assess_diff,
+    build_review_prompt,
+    review_session_config,
+)
 
 logger = logging.getLogger("app.droid")
 
@@ -46,9 +54,12 @@ class SetupStatus:
     TIMED_OUT = "timed_out"
 
 
+# Agent prompts describe a local candidate only. Publishing is an app-owned step
+# that requires checks, a restricted review and operator approval of the exact
+# commit, so no prompt grants or implies publication authority.
 FIX_PROMPT_TEMPLATE = """You are working in a local clone of the repository: {repository_url}
-(checkout of ref "{starting_ref}"). You have no credentials for pushing; the automation
-publishes your branch after the run if policy permits.
+(checkout of ref "{starting_ref}"). Your result is a local candidate commit; you have no
+credentials to publish it, and the application decides separately whether it is published.
 
 Resolve the following GitHub issue (#{issue_number}):
 
@@ -61,22 +72,9 @@ Requirements:
 - Make only the requested changes described in the issue.
 - Create a new git branch for your work.
 - Run the project's test suite (or the closest relevant subset if the full suite is impractical) and fix any failures introduced by your changes.
-- Commit your work on that branch. Do NOT push and do NOT open a pull request; automation publishes the branch and opens a same-repo pull request when permitted.
-- Do NOT rebase onto or push to any upstream / parent repository. If this repo is a fork, keep all branches inside the fork only.
+- Commit all of your work on that branch and leave the working tree clean.
+- Do NOT push, do NOT open a pull request, and do NOT change git remotes or credentials.
 - End your final response with a line of the exact form `BRANCH: <your-branch-name>` followed by a short summary of the completed work.
-"""
-
-REVIEW_PROMPT_TEMPLATE = """Review the code changes on the currently checked-out branch of the repository: {repository_url}
-Pull request: {pr_url}
-The changes are relative to the base branch "origin/{base_ref}"; inspect them with
-`git diff origin/{base_ref}...HEAD` (three-dot compares against the merge base).
-
-Perform a thorough code review focused on production readiness:
-- Identify bugs, regressions, missing tests, and security issues.
-- Check that the change is coherent and complete on its own.
-- Leave a clear verdict: approve with notes, or request changes with concrete fixes.
-- End your response with exactly one line: `VERDICT: APPROVE` or `VERDICT: REQUEST_CHANGES`.
-- Do not modify files, push branches, or open pull requests. Review only.
 """
 
 FOLLOW_UP_PROMPT_TEMPLATE = """Continue work on this agent session.
@@ -85,9 +83,9 @@ Follow-up instruction:
 {instruction}
 
 Requirements:
-- Keep the existing branch / pull request when possible.
-- Commit your changes on the branch when done; automation publishes it when permitted.
+- Keep working on the existing local branch.
 - Run relevant tests after changes.
+- Commit all of your changes on the branch and leave the working tree clean. Do NOT push or open a pull request.
 - End your final response with a line of the exact form `BRANCH: <your-branch-name>` and summarize what you changed.
 """
 
@@ -95,12 +93,11 @@ RECOVERY_PROMPT_TEMPLATE = """The automation service restarted while you were wo
 being resumed. Continue the task from where you left off.
 
 - If the work is already complete, restate your final summary.
-- Make sure your work is committed on your branch; automation publishes it when permitted.
+- Make sure all of your work is committed on your local branch. Do NOT push or open a pull request.
 - End your final response with a line of the exact form `BRANCH: <your-branch-name>` and a short summary.
 """
 
 _BRANCH_RE = re.compile(r"^\s*BRANCH:\s*([A-Za-z0-9._/-]+)\s*$", re.MULTILINE)
-_VERDICT_RE = re.compile(r"VERDICT:\s*(APPROVE|REQUEST_CHANGES)", re.IGNORECASE)
 
 GIT_TIMEOUT_SECONDS = 300.0
 SETUP_TIMEOUT_SECONDS = 900.0
@@ -130,14 +127,6 @@ def build_fix_prompt(
     )
 
 
-def build_review_prompt(repository_url: str, pr_url: str, base_ref: str) -> str:
-    return REVIEW_PROMPT_TEMPLATE.format(
-        repository_url=repository_url,
-        pr_url=pr_url,
-        base_ref=(base_ref or "").strip() or "main",
-    )
-
-
 def build_follow_up_prompt(instruction: str) -> str:
     return FOLLOW_UP_PROMPT_TEMPLATE.format(instruction=instruction.strip() or "Continue.")
 
@@ -148,14 +137,6 @@ def extract_branch_name(text: str | None) -> str | None:
         return None
     match = _BRANCH_RE.search(text)
     return match.group(1) if match else None
-
-
-def extract_verdict(text: str | None) -> str | None:
-    """Pull the review verdict line from a review turn result."""
-    if not text:
-        return None
-    match = _VERDICT_RE.search(text)
-    return match.group(1).upper() if match else None
 
 
 def map_outcome_status(outcome: dict[str, Any]) -> str:
@@ -209,6 +190,14 @@ async def _git(
         detail = (err or b"").decode(errors="replace").strip()[:500]
         raise DroidRunError(safe_error(f"git {' '.join(args[:4])} failed (exit {proc.returncode}): {detail}"))
     return out.decode(errors="replace").strip()
+
+
+async def _git_or_none(args: list[str], *, cwd: Path, credential_url: str | None = None) -> str | None:
+    """Like ``_git`` but returns ``None`` when the command fails or the workspace is missing."""
+    try:
+        return await _git(args, cwd=cwd, credential_url=credential_url)
+    except (DroidRunError, OSError):
+        return None
 
 
 def _remote_url(repository: str) -> str:
@@ -283,10 +272,9 @@ class DroidClient:
 
     # ---- settings / discovery -------------------------------------------
 
-    def autonomy(self, *, review: bool = False) -> Autonomy:
-        settings = get_settings()
-        raw = settings.droid_review_autonomy if review else settings.droid_autonomy
-        level = (raw or "high").strip().lower()
+    def autonomy(self) -> Autonomy:
+        """Autonomy for implementation sessions. Review sessions use ``review_session_config``."""
+        level = (get_settings().droid_autonomy or "high").strip().lower()
         return {
             "off": Autonomy.OFF,
             "low": Autonomy.LOW,
@@ -294,9 +282,9 @@ class DroidClient:
             "high": Autonomy.HIGH,
         }.get(level, Autonomy.HIGH)
 
-    def _session_config(self, *, review: bool) -> SessionConfig:
+    def _fix_session_config(self) -> SessionConfig:
         return SessionConfig(
-            autonomy=self.autonomy(review=review),
+            autonomy=self.autonomy(),
             # Headless runs must never hang waiting for a human answer.
             auto_reject_permission_requests=True,
         )
@@ -429,20 +417,22 @@ class DroidClient:
         setup = await self._run_setup_command(ws, (setup_command or "").strip())
         return ws, setup
 
-    async def prepare_review_workspace(
+    async def prepare_review_context(
         self,
         *,
         repository: str,
         review_id: int,
         pr_number: int,
         base_ref: str | None = None,
-    ) -> Path:
-        """Clone the repo, materialize the base branch, and check out the PR head.
+    ) -> ReviewContext:
+        """Build a clean review checkout of the PR head plus the exact base..head diff.
 
-        A *shallow* clone has no common history with the PR branch, so
-        ``git diff base...HEAD`` fails with "no merge base". Use a blobless
-        (``--filter=blob:none``) full-history clone so the merge base exists,
-        then fetch the PR head and a local base branch for diffing.
+        A *shallow* clone has no common history with the PR branch, so a merge
+        base cannot be found. Use a blobless (``--filter=blob:none``)
+        full-history clone; lazily fetched blobs need the credential, so
+        checkout and diff run as app-owned authenticated Git too. The reviewer
+        never runs Git: it gets a detached, ``git clean``-ed checkout of the
+        head SHA and the diff from the merge base to that SHA.
         """
         ws = review_workspace_dir(repository, review_id)
         remote = _remote_url(repository)
@@ -461,36 +451,61 @@ class DroidClient:
             cwd=ws,
             credential_url=remote,
         )
-        await _git(["checkout", "-q", "--force", branch], cwd=ws)
+        head_sha = await _git(["rev-parse", "--verify", f"refs/heads/{branch}^{{commit}}"], cwd=ws)
+        await _git(["checkout", "-q", "--force", "--detach", head_sha], cwd=ws, credential_url=remote)
+        await _git(["clean", "-q", "-ffdx"], cwd=ws)
 
-        # Materialize the base branch locally when it is absent. Do this after
-        # checking out the PR branch: a fresh clone leaves the default branch
-        # checked out, and git refuses to force-update the current worktree ref.
+        # Always refresh the remote-tracking base: a reused workspace's local
+        # branch can be stale and would widen the diff beyond the PR's change.
+        base_tracking = f"refs/remotes/origin/{base}"
         try:
-            await _git(["rev-parse", "--verify", f"refs/heads/{base}"], cwd=ws)
-        except DroidRunError:
-            try:
-                await _git(["fetch", "origin", base], cwd=ws, credential_url=remote)
-                await _git(["branch", base, f"origin/{base}"], cwd=ws)
-            except DroidRunError as exc:
-                log_event(
-                    logger,
-                    logging.WARNING,
-                    "droid.review_base_ref_failed",
-                    review_id=review_id,
-                    base=base,
-                    error=str(exc),
-                )
-        return ws
+            await _git(
+                ["fetch", "--force", "origin", f"+refs/heads/{base}:{base_tracking}"],
+                cwd=ws,
+                credential_url=remote,
+            )
+        except DroidRunError as exc:
+            log_event(
+                logger,
+                logging.WARNING,
+                "droid.review_base_ref_failed",
+                review_id=review_id,
+                base=base,
+                error=str(exc),
+            )
+        base_sha = await _git_or_none(["merge-base", base_tracking, head_sha], cwd=ws)
+        diff = None
+        if base_sha and base_sha != head_sha:
+            diff = await _git_or_none(
+                ["diff", "--no-color", "--no-ext-diff", "--no-textconv", "--find-renames", base_sha, head_sha],
+                cwd=ws,
+                credential_url=remote,
+            )
+        return ReviewContext(
+            workspace=ws,
+            base_ref=base,
+            base_sha=base_sha,
+            head_sha=head_sha or None,
+            diff=diff or "",
+            incomplete_reason=assess_diff(base_sha, head_sha, diff),
+        )
 
-    # ---- branch helpers ---------------------------------------------------
+    # ---- candidate inspection ---------------------------------------------
 
-    async def current_branch(self, repository: str, task_id: int) -> str | None:
-        try:
-            branch = await _git(["rev-parse", "--abbrev-ref", "HEAD"], cwd=task_workspace_dir(repository, task_id))
-        except DroidRunError:
-            return None
-        return branch or None
+    async def inspect_workspace(self, repository: str, task_id: int, reported_branch: str | None) -> WorkspaceState:
+        """Observe the candidate the agent left: the reported branch tip (else HEAD) and worktree state."""
+        ws = task_workspace_dir(repository, task_id)
+        head_sha = None
+        branch = None
+        if reported_branch:
+            head_sha = await _git_or_none(["rev-parse", "--verify", f"refs/heads/{reported_branch}^{{commit}}"], cwd=ws)
+            branch = reported_branch if head_sha else None
+        if not head_sha:
+            head_sha = await _git_or_none(["rev-parse", "--verify", "HEAD^{commit}"], cwd=ws)
+            current = await _git_or_none(["rev-parse", "--abbrev-ref", "HEAD"], cwd=ws)
+            branch = current if current and current != "HEAD" else None
+        status = await _git_or_none(["status", "--porcelain"], cwd=ws)
+        return WorkspaceState(head_sha=head_sha or None, branch=branch, dirty=status is None or bool(status))
 
     async def ensure_branch_pushed(self, repository: str, task_id: int, branch: str) -> bool:
         """Push the workspace HEAD to ``branch`` on the canonical remote with the app's credential.
@@ -669,9 +684,11 @@ class DroidClient:
             starting_ref=starting_ref,
             setup_command=setup_command,
         )
+        # The candidate's base: the commit the agent starts from.
+        base_sha = await _git_or_none(["rev-parse", "--verify", "HEAD^{commit}"], cwd=ws)
         prompt = build_fix_prompt(repository_url, issue_number, issue_title, issue_body, starting_ref or "")
         session = await self._open_session(
-            cwd=ws, model=model or self.model, config=self._session_config(review=False), purpose="session"
+            cwd=ws, model=model or self.model, config=self._fix_session_config(), purpose="session"
         )
         session_id = self._spawn_turn(session, prompt, kind="fix", on_complete=on_complete)
         log_event(
@@ -687,32 +704,33 @@ class DroidClient:
             sdk="droid-sdk",
             setup=setup,
         )
-        return {"session_id": session_id, "status": "running", "setup": setup}
+        return {"session_id": session_id, "status": "running", "setup": setup, "base_sha": base_sha}
 
     async def start_review_run(
         self,
         *,
-        repository: str,
+        context: ReviewContext,
         repository_url: str,
         review_id: int,
-        pr_number: int,
         pr_url: str,
-        base_ref: str | None = None,
         model: str | None = None,
         on_complete: Callable[[dict[str, Any]], Any] | None = None,
     ) -> dict[str, Any]:
-        """Open a read-only review session on the PR head branch."""
+        """Open a *fresh* restricted (Read/Grep/Glob) review session over a complete review context.
+
+        Reviews are never resumed: ``Session.resume`` cannot re-apply tool
+        restrictions, so every review turn is a new restricted session.
+        """
         if not self.configured:
             raise DroidRunError("Droid is not configured (FACTORY_API_KEY missing)")
-        ws = await self.prepare_review_workspace(
-            repository=repository,
-            review_id=review_id,
-            pr_number=pr_number,
-            base_ref=base_ref,
-        )
-        prompt = build_review_prompt(repository_url, pr_url, base_ref or "")
+        if not context.complete:
+            raise ReviewContextIncompleteError(context)
+        prompt = build_review_prompt(context, repository_url=repository_url, pr_url=pr_url)
         session = await self._open_session(
-            cwd=ws, model=model or self.model, config=self._session_config(review=True), purpose="review session"
+            cwd=context.workspace,
+            model=model or self.model,
+            config=review_session_config(),
+            purpose="review session",
         )
         session_id = self._spawn_turn(session, prompt, kind="review", on_complete=on_complete)
         log_event(
@@ -721,9 +739,10 @@ class DroidClient:
             "droid.review_started",
             session_id=session_id,
             review_id=review_id,
-            repository=repository,
-            pr=pr_number,
-            workspace=str(ws),
+            base_sha=context.base_sha,
+            head_sha=context.head_sha,
+            diff_chars=len(context.diff),
+            workspace=str(context.workspace),
         )
         return {"session_id": session_id, "status": "running"}
 
@@ -755,7 +774,10 @@ class DroidClient:
         cwd: Path | None = None,
         on_complete: Callable[[dict[str, Any]], Any] | None = None,
     ) -> dict[str, Any]:
-        """Resume a session orphaned by a service restart and nudge it forward."""
+        """Resume an implementation session orphaned by a service restart and nudge it forward.
+
+        Only for fix/follow-up sessions; review sessions are never resumed.
+        """
         if not self.configured:
             raise DroidRunError("Droid is not configured (FACTORY_API_KEY missing)")
         if self.session_busy(session_id):
@@ -791,9 +813,7 @@ __all__ = [
     "SetupStatus",
     "build_fix_prompt",
     "build_follow_up_prompt",
-    "build_review_prompt",
     "extract_branch_name",
-    "extract_verdict",
     "get_droid_client",
     "map_outcome_status",
     "reset_droid_client_for_tests",

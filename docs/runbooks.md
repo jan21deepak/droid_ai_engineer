@@ -26,25 +26,28 @@ operator-only `GET /api/health` (bearer or signed-in session), which reports
 
 ### Tasks stuck in RUNNING after a restart
 
-Sessions persist on disk (`~/.factory`); startup recovery resumes orphaned rows
-automatically. If rows stay RUNNING for more than `DROID_TURN_TIMEOUT_SECONDS`
+Sessions persist on disk (`~/.factory`); startup recovery resumes orphaned fix rows
+automatically (reviews are never resumed). If rows stay RUNNING for more than `DROID_TURN_TIMEOUT_SECONDS`
 (default 3600):
 
 1. Check the logs for `recovery.dispatch_lost` / `recovery.session_lost`.
 2. Verify the droid CLI is authenticated on the host: `droid --version`.
 3. Restart the service to re-trigger recovery.
 
-### PRs not being created despite completed fixes
+### Completed fixes have no PR
 
-1. Check the task row's `error` on the dashboard.
-2. Look for `policy.outward_denied` in logs. Publishing needs
-   `FORGE_ALLOW_GITHUB_WRITES=true`, the repository in `FORGE_ALLOWED_REPOSITORIES`
-   and the agent's branch in `FORGE_ALLOWED_BRANCHES`; otherwise the commit stays
-   local by design.
-3. Verify `GITHUB_TOKEN` can open PRs on the target repo (same-repo PRs need
-   `contents: write` + `pull requests: write`).
-4. Look for `droid.branch_push_failed` / `polling.pr_fallback_error` in logs:
-   forge's own push failed, or the branch was pushed but the PR could not be opened.
+This is expected. A successful fix records a local candidate (`candidate` on the
+task API: `base_sha`, `sha`, `branch`, `status`) and never pushes or opens a PR on
+its own. Look for `task.candidate_recorded` in the logs. A `candidate.status` of
+`dirty` means the agent left uncommitted changes; `no_changes` means the agent
+made no commit; `unavailable` means the workspace could not be inspected.
+
+### Review failed with "review not started"
+
+Forge refuses to review a partial change. The error names the reason: the PR's
+base branch could not be fetched, the head was missing, the diff was empty, or the
+diff was larger than the review limit. Interrupted reviews are also failed on
+restart instead of resumed; reassign the PR to start a fresh restricted review.
 
 ### Review posts fail with 403 on GitHub
 

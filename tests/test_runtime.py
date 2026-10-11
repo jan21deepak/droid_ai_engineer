@@ -2,16 +2,17 @@
 
 from datetime import UTC, datetime
 
+from app.candidates import build_candidate_comment, format_runtime
 from app.database import db_session
 from app.models import Task, TaskStatus
-from app.worker import _format_runtime, build_completion_comment, parse_pr_number
+from app.worker import parse_pr_number
 
 
-def test_format_runtime():
-    assert _format_runtime(None) == "unknown"
-    assert _format_runtime(45) == "45s"
-    assert _format_runtime(734) == "12m 14s"
-    assert _format_runtime(7340) == "2h 2m 20s"
+def testformat_runtime():
+    assert format_runtime(None) == "unknown"
+    assert format_runtime(45) == "45s"
+    assert format_runtime(734) == "12m 14s"
+    assert format_runtime(7340) == "2h 2m 20s"
 
 
 def testparse_pr_number():
@@ -21,24 +22,27 @@ def testparse_pr_number():
     assert parse_pr_number("not a url") is None
 
 
-def test_build_completion_comment():
+def test_build_candidate_comment_states_nothing_was_published():
     task = Task(
         repository="jan21deepak/omnigent",
         issue_number=2,
         issue_title="[Bug] cold start",
         droid_session_id="sess-abc",
         status=TaskStatus.COMPLETED,
-        pull_request_url="https://github.com/jan21deepak/omnigent/pull/7",
         summary="Fixed the guard clause and added tests.",
         duration_seconds=734.0,
         completed_at=datetime(2026, 9, 28, 4, 0, tzinfo=UTC),
+        candidate_sha="c" * 40,
+        candidate_branch="droid/fix-2",
+        candidate_status="ready",
     )
-    comment = build_completion_comment(task)
+    comment = build_candidate_comment(task)
     assert "sess-abc" in comment
-    assert "pull/7" in comment
+    assert "c" * 12 in comment
+    assert "droid/fix-2" in comment
     assert "12m 14s" in comment
     assert "Fixed the guard clause" in comment
-    assert "✅" in comment
+    assert "Nothing has been pushed and no pull request was opened" in comment
 
 
 def test_task_to_dict_uses_droid_session_fields():

@@ -1,12 +1,13 @@
 """SQLAlchemy ORM models and status constants."""
 
+import json
 from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import Boolean, DateTime, Float, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, validates
 
-from app.redaction import redact_text, safe_error
+from app.redaction import redact, redact_text, safe_error
 from app.timeutil import format_sgt, iso_sgt
 
 
@@ -127,6 +128,13 @@ class Task(RedactedOutputMixin, Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     duration_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # Local candidate facts (app.candidates). Nullable without defaults so rows
+    # from before these columns existed stay "unknown" rather than invented.
+    base_sha: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    candidate_sha: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    candidate_branch: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    candidate_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    candidate_recorded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -152,6 +160,13 @@ class Task(RedactedOutputMixin, Base):
             "completed_at": iso_sgt(self.completed_at),
             "completed_at_display": format_sgt(self.completed_at),
             "duration_seconds": self.duration_seconds,
+            "base_sha": self.base_sha,
+            "candidate": {
+                "sha": self.candidate_sha,
+                "branch": self.candidate_branch,
+                "status": self.candidate_status,
+                "recorded_at": iso_sgt(self.candidate_recorded_at),
+            },
             "kind": "fix",
         }
 
@@ -192,7 +207,11 @@ class SyncedPullRequest(Base):
 
 
 class ReviewTask(RedactedOutputMixin, Base):
-    """Tracks a Droid review session against a pull request, including auto-merge."""
+    """Tracks a restricted Droid review session against a pull request.
+
+    ``merged`` / ``auto_merge_enabled`` are observed or historical facts only;
+    Forge never merges or enables auto-merge.
+    """
 
     __tablename__ = "review_tasks"
 
@@ -214,6 +233,12 @@ class ReviewTask(RedactedOutputMixin, Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     duration_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # Exact review context (app.review_policy); commit_sha is the reviewed head.
+    base_sha: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    diff_complete: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    review_policy: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    verdict: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    findings: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -238,5 +263,20 @@ class ReviewTask(RedactedOutputMixin, Base):
             "completed_at": iso_sgt(self.completed_at),
             "completed_at_display": format_sgt(self.completed_at),
             "duration_seconds": self.duration_seconds,
+            "base_sha": self.base_sha,
+            "diff_complete": self.diff_complete,
+            "review_policy": self.review_policy,
+            "verdict": self.verdict,
+            "findings": _load_findings(self.findings),
             "kind": "review",
         }
+
+
+def _load_findings(raw: str | None) -> list[Any] | None:
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except ValueError:
+        return None
+    return redact(parsed) if isinstance(parsed, list) else None
