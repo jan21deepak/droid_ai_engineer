@@ -40,6 +40,7 @@ from app.review_policy import (
     ReviewContextIncompleteError,
     assess_diff,
     build_review_prompt,
+    review_base_ref,
     review_session_config,
 )
 from app.workspace_config import (
@@ -479,17 +480,22 @@ class DroidClient:
         repository: str,
         review_id: int,
         pr_number: int,
-        base_ref: str | None = None,
+        base_ref: str,
     ) -> ReviewContext:
         """Build a clean review checkout of the PR head plus the exact base..head diff.
 
-        A *shallow* clone has no common history with the PR branch, so a merge
-        base cannot be found. Use a blobless (``--filter=blob:none``)
-        full-history clone; lazily fetched blobs need the credential, so
-        checkout and diff run as app-owned authenticated Git too. The reviewer
-        never runs Git: it gets a detached, ``git clean``-ed checkout of the
-        head SHA and the diff from the merge base to that SHA.
+        ``base_ref`` must be the pull request's actual target branch; it is
+        never guessed. A *shallow* clone has no common history with the PR
+        branch, so a merge base cannot be found. Use a blobless
+        (``--filter=blob:none``) full-history clone; lazily fetched blobs need
+        the credential, so checkout and diff run as app-owned authenticated
+        Git too. The reviewer never runs Git: it gets a detached, ``git
+        clean``-ed checkout of the head SHA and the diff from the merge base to
+        that SHA.
         """
+        base = review_base_ref(base_ref)
+        if base is None:
+            raise DroidRunError("review base branch is missing or invalid; it is never guessed")
         ws = review_workspace_dir(repository, review_id)
         remote = _remote_url(repository)
         ws.parent.mkdir(parents=True, exist_ok=True)
@@ -500,7 +506,6 @@ class DroidClient:
             await _git(["remote", "set-url", "origin", remote], cwd=ws)
             await _git(["fetch", "--filter=blob:none", "--prune", "origin"], cwd=ws, credential_url=remote)
 
-        base = (base_ref or "").strip() or "main"
         branch = f"pr-{pr_number}"
         await _git(
             ["fetch", "--force", "origin", f"pull/{pr_number}/head:{branch}"],
@@ -514,6 +519,7 @@ class DroidClient:
         # Always refresh the remote-tracking base: a reused workspace's local
         # branch can be stale and would widen the diff beyond the PR's change.
         base_tracking = f"refs/remotes/origin/{base}"
+        base_fetched = True
         try:
             await _git(
                 ["fetch", "--force", "origin", f"+refs/heads/{base}:{base_tracking}"],
@@ -521,6 +527,7 @@ class DroidClient:
                 credential_url=remote,
             )
         except DroidRunError as exc:
+            base_fetched = False
             log_event(
                 logger,
                 logging.WARNING,
@@ -529,7 +536,8 @@ class DroidClient:
                 base=base,
                 error=str(exc),
             )
-        base_sha = await _git_or_none(["merge-base", base_tracking, head_sha], cwd=ws)
+        # An unrefreshed tracking ref may be stale, so it never stands in for the current base.
+        base_sha = await _git_or_none(["merge-base", base_tracking, head_sha], cwd=ws) if base_fetched else None
         diff = None
         if base_sha and base_sha != head_sha:
             diff = await _git_or_none(
@@ -771,11 +779,14 @@ class DroidClient:
         pr_url: str,
         model: str | None = None,
         on_complete: Callable[[dict[str, Any]], Any] | None = None,
+        on_session_opened: Callable[[str], None] | None = None,
     ) -> dict[str, Any]:
         """Open a *fresh* restricted (Read/Grep/Glob) review session over a complete review context.
 
         Reviews are never resumed: ``Session.resume`` cannot re-apply tool
         restrictions, so every review turn is a new restricted session.
+        ``on_session_opened`` receives the session id before the turn starts,
+        so the caller can persist it before any completion callback can run.
         """
         if not self.configured:
             raise DroidRunError("Droid is not configured (FACTORY_API_KEY missing)")
@@ -788,6 +799,13 @@ class DroidClient:
             config=review_session_config(),
             purpose="review session",
         )
+        if on_session_opened is not None:
+            try:
+                on_session_opened(session.id)
+            except Exception:
+                with contextlib.suppress(Exception):
+                    await session.close()
+                raise
         session_id = self._spawn_turn(session, prompt, kind="review", on_complete=on_complete)
         log_event(
             logger,

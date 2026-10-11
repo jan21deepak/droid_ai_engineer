@@ -12,7 +12,7 @@ from app.candidates import CandidateStatus, WorkspaceState
 from app.config import get_settings
 from app.database import db_session
 from app.models import ReviewTask, Task, TaskStatus
-from app.review_policy import REVIEW_POLICY_RESTRICTED, ReviewContext, ReviewVerdict
+from app.review_policy import REVIEW_POLICY_RESTRICTED, ReviewBinding, ReviewContext, ReviewVerdict
 
 HEAD = "b" * 40
 BASE = "a" * 40
@@ -145,6 +145,18 @@ def add_review(**overrides):
         session.add(review)
         session.flush()
         return review.id
+
+
+def bound(review_id):
+    """The binding a session started over this row's stored context would carry."""
+    with db_session() as session:
+        review = session.get(ReviewTask, review_id)
+        return ReviewBinding(
+            base_sha=review.base_sha,
+            head_sha=review.commit_sha,
+            diff_complete=review.diff_complete,
+            review_policy=review.review_policy,
+        )
 
 
 def success_outcome(text="Fixed the bug.\nBRANCH: droid/fix-branch", duration=734.0):
@@ -318,7 +330,9 @@ async def test_restricted_complete_review_posts_approval_pinned_to_reviewed_sha(
     monkeypatch.setattr(worker, "GitHubClient", lambda: github)
 
     await worker.finalize_review_task(
-        review_id, review_outcome(findings=[{"severity": "nit", "title": "Rename x", "file": "x.py", "line": 3}])
+        review_id,
+        bound(review_id),
+        review_outcome(findings=[{"severity": "nit", "title": "Rename x", "file": "x.py", "line": 3}]),
     )
 
     [(repo, pr, body, event, commit_id)] = github.review_posts
@@ -351,7 +365,7 @@ async def test_approval_without_complete_restricted_context_is_not_an_approval(
     github = StubGitHub()
     monkeypatch.setattr(worker, "GitHubClient", lambda: github)
 
-    await worker.finalize_review_task(review_id, review_outcome())
+    await worker.finalize_review_task(review_id, bound(review_id), review_outcome())
 
     assert [post[3] for post in github.review_posts] == ["COMMENT"]
     with db_session() as session:
@@ -364,7 +378,7 @@ async def test_approval_is_downgraded_when_pr_head_moved(client, monkeypatch, gi
     github = StubGitHub({("jan21deepak/omnigent", 9): {"state": "open", "head": {"sha": "e" * 40}}})
     monkeypatch.setattr(worker, "GitHubClient", lambda: github)
 
-    await worker.finalize_review_task(review_id, review_outcome())
+    await worker.finalize_review_task(review_id, bound(review_id), review_outcome())
 
     assert [post[3] for post in github.review_posts] == ["COMMENT"]
     with db_session() as session:
@@ -395,7 +409,7 @@ async def test_finalize_review_task_falls_back_to_comment_event(client, monkeypa
     monkeypatch.setattr(worker, "GitHubClient", lambda: github)
 
     await worker.finalize_review_task(
-        review_id, review_outcome("REQUEST_CHANGES", [{"severity": "major", "title": "Bug"}])
+        review_id, bound(review_id), review_outcome("REQUEST_CHANGES", [{"severity": "major", "title": "Bug"}])
     )
 
     assert [(post[3], post[4]) for post in github.review_posts] == [("COMMENT", HEAD)]
@@ -418,7 +432,8 @@ async def test_launch_review_refuses_incomplete_diff(client, monkeypatch):
         incomplete_reason="diff is 10 characters, above the 5-character review limit",
     )
     monkeypatch.setattr(worker, "get_droid_client", lambda: droid)
-    monkeypatch.setattr(worker, "GitHubClient", lambda: StubGitHub())
+    pr = {"state": "open", "head": {"sha": HEAD}, "base": {"ref": "main"}}
+    monkeypatch.setattr(worker, "GitHubClient", lambda: StubGitHub({("jan21deepak/omnigent", 9): pr}))
 
     await worker.launch_review_task(
         review_id, repository="jan21deepak/omnigent", repository_url="", pr_number=9, pr_url=""

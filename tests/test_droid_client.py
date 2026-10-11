@@ -337,6 +337,46 @@ class TestWorkspaces:
         assert ctx.base_sha is None
         assert "base commit" in ctx.incomplete_reason
 
+    @pytest.mark.parametrize("base_ref", ["", "   ", "bad..ref", "-upload-pack=x", "refs/heads/main"])
+    @pytest.mark.asyncio
+    async def test_unknown_or_invalid_base_is_never_guessed(self, tmp_path, monkeypatch, base_ref):
+        monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path / "ws"))
+        get_settings.cache_clear()
+        git_calls: list[list[str]] = []
+
+        async def record_git(args, **kwargs):
+            git_calls.append(args)
+            return ""
+
+        monkeypatch.setattr(droid_client, "_git", record_git)
+        with pytest.raises(DroidRunError, match="never guessed"):
+            await DroidClient(api_key="fk_test").prepare_review_context(
+                repository="jan21deepak/demo", review_id=5, pr_number=7, base_ref=base_ref
+            )
+        assert git_calls == []
+
+    @pytest.mark.asyncio
+    async def test_failed_base_fetch_never_falls_back_to_a_stale_tracking_ref(self, tmp_path, monkeypatch):
+        bare, base_sha, _head = make_pull_request(tmp_path, content="change\n")
+        subprocess.run(["git", "-C", str(bare), "branch", "release", base_sha], check=True)
+        monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path / "ws"))
+        get_settings.cache_clear()
+        monkeypatch.setattr(droid_client, "_remote_url", lambda repository: str(bare))
+        client = DroidClient(api_key="fk_test")
+        first = await client.prepare_review_context(
+            repository="jan21deepak/demo", review_id=6, pr_number=7, base_ref="release"
+        )
+        assert first.complete, first.incomplete_reason
+
+        # The base branch disappears; the reused workspace still has the old tracking ref.
+        subprocess.run(["git", "-C", str(bare), "branch", "-D", "release"], check=True, capture_output=True)
+        again = await client.prepare_review_context(
+            repository="jan21deepak/demo", review_id=6, pr_number=7, base_ref="release"
+        )
+        assert not again.complete
+        assert again.base_sha is None
+        assert "base commit" in again.incomplete_reason
+
     @pytest.mark.asyncio
     async def test_inspect_workspace_reports_candidate_commit_and_dirty_state(self, tmp_path, monkeypatch):
         bare = make_bare_repo(tmp_path)

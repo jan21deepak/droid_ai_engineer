@@ -20,6 +20,7 @@ import asyncio
 import json
 import logging
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import partial
 from typing import Any
@@ -48,14 +49,16 @@ from app.reconcile import (
     refresh_pr_states,
     worker_loop,
 )
-from app.redaction import safe_error
+from app.redaction import redact_text, safe_error
 from app.repos import resolve_agent_launch_config
 from app.review_policy import (
     REVIEW_POLICY_RESTRICTED,
+    ReviewBinding,
     ReviewContext,
     ReviewVerdict,
     effective_verdict,
     parse_review_output,
+    review_base_ref,
 )
 
 __all__ = [
@@ -325,10 +328,15 @@ async def start_pr_review(
     pr_url: str = "",
     pr_title: str = "",
 ) -> dict[str, Any]:
-    """Ensure a review row exists and launch a fresh restricted Droid review (non-blocking)."""
+    """Create a review row and launch a fresh restricted Droid review over it (non-blocking).
+
+    Only a newly created row is launched. An active row already belongs to a
+    review session (or one being prepared), so reassignment is refused rather
+    than replacing that row's context; a terminal row gets a fresh row.
+    """
     if _policy_denied(REPOSITORY_ACCESS, repository, pr=pr_number):
         return {"review_id": None, "started": False, "detail": "repository_not_allowed"}
-    review_id, _created = ensure_review_task_row(
+    review_id, created = ensure_review_task_row(
         repository=repository,
         repository_url=repository_url,
         pr_number=pr_number,
@@ -337,9 +345,14 @@ async def start_pr_review(
     )
     if review_id is None:
         return {"review_id": None, "started": False, "detail": "invalid review target"}
+    if not created:
+        log_event(logger, logging.INFO, "review.reassign_rejected", review_id=review_id, repo=repository, pr=pr_number)
+        return {"review_id": review_id, "started": False, "detail": "review_already_active"}
 
     droid = get_droid_client()
     if not droid.configured:
+        # Closed rather than left queued, so a later assignment can start fresh.
+        _fail_review(review_id, "review not started: Droid is not configured")
         return {"review_id": review_id, "started": False, "detail": "droid_not_configured"}
 
     launch = asyncio.create_task(
@@ -363,26 +376,68 @@ def _fail_review(review_id: int, error: str) -> None:
     _mark_row_failed(ReviewTask, review_id, error, stamp_completed=True)
 
 
-def _persist_review_context(review_id: int, context: ReviewContext) -> None:
+def _awaiting_launch(review: ReviewTask | None) -> bool:
+    """A queued row that no session or review context has been attached to yet."""
+    return (
+        review is not None
+        and review.status == TaskStatus.QUEUED
+        and review.droid_session_id is None
+        and review.commit_sha is None
+    )
+
+
+def _review_awaits_launch(review_id: int) -> bool:
+    with db_session() as session:
+        return _awaiting_launch(session.get(ReviewTask, review_id))
+
+
+def _persist_review_context(review_id: int, context: ReviewContext) -> bool:
+    """Attach the review context to a still-unbound row; ``False`` if the row was already taken."""
     with db_session() as session:
         review = session.get(ReviewTask, review_id)
-        if review is not None:
-            review.commit_sha = context.head_sha
-            review.base_sha = context.base_sha
-            review.diff_complete = context.complete
-            review.review_policy = REVIEW_POLICY_RESTRICTED
+        if review is None or not _awaiting_launch(review):
+            return False
+        review.commit_sha = context.head_sha
+        review.base_sha = context.base_sha
+        review.diff_complete = context.complete
+        review.review_policy = REVIEW_POLICY_RESTRICTED
+        return True
+
+
+def _bound_to(review: ReviewTask, binding: ReviewBinding) -> bool:
+    return binding.matches(
+        base_sha=review.base_sha,
+        head_sha=review.commit_sha,
+        diff_complete=review.diff_complete,
+        review_policy=review.review_policy,
+    )
+
+
+def _bind_review_session(review_id: int, binding: ReviewBinding, session_id: str) -> None:
+    """Record the session reviewing ``binding`` on its row, unless the row moved on."""
+    with db_session() as session:
+        review = session.get(ReviewTask, review_id)
+        if review is None or review.status not in TaskStatus.ACTIVE:
+            return
+        if review.droid_session_id not in (None, session_id) or not _bound_to(review, binding):
+            log_event(
+                logger, logging.WARNING, "review.session_bind_rejected", review_id=review_id, session_id=session_id
+            )
+            return
+        review.droid_session_id = session_id
+        review.status = TaskStatus.RUNNING
+        review.error = None
 
 
 async def _pull_request_base_ref(repository: str, pr_number: int) -> str | None:
-    """The PR's own target branch, which defines the exact review base."""
+    """The PR's own target branch, which defines the exact review base; ``None`` if it is not known."""
     try:
         pr = await GitHubClient().get_pull_request(repository, pr_number)
     except Exception as exc:
         log_event(logger, logging.WARNING, "review.base_lookup_failed", repo=repository, pr=pr_number, error=str(exc))
         return None
     base = pr.get("base") if isinstance(pr, dict) else None
-    ref = base.get("ref") if isinstance(base, dict) else None
-    return ref if isinstance(ref, str) and ref.strip() else None
+    return review_base_ref(base.get("ref") if isinstance(base, dict) else None)
 
 
 async def launch_review_task(
@@ -393,20 +448,26 @@ async def launch_review_task(
     pr_number: int,
     pr_url: str,
 ) -> None:
-    """Background launcher: build the exact review context, then a fresh restricted session."""
+    """Background launcher: build the exact review context, then a fresh restricted session.
+
+    Only a queued row with no session or context is launched. The base is the
+    pull request's actual target branch; when GitHub does not report a valid
+    one the review fails before any workspace or session work.
+    """
     denied = _policy_denied(REPOSITORY_ACCESS, repository, review_id=review_id)
     if denied is not None:
         _fail_review(review_id, f"blocked by repository policy: {denied.reason}")
         return
+    if not _review_awaits_launch(review_id):
+        log_event(logger, logging.WARNING, "review.launch_rejected", review_id=review_id, reason="row already bound")
+        return
     droid = get_droid_client()
     launch = resolve_agent_launch_config(repository=repository, repository_url=repository_url)
-    base_ref = await _pull_request_base_ref(repository, pr_number) or launch.get("starting_ref")
-    if not base_ref:
-        try:
-            meta = await GitHubClient().get_repository(repository)
-            base_ref = meta.get("default_branch") or "main"
-        except Exception:
-            base_ref = "main"
+    base_ref = await _pull_request_base_ref(repository, pr_number)
+    if base_ref is None:
+        _fail_review(review_id, "review not started: the pull request's actual base branch could not be determined")
+        log_event(logger, logging.WARNING, "review.base_unknown", review_id=review_id, repo=repository, pr=pr_number)
+        return
 
     try:
         context = await droid.prepare_review_context(
@@ -416,7 +477,9 @@ async def launch_review_task(
         _fail_review(review_id, f"review context could not be prepared: {safe_error(exc)}")
         log_event(logger, logging.ERROR, "droid.review_context_failed", review_id=review_id, error=str(exc))
         return
-    _persist_review_context(review_id, context)
+    if not _persist_review_context(review_id, context):
+        log_event(logger, logging.WARNING, "review.launch_rejected", review_id=review_id, reason="row already bound")
+        return
     if not context.complete:
         # Never review a partial change as if it were the whole candidate.
         _fail_review(review_id, f"review not started: {context.incomplete_reason}")
@@ -429,6 +492,7 @@ async def launch_review_task(
         )
         return
 
+    binding = ReviewBinding.from_context(context)
     try:
         result = await droid.start_review_run(
             context=context,
@@ -436,7 +500,8 @@ async def launch_review_task(
             review_id=review_id,
             pr_url=pr_url or f"https://github.com/{repository}/pull/{pr_number}",
             model=launch.get("model"),
-            on_complete=partial(finalize_review_task, review_id),
+            on_complete=partial(finalize_review_task, review_id, binding),
+            on_session_opened=partial(_bind_review_session, review_id, binding),
         )
     except Exception as exc:
         _fail_review(review_id, f"Droid review session failed to start: {safe_error(exc)}")
@@ -451,12 +516,7 @@ async def launch_review_task(
         )
         return
 
-    with db_session() as session:
-        review = session.get(ReviewTask, review_id)
-        if review is not None:
-            review.droid_session_id = result["session_id"]
-            review.status = TaskStatus.RUNNING
-            review.error = None
+    _bind_review_session(review_id, binding, result["session_id"])
     log_event(
         logger,
         logging.INFO,
@@ -468,17 +528,34 @@ async def launch_review_task(
     )
 
 
-async def _post_review_verdict(github: GitHubClient, review: ReviewTask, body: str, event: str) -> tuple[bool, str]:
+@dataclass(frozen=True)
+class _ReviewTarget:
+    review_id: int
+    repository: str
+    pr_number: int
+    head_sha: str | None
+
+
+def review_display_body(text: str) -> str:
+    """The review text as posted to GitHub: redacted first, then bounded.
+
+    Bounding first could cut a credential in half so that neither part matches
+    the redaction rules, leaving a partial secret in the posted body.
+    """
+    return redact_text(text)[:REVIEW_BODY_LIMIT]
+
+
+async def _post_review_verdict(github: GitHubClient, target: _ReviewTarget, text: str, event: str) -> tuple[bool, str]:
     """Post a PR review pinned to the reviewed commit, falling back to COMMENT when GitHub rejects the verdict.
 
     Returns ``(posted, event)``.
     """
-    if _policy_denied(OutwardAction.PULL_REQUEST_REVIEW, review.repository, review_id=review.id):
+    if _policy_denied(OutwardAction.PULL_REQUEST_REVIEW, target.repository, review_id=target.review_id):
         return False, event
-    commit_id = review.commit_sha
+    body = review_display_body(text)
     try:
         await github.create_pull_request_review(
-            review.repository, review.pr_number, body, event=event, commit_id=commit_id
+            target.repository, target.pr_number, body, event=event, commit_id=target.head_sha
         )
         return True, event
     except httpx.HTTPStatusError as exc:
@@ -486,7 +563,7 @@ async def _post_review_verdict(github: GitHubClient, review: ReviewTask, body: s
         if exc.response.status_code in (403, 422):
             try:
                 await github.create_pull_request_review(
-                    review.repository, review.pr_number, body, event="COMMENT", commit_id=commit_id
+                    target.repository, target.pr_number, body, event="COMMENT", commit_id=target.head_sha
                 )
                 return True, "COMMENT"
             except Exception as fallback_exc:
@@ -494,7 +571,7 @@ async def _post_review_verdict(github: GitHubClient, review: ReviewTask, body: s
                     logger,
                     logging.WARNING,
                     "github.review_post_failed",
-                    review_id=review.id,
+                    review_id=target.review_id,
                     error=str(fallback_exc),
                 )
         else:
@@ -502,7 +579,7 @@ async def _post_review_verdict(github: GitHubClient, review: ReviewTask, body: s
                 logger,
                 logging.WARNING,
                 "github.review_post_failed",
-                review_id=review.id,
+                review_id=target.review_id,
                 error=str(exc),
             )
     except Exception as exc:
@@ -510,101 +587,129 @@ async def _post_review_verdict(github: GitHubClient, review: ReviewTask, body: s
             logger,
             logging.WARNING,
             "github.review_post_failed",
-            review_id=review.id,
+            review_id=target.review_id,
             error=str(exc),
         )
     return False, event
 
 
-async def _pull_request_head_matches(github: GitHubClient, review: ReviewTask) -> bool:
+async def _pull_request_head_matches(github: GitHubClient, target: _ReviewTarget) -> bool:
     """True only when GitHub confirms the PR head is still the reviewed commit."""
     try:
-        pr = await github.get_pull_request(review.repository, review.pr_number)
+        pr = await github.get_pull_request(target.repository, target.pr_number)
     except Exception as exc:
-        log_event(logger, logging.WARNING, "review.head_check_failed", review_id=review.id, error=str(exc))
+        log_event(logger, logging.WARNING, "review.head_check_failed", review_id=target.review_id, error=str(exc))
         return False
     head = (pr.get("head") or {}).get("sha") if isinstance(pr, dict) else None
-    if head != review.commit_sha:
+    if not target.head_sha or head != target.head_sha:
         log_event(
             logger,
             logging.WARNING,
             "review.head_moved",
-            review_id=review.id,
-            reviewed=review.commit_sha,
+            review_id=target.review_id,
+            reviewed=target.head_sha,
             current=head,
         )
         return False
     return True
 
 
-async def finalize_review_task(review_id: int, outcome: dict[str, Any]) -> None:
-    """Turn-completion handler for restricted Droid PR review sessions.
+def _callback_rejection(review: ReviewTask, binding: ReviewBinding, session_id: object) -> str | None:
+    """Why a completion callback may not finalize this row, or ``None`` if it may."""
+    if review.status not in TaskStatus.ACTIVE:
+        return "review is no longer active"
+    if not isinstance(session_id, str) or not session_id or session_id != review.droid_session_id:
+        return "completing session is not the session bound to this review"
+    if not _bound_to(review, binding):
+        return "review context changed since this session started"
+    return None
 
-    The structured verdict is persisted with the reviewed SHA. Only a restricted
-    review of a complete diff whose head still matches GitHub posts APPROVE;
-    nothing here merges or enables auto-merge.
+
+async def finalize_review_task(review_id: int, binding: ReviewBinding, outcome: dict[str, Any]) -> None:
+    """Turn-completion handler for one restricted Droid PR review session.
+
+    ``binding`` is the context the completing session was started over. A
+    callback from any other session, for another context, or for a row that
+    is already terminal changes nothing and makes no GitHub call.
+
+    The structured verdict is persisted with the reviewed SHA. Policy is then
+    rechecked before any GitHub read or write; only a restricted review of a
+    complete diff whose head still matches GitHub posts APPROVE, pinned to the
+    bound head. Nothing here merges or enables auto-merge.
     """
     github = GitHubClient()
     status = map_outcome_status(outcome)
     summary = (outcome.get("text") or "").strip() or None
+    session_id = outcome.get("session_id")
 
     with db_session() as session:
         review = session.get(ReviewTask, review_id)
         if review is None:
             log_event(logger, logging.WARNING, "droid.review_missing", review_id=review_id)
             return
+        rejection = _callback_rejection(review, binding, session_id)
+        if rejection is not None:
+            log_event(
+                logger,
+                logging.WARNING,
+                "review.callback_rejected",
+                review_id=review_id,
+                session_id=session_id,
+                bound_session_id=review.droid_session_id,
+                reason=rejection,
+                credits=outcome.get("credits"),
+            )
+            return
         old_status = review.status
         _apply_outcome_to_task(review, outcome, status, summary)
         if status == TaskStatus.COMPLETED and summary:
             parsed = effective_verdict(
                 parse_review_output(summary),
-                review_policy=review.review_policy,
-                diff_complete=review.diff_complete,
-                reviewed_sha=review.commit_sha,
+                review_policy=binding.review_policy,
+                diff_complete=binding.diff_complete,
+                reviewed_sha=binding.head_sha,
             )
             review.verdict = parsed.verdict
             review.findings = json.dumps(parsed.findings)
-        refreshed = review
+        verdict = review.verdict
+        error = review.error
+        target = _ReviewTarget(review_id, review.repository, review.pr_number, binding.head_sha)
 
     log_event(
         logger,
         logging.INFO,
         "review.status_changed",
         review_id=review_id,
+        session_id=session_id,
         old=old_status,
         new=status,
     )
 
     if status != TaskStatus.COMPLETED or not summary:
-        log_event(
-            logger,
-            logging.WARNING,
-            "review.failed",
-            review_id=review_id,
-            error=refreshed.error,
-        )
+        log_event(logger, logging.WARNING, "review.failed", review_id=review_id, error=error)
         return
 
-    verdict = refreshed.verdict
+    posted = False
     event = {ReviewVerdict.APPROVE: "APPROVE", ReviewVerdict.REQUEST_CHANGES: "REQUEST_CHANGES"}.get(
         verdict or "", "COMMENT"
     )
-    if event == "APPROVE" and not await _pull_request_head_matches(github, refreshed):
-        event = "COMMENT"
-    body = summary[:REVIEW_BODY_LIMIT]
-    posted, event = await _post_review_verdict(github, refreshed, body, event)
+    # Checked before the head read too: stored work outside current policy gets no GitHub call at all.
+    if not _policy_denied(OutwardAction.PULL_REQUEST_REVIEW, target.repository, review_id=review_id):
+        if event == "APPROVE" and not await _pull_request_head_matches(github, target):
+            event = "COMMENT"
+        posted, event = await _post_review_verdict(github, target, summary, event)
 
     log_event(
         logger,
         logging.INFO,
         "review.completed",
         review_id=review_id,
-        repo=refreshed.repository,
-        pr=refreshed.pr_number,
+        repo=target.repository,
+        pr=target.pr_number,
         verdict=verdict,
         github_event=event,
         posted=posted,
-        reviewed_sha=refreshed.commit_sha,
+        reviewed_sha=target.head_sha,
     )
 
 

@@ -67,6 +67,63 @@ class ReviewContext:
         return self.incomplete_reason is None
 
 
+@dataclass(frozen=True)
+class ReviewBinding:
+    """The immutable context one review session was started over.
+
+    A session's completion callback carries this, so it can only finalize the
+    row while the row still holds exactly this context.
+    """
+
+    base_sha: str | None
+    head_sha: str | None
+    diff_complete: bool
+    review_policy: str
+
+    @classmethod
+    def from_context(cls, context: ReviewContext) -> ReviewBinding:
+        return cls(
+            base_sha=context.base_sha,
+            head_sha=context.head_sha,
+            diff_complete=context.complete,
+            review_policy=REVIEW_POLICY_RESTRICTED,
+        )
+
+    def matches(
+        self, *, base_sha: str | None, head_sha: str | None, diff_complete: bool | None, review_policy: str | None
+    ) -> bool:
+        return (base_sha, head_sha, diff_complete, review_policy) == (
+            self.base_sha,
+            self.head_sha,
+            self.diff_complete,
+            self.review_policy,
+        )
+
+
+_REF_FORBIDDEN_CHARS = frozenset(" ~^:?*[\\")
+_MAX_REF_CHARS = 255
+
+
+def review_base_ref(value: object) -> str | None:
+    """A PR's ``base.ref`` if it is a plain, safe branch name, else ``None``.
+
+    Follows ``git check-ref-format`` rules plus a few stricter ones (no leading
+    ``-``, no ``refs/`` prefix, no surrounding whitespace) so the value can only
+    name a branch, never an option or another ref namespace.
+    """
+    if not isinstance(value, str) or not value or len(value) > _MAX_REF_CHARS:
+        return None
+    if value != value.strip() or value.startswith(("-", "/", "refs/")) or value == "@":
+        return None
+    if value.endswith(("/", ".", ".lock")) or ".." in value or "//" in value or "@{" in value:
+        return None
+    if any(ch in _REF_FORBIDDEN_CHARS or ord(ch) < 0x20 or ord(ch) == 0x7F for ch in value):
+        return None
+    if any(part.startswith(".") for part in value.split("/")):
+        return None
+    return value
+
+
 def assess_diff(base_sha: str | None, head_sha: str | None, diff: str | None) -> str | None:
     """Return why a diff cannot stand for the complete candidate, or ``None`` if it can."""
     if not base_sha:
@@ -230,6 +287,7 @@ __all__ = [
     "REVIEW_DIFF_MAX_CHARS",
     "REVIEW_POLICY_RESTRICTED",
     "REVIEW_TOOLS",
+    "ReviewBinding",
     "ReviewContext",
     "ReviewContextIncompleteError",
     "ReviewVerdict",
@@ -238,5 +296,6 @@ __all__ = [
     "build_review_prompt",
     "effective_verdict",
     "parse_review_output",
+    "review_base_ref",
     "review_session_config",
 ]

@@ -24,6 +24,7 @@ from app.policy import (
     ref_decision,
     repository_decision,
 )
+from app.review_policy import REVIEW_POLICY_RESTRICTED, ReviewBinding
 from app.tasks import TaskCreateError, create_and_dispatch_task
 
 ALLOWED = "jan21deepak/allowed"
@@ -445,15 +446,32 @@ class TestBackgroundPaths:
     async def test_review_verdict_is_not_posted_without_write_permission(self, monkeypatch, allowlist):
         github = RecordingGitHub()
         monkeypatch.setattr(worker, "GitHubClient", lambda: github)
+        bound = ReviewBinding(
+            base_sha="a" * 40, head_sha="b" * 40, diff_complete=True, review_policy=REVIEW_POLICY_RESTRICTED
+        )
         with db_session() as session:
-            review = ReviewTask(repository=ALLOWED, pr_number=4, droid_session_id="s", status=TaskStatus.RUNNING)
+            review = ReviewTask(
+                repository=ALLOWED,
+                pr_number=4,
+                droid_session_id="s",
+                status=TaskStatus.RUNNING,
+                base_sha=bound.base_sha,
+                commit_sha=bound.head_sha,
+                diff_complete=True,
+                review_policy=REVIEW_POLICY_RESTRICTED,
+            )
             session.add(review)
             session.flush()
             review_id = review.id
 
-        await worker.finalize_review_task(review_id, outcome("Looks fine.\nVERDICT: APPROVE"))
+        await worker.finalize_review_task(
+            review_id, bound, {**outcome("Looks fine.\nVERDICT: APPROVE"), "session_id": "s"}
+        )
 
-        assert [c[0] for c in github.calls if c[0].startswith(("create_", "post_", "merge", "enable"))] == []
+        # Writes are disabled, so not even the approval head check reads GitHub.
+        assert github.calls == []
+        with db_session() as session:
+            assert session.get(ReviewTask, review_id).status == TaskStatus.COMPLETED
 
 
 class TestBranchPush:

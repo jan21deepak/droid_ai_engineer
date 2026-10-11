@@ -124,6 +124,45 @@ class TestReviewSessions:
         assert "merge" not in lowered
 
     @pytest.mark.asyncio
+    async def test_session_id_is_handed_over_before_the_turn_starts(self, review_sessions):
+        seen: list[tuple[str, int]] = []
+
+        def on_session_opened(session_id):
+            seen.append((session_id, len(review_sessions.created[0].prompts)))
+
+        client = DroidClient(api_key="fk_test")
+        result = await client.start_review_run(
+            context=context(),
+            repository_url="https://github.com/o/r",
+            review_id=1,
+            pr_url="",
+            on_session_opened=on_session_opened,
+        )
+        for _ in range(5):
+            await asyncio.sleep(0)
+        # Called with the session's id while no prompt had been streamed yet.
+        assert seen == [(result["session_id"], 0)]
+
+    @pytest.mark.asyncio
+    async def test_failing_session_hook_never_starts_the_turn(self, review_sessions):
+        def on_session_opened(session_id):
+            raise RuntimeError("row could not be updated")
+
+        client = DroidClient(api_key="fk_test")
+        with pytest.raises(RuntimeError):
+            await client.start_review_run(
+                context=context(),
+                repository_url="https://github.com/o/r",
+                review_id=1,
+                pr_url="",
+                on_session_opened=on_session_opened,
+            )
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert review_sessions.created[0].prompts == []
+        assert client.active_sessions == set()
+
+    @pytest.mark.asyncio
     async def test_incomplete_context_never_opens_a_session(self, review_sessions):
         client = DroidClient(api_key="fk_test")
         with pytest.raises(ReviewContextIncompleteError):
