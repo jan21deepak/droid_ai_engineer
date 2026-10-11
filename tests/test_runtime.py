@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 
 from app.database import db_session
 from app.models import Task, TaskStatus
-from app.worker import _format_runtime, _parse_pr_number, build_completion_comment
+from app.worker import _format_runtime, build_completion_comment, parse_pr_number
 
 
 def test_format_runtime():
@@ -14,11 +14,11 @@ def test_format_runtime():
     assert _format_runtime(7340) == "2h 2m 20s"
 
 
-def test_parse_pr_number():
-    assert _parse_pr_number("https://github.com/org/repo/pull/42") == 42
-    assert _parse_pr_number("https://github.com/org/repo/pull/42/") == 42
-    assert _parse_pr_number("https://github.com/org/repo") is None
-    assert _parse_pr_number("not a url") is None
+def testparse_pr_number():
+    assert parse_pr_number("https://github.com/org/repo/pull/42") == 42
+    assert parse_pr_number("https://github.com/org/repo/pull/42/") == 42
+    assert parse_pr_number("https://github.com/org/repo") is None
+    assert parse_pr_number("not a url") is None
 
 
 def test_build_completion_comment():

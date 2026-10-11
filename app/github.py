@@ -10,6 +10,7 @@ import httpx
 
 from app.config import get_settings
 from app.logging_conf import log_event
+from app.policy import OutwardAction, OutwardActionDeniedError, PolicyDecision, outward_decision
 from app.resilience import retry_with_backoff
 
 logger = logging.getLogger("app.github")
@@ -74,6 +75,27 @@ class GitHubClient:
         self.token = token if token is not None else settings.github_token
         self.api_url = (api_url or settings.github_api_url).rstrip("/")
 
+    def _outward_denied(self, action: str, repository: str, *, ref: str | None = None) -> PolicyDecision | None:
+        """Policy gate in front of every GitHub write; returns the denial, if any."""
+        decision = outward_decision(action, repository, ref=ref)
+        if decision.allowed:
+            return None
+        log_event(
+            logger,
+            logging.WARNING,
+            "policy.outward_denied",
+            action=action,
+            repo=repository,
+            ref=ref,
+            reason=decision.reason,
+        )
+        return decision
+
+    def _require_outward(self, action: str, repository: str, *, ref: str | None = None) -> None:
+        decision = self._outward_denied(action, repository, ref=ref)
+        if decision is not None:
+            raise OutwardActionDeniedError(action, repository, decision)
+
     def _headers(self) -> dict[str, str]:
         headers = {
             "Accept": "application/vnd.github+json",
@@ -84,6 +106,8 @@ class GitHubClient:
         return headers
 
     async def post_issue_comment(self, repository: str, issue_number: int, body: str) -> bool:
+        if self._outward_denied(OutwardAction.ISSUE_COMMENT, repository):
+            return False
         if not self.token:
             log_event(
                 logger,
@@ -182,6 +206,7 @@ class GitHubClient:
         labels: list[str] | None = None,
     ) -> dict[str, Any]:
         """Create a GitHub issue and return its API response."""
+        self._require_outward(OutwardAction.ISSUE_CREATE, repository)
         if not self.token:
             raise RuntimeError("GitHub token is not configured")
         payload: dict[str, Any] = {"title": title, "body": body}
@@ -205,6 +230,8 @@ class GitHubClient:
         return issue
 
     async def add_issue_label(self, repository: str, issue_number: int, label: str) -> bool:
+        if self._outward_denied(OutwardAction.ISSUE_LABEL, repository):
+            return False
         if not self.token:
             return False
         url = f"{self.api_url}/repos/{repository}/issues/{issue_number}/labels"
@@ -235,6 +262,8 @@ class GitHubClient:
         description: str = "Assign to Droid Forge for autonomous fix",
     ) -> bool:
         """Create the repo label if missing. Returns True if it exists or was created."""
+        if self._outward_denied(OutwardAction.ISSUE_LABEL, repository):
+            return False
         if not self.token or not name:
             return False
         encoded = name.replace(" ", "%20")
@@ -281,6 +310,7 @@ class GitHubClient:
         secret: str,
     ) -> dict[str, Any]:
         """Install or update an issues webhook pointing at forge's public URL."""
+        self._require_outward(OutwardAction.WEBHOOK_INSTALL, repository)
         if not self.token:
             raise RuntimeError("GitHub token is not configured")
         webhook_url = (webhook_url or "").rstrip("/")
@@ -390,6 +420,7 @@ class GitHubClient:
         ``owner:branch`` so GitHub opens a PR *within* ``repository`` rather
         than defaulting a fork compare against an upstream parent.
         """
+        self._require_outward(OutwardAction.PULL_REQUEST_CREATE, repository, ref=head)
         if not self.token:
             raise RuntimeError("GitHub token is not configured")
         owner = repository.split("/", 1)[0]
@@ -470,6 +501,7 @@ class GitHubClient:
         APPROVE / REQUEST_CHANGES when the token owner authored the PR; callers
         should retry with COMMENT on 403/422.
         """
+        self._require_outward(OutwardAction.PULL_REQUEST_REVIEW, repository)
         if not self.token:
             raise RuntimeError("GitHub token is not configured")
         async with httpx.AsyncClient(timeout=30) as client:
@@ -570,6 +602,7 @@ class GitHubClient:
         commit_title: str | None = None,
     ) -> dict[str, Any]:
         """Merge a pull request via the GitHub REST API."""
+        self._require_outward(OutwardAction.PULL_REQUEST_MERGE, repository)
         if not self.token:
             raise RuntimeError("GitHub token is not configured")
         payload: dict[str, Any] = {"merge_method": merge_method}
@@ -595,6 +628,8 @@ class GitHubClient:
 
     async def enable_auto_merge(self, repository: str, pr_number: int, merge_method: str = "SQUASH") -> bool:
         """Enable GitHub auto-merge via GraphQL. Returns True on success."""
+        if self._outward_denied(OutwardAction.AUTO_MERGE_ENABLE, repository):
+            return False
         if not self.token:
             return False
         try:

@@ -2,10 +2,14 @@
 
 Cursor Forge delegated implementation to remote Cursor Cloud Agents. Droid
 Forge instead runs **local Droid sessions**: for every issue the client
-prepares a workspace clone of the target repository (with an authenticated
-push remote), opens a Droid session inside that clone, and streams the fix
-turn in a background asyncio task. The run registry keeps shutdown orderly
-and makes post-restart recovery possible via ``Session.resume``.
+prepares a workspace clone of the target repository (with a credential-free
+remote), opens a Droid session inside that clone, and streams the fix turn in
+a background asyncio task. The run registry keeps shutdown orderly and makes
+post-restart recovery possible via ``Session.resume``.
+
+Agent sessions and setup commands run with a clean, allowlisted environment
+(see ``app.agent_env``). Only app-owned Git operations receive the GitHub
+credential, transiently, and pushes are checked against outward-action policy.
 """
 
 from __future__ import annotations
@@ -13,26 +17,38 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-import os
 import re
 import shutil
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from droid_sdk import Autonomy, Session, SessionConfig, list_models
+from droid_sdk import Autonomy, Runtime, Session, SessionConfig, list_models
 
+from app.agent_env import agent_environment, close_runtime, git_environment, open_agent_runtime
 from app.config import get_settings
 from app.logging_conf import log_event
 from app.models import TaskStatus
+from app.policy import OutwardAction, outward_decision, privileged_setup_allowed
+from app.redaction import safe_error
 from app.repos import parse_repository_ref
 
 logger = logging.getLogger("app.droid")
 
-GIT_ENV = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+
+class SetupStatus:
+    """Outcome of the optional per-repository setup command."""
+
+    NOT_CONFIGURED = "not_configured"
+    DISABLED = "disabled_by_policy"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    TIMED_OUT = "timed_out"
+
 
 FIX_PROMPT_TEMPLATE = """You are working in a local clone of the repository: {repository_url}
-(checkout of ref "{starting_ref}"). The "origin" remote is already authenticated for pushes.
+(checkout of ref "{starting_ref}"). You have no credentials for pushing; the automation
+publishes your branch after the run if policy permits.
 
 Resolve the following GitHub issue (#{issue_number}):
 
@@ -45,7 +61,7 @@ Requirements:
 - Make only the requested changes described in the issue.
 - Create a new git branch for your work.
 - Run the project's test suite (or the closest relevant subset if the full suite is impractical) and fix any failures introduced by your changes.
-- Push your branch to the "origin" remote. Do NOT open a pull request; automation opens a same-repo pull request for you.
+- Commit your work on that branch. Do NOT push and do NOT open a pull request; automation publishes the branch and opens a same-repo pull request when permitted.
 - Do NOT rebase onto or push to any upstream / parent repository. If this repo is a fork, keep all branches inside the fork only.
 - End your final response with a line of the exact form `BRANCH: <your-branch-name>` followed by a short summary of the completed work.
 """
@@ -70,7 +86,7 @@ Follow-up instruction:
 
 Requirements:
 - Keep the existing branch / pull request when possible.
-- Push your updated branch to "origin" when done.
+- Commit your changes on the branch when done; automation publishes it when permitted.
 - Run relevant tests after changes.
 - End your final response with a line of the exact form `BRANCH: <your-branch-name>` and summarize what you changed.
 """
@@ -79,7 +95,7 @@ RECOVERY_PROMPT_TEMPLATE = """The automation service restarted while you were wo
 being resumed. Continue the task from where you left off.
 
 - If the work is already complete, restate your final summary.
-- Make sure your branch is pushed to the "origin" remote.
+- Make sure your work is committed on your branch; automation publishes it when permitted.
 - End your final response with a line of the exact form `BRANCH: <your-branch-name>` and a short summary.
 """
 
@@ -163,32 +179,53 @@ def review_workspace_dir(repository: str, review_id: int) -> Path:
     return workspace_root() / owner / repo / f"review-{review_id}"
 
 
-async def _git(args: list[str], *, cwd: Path | str | None = None, timeout: float = GIT_TIMEOUT_SECONDS) -> str:
-    """Run a git command, returning stdout. Raises DroidRunError on failure."""
+async def _git(
+    args: list[str],
+    *,
+    cwd: Path | str | None = None,
+    timeout: float = GIT_TIMEOUT_SECONDS,
+    credential_url: str | None = None,
+) -> str:
+    """Run an app-owned git command, returning stdout. Raises DroidRunError on failure.
+
+    With ``credential_url`` the configured GitHub token is supplied for that
+    URL only, through the child environment; it never appears in ``args``.
+    """
+    token = (get_settings().github_token or None) if credential_url else None
     proc = await asyncio.create_subprocess_exec(
         "git",
         *args,
         cwd=str(cwd) if cwd else None,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
-        env=GIT_ENV,
+        env=git_environment(token=token, credential_url=credential_url),
     )
     try:
         out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except TimeoutError:
         proc.kill()
-        raise DroidRunError(f"git {' '.join(args[:3])} … timed out after {timeout}s") from None
+        raise DroidRunError(safe_error(f"git {' '.join(args[:3])} … timed out after {timeout}s")) from None
     if proc.returncode != 0:
         detail = (err or b"").decode(errors="replace").strip()[:500]
-        raise DroidRunError(f"git {' '.join(args[:4])} failed (exit {proc.returncode}): {detail}")
+        raise DroidRunError(safe_error(f"git {' '.join(args[:4])} failed (exit {proc.returncode}): {detail}"))
     return out.decode(errors="replace").strip()
 
 
-def _remote_url(repository: str, token: str | None) -> str:
+def _remote_url(repository: str) -> str:
+    """Canonical credential-free HTTPS remote for ``repository``."""
     full_name = parse_repository_ref(repository) or repository
-    if token:
-        return f"https://x-access-token:{token}@github.com/{full_name}.git"
     return f"https://github.com/{full_name}.git"
+
+
+async def _ensure_commit_identity(ws: Path) -> None:
+    """Keep any configured Git identity; only fill in a fallback when none exists."""
+    try:
+        if await _git(["config", "--get", "user.email"], cwd=ws):
+            return
+    except DroidRunError:
+        pass
+    await _git(["config", "user.name", "Droid Forge"], cwd=ws)
+    await _git(["config", "user.email", "droid-forge@users.noreply.github.com"], cwd=ws)
 
 
 class DroidClient:
@@ -297,7 +334,19 @@ class DroidClient:
 
     # ---- workspaces ------------------------------------------------------
 
-    async def _run_setup_command(self, ws: Path, command: str) -> None:
+    async def _run_setup_command(self, ws: Path, command: str) -> str:
+        """Run a stored setup command only under explicit privileged-setup opt-in."""
+        if not command.strip():
+            return SetupStatus.NOT_CONFIGURED
+        if not privileged_setup_allowed():
+            log_event(
+                logger,
+                logging.WARNING,
+                "droid.setup_command_disabled",
+                workspace=str(ws),
+                reason="FORGE_ALLOW_PRIVILEGED_SETUP is false",
+            )
+            return SetupStatus.DISABLED
         proc = await asyncio.create_subprocess_exec(
             "/bin/sh",
             "-c",
@@ -305,7 +354,7 @@ class DroidClient:
             cwd=str(ws),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
-            env=GIT_ENV,
+            env=agent_environment(),
         )
         try:
             out, _ = await asyncio.wait_for(proc.communicate(), timeout=SETUP_TIMEOUT_SECONDS)
@@ -317,7 +366,7 @@ class DroidClient:
                 "droid.setup_command_timeout",
                 workspace=str(ws),
             )
-            return
+            return SetupStatus.TIMED_OUT
         if proc.returncode != 0:
             log_event(
                 logger,
@@ -327,6 +376,8 @@ class DroidClient:
                 exit_code=proc.returncode,
                 output=(out or b"").decode(errors="replace")[-500:],
             )
+            return SetupStatus.FAILED
+        return SetupStatus.SUCCEEDED
 
     async def prepare_fix_workspace(
         self,
@@ -336,33 +387,47 @@ class DroidClient:
         starting_ref: str | None,
         setup_command: str = "",
     ) -> Path:
-        """Clone/refresh the per-task workspace with an authenticated remote."""
-        settings = get_settings()
+        """Clone/refresh the per-task workspace with a credential-free remote."""
+        ws, _setup = await self.prepare_fix_workspace_with_setup(
+            repository=repository,
+            task_id=task_id,
+            starting_ref=starting_ref,
+            setup_command=setup_command,
+        )
+        return ws
+
+    async def prepare_fix_workspace_with_setup(
+        self,
+        *,
+        repository: str,
+        task_id: int,
+        starting_ref: str | None,
+        setup_command: str = "",
+    ) -> tuple[Path, str]:
+        """Prepare the workspace and report what happened to the setup command."""
         ws = task_workspace_dir(repository, task_id)
-        remote = _remote_url(repository, settings.github_token or None)
+        remote = _remote_url(repository)
         ws.parent.mkdir(parents=True, exist_ok=True)
 
         if (ws / ".git").exists():
-            # Reuse (restart recovery for the same task): keep agent state, only
-            # refresh the remote URL so a rotated token still works.
+            # Reuse (restart recovery for the same task): keep agent state, and
+            # reset the remote so a legacy token-bearing URL is scrubbed.
             await _git(["remote", "set-url", "origin", remote], cwd=ws)
         else:
             ref = (starting_ref or "").strip()
             try:
                 if ref:
-                    await _git(["clone", "--depth", "1", "--branch", ref, remote, str(ws)])
+                    await _git(["clone", "--depth", "1", "--branch", ref, remote, str(ws)], credential_url=remote)
                 else:
-                    await _git(["clone", "--depth", "1", remote, str(ws)])
+                    await _git(["clone", "--depth", "1", remote, str(ws)], credential_url=remote)
             except DroidRunError:
                 if not ws.exists() or not (ws / ".git").exists():
                     raise
                 # Clone partially succeeded (e.g. unknown ref); keep what we got.
-            await _git(["config", "user.name", "Droid Forge"], cwd=ws)
-            await _git(["config", "user.email", "droid-forge@users.noreply.github.com"], cwd=ws)
+        await _ensure_commit_identity(ws)
 
-        if (setup_command or "").strip():
-            await self._run_setup_command(ws, setup_command.strip())
-        return ws
+        setup = await self._run_setup_command(ws, (setup_command or "").strip())
+        return ws, setup
 
     async def prepare_review_workspace(
         self,
@@ -379,24 +444,22 @@ class DroidClient:
         (``--filter=blob:none``) full-history clone so the merge base exists,
         then fetch the PR head and a local base branch for diffing.
         """
-        settings = get_settings()
         ws = review_workspace_dir(repository, review_id)
-        remote = _remote_url(repository, settings.github_token or None)
+        remote = _remote_url(repository)
         ws.parent.mkdir(parents=True, exist_ok=True)
 
         if not (ws / ".git").exists():
-            await _git(["clone", "--filter=blob:none", remote, str(ws)])
-            await _git(["config", "user.name", "Droid Forge"], cwd=ws)
-            await _git(["config", "user.email", "droid-forge@users.noreply.github.com"], cwd=ws)
+            await _git(["clone", "--filter=blob:none", remote, str(ws)], credential_url=remote)
         else:
             await _git(["remote", "set-url", "origin", remote], cwd=ws)
-            await _git(["fetch", "--filter=blob:none", "--prune", "origin"], cwd=ws)
+            await _git(["fetch", "--filter=blob:none", "--prune", "origin"], cwd=ws, credential_url=remote)
 
         base = (base_ref or "").strip() or "main"
         branch = f"pr-{pr_number}"
         await _git(
             ["fetch", "--force", "origin", f"pull/{pr_number}/head:{branch}"],
             cwd=ws,
+            credential_url=remote,
         )
         await _git(["checkout", "-q", "--force", branch], cwd=ws)
 
@@ -407,7 +470,7 @@ class DroidClient:
             await _git(["rev-parse", "--verify", f"refs/heads/{base}"], cwd=ws)
         except DroidRunError:
             try:
-                await _git(["fetch", "origin", base], cwd=ws)
+                await _git(["fetch", "origin", base], cwd=ws, credential_url=remote)
                 await _git(["branch", base, f"origin/{base}"], cwd=ws)
             except DroidRunError as exc:
                 log_event(
@@ -430,16 +493,34 @@ class DroidClient:
         return branch or None
 
     async def ensure_branch_pushed(self, repository: str, task_id: int, branch: str) -> bool:
-        """Make sure the agent branch exists on origin; push it ourselves if not."""
+        """Push the workspace HEAD to ``branch`` on the canonical remote with the app's credential.
+
+        Pushing is an outward action: it requires GitHub writes, an allowed
+        repository and an allowed branch. The push targets the canonical URL,
+        not whatever ``origin`` the agent may have reconfigured.
+        """
+        decision = outward_decision(OutwardAction.BRANCH_PUSH, repository, ref=branch)
+        if not decision.allowed:
+            log_event(
+                logger,
+                logging.WARNING,
+                "policy.outward_denied",
+                action=OutwardAction.BRANCH_PUSH,
+                repo=repository,
+                ref=branch,
+                reason=decision.reason,
+            )
+            return False
         ws = task_workspace_dir(repository, task_id)
+        remote = _remote_url(repository)
         try:
-            remote_refs = await _git(["ls-remote", "origin", f"refs/heads/{branch}"], cwd=ws)
+            await _git(["remote", "set-url", "origin", remote], cwd=ws)
         except DroidRunError:
             return False
-        if remote_refs:
-            return True
         try:
-            await _git(["push", "origin", f"HEAD:refs/heads/{branch}"], cwd=ws)
+            # Always push (never force): agents commit locally only, so new
+            # follow-up commits on an existing branch also need publishing.
+            await _git(["push", remote, f"HEAD:refs/heads/{branch}"], cwd=ws, credential_url=remote)
             return True
         except DroidRunError as exc:
             log_event(
@@ -500,7 +581,7 @@ class DroidClient:
                 success=False,
                 subtype="error_during_execution",
                 text="",
-                error=str(exc),
+                error=safe_error(exc),
             )
         finally:
             with contextlib.suppress(Exception):
@@ -523,6 +604,30 @@ class DroidClient:
             except Exception:
                 logger.exception("droid.on_complete_failed session_id=%s", session_id)
         return outcome
+
+    async def _open_session(
+        self,
+        *,
+        cwd: Path,
+        resume_id: str | None = None,
+        model: str | None = None,
+        config: SessionConfig | None = None,
+        purpose: str = "session",
+    ) -> Session:
+        """Open a session whose droid process has the clean agent environment."""
+        runtime: Runtime | None = None
+        try:
+            runtime = await open_agent_runtime(cwd=cwd, api_key=self.api_key)
+            if resume_id:
+                session = Session.resume(resume_id, runtime=runtime, api_key=self.api_key)
+            else:
+                session = Session(cwd=str(cwd), model=model, config=config, runtime=runtime, api_key=self.api_key)
+            await session.open()
+        except Exception as exc:
+            with contextlib.suppress(Exception):
+                await close_runtime(runtime)
+            raise DroidRunError(safe_error(f"failed to open Droid {purpose}: {exc}")) from exc
+        return session
 
     def _spawn_turn(
         self,
@@ -558,23 +663,16 @@ class DroidClient:
         """
         if not self.configured:
             raise DroidRunError("Droid is not configured (FACTORY_API_KEY missing)")
-        ws = await self.prepare_fix_workspace(
+        ws, setup = await self.prepare_fix_workspace_with_setup(
             repository=repository,
             task_id=task_id,
             starting_ref=starting_ref,
             setup_command=setup_command,
         )
         prompt = build_fix_prompt(repository_url, issue_number, issue_title, issue_body, starting_ref or "")
-        session = Session(
-            cwd=str(ws),
-            model=model or self.model,
-            config=self._session_config(review=False),
-            api_key=self.api_key,
+        session = await self._open_session(
+            cwd=ws, model=model or self.model, config=self._session_config(review=False), purpose="session"
         )
-        try:
-            await session.open()
-        except Exception as exc:
-            raise DroidRunError(f"failed to open Droid session: {exc}") from exc
         session_id = self._spawn_turn(session, prompt, kind="fix", on_complete=on_complete)
         log_event(
             logger,
@@ -587,8 +685,9 @@ class DroidClient:
             workspace=str(ws),
             model=model or self.model,
             sdk="droid-sdk",
+            setup=setup,
         )
-        return {"session_id": session_id, "status": "running"}
+        return {"session_id": session_id, "status": "running", "setup": setup}
 
     async def start_review_run(
         self,
@@ -612,16 +711,9 @@ class DroidClient:
             base_ref=base_ref,
         )
         prompt = build_review_prompt(repository_url, pr_url, base_ref or "")
-        session = Session(
-            cwd=str(ws),
-            model=model or self.model,
-            config=self._session_config(review=True),
-            api_key=self.api_key,
+        session = await self._open_session(
+            cwd=ws, model=model or self.model, config=self._session_config(review=True), purpose="review session"
         )
-        try:
-            await session.open()
-        except Exception as exc:
-            raise DroidRunError(f"failed to open Droid review session: {exc}") from exc
         session_id = self._spawn_turn(session, prompt, kind="review", on_complete=on_complete)
         log_event(
             logger,
@@ -640,6 +732,7 @@ class DroidClient:
         session_id: str,
         instruction: str,
         *,
+        cwd: Path | None = None,
         on_complete: Callable[[dict[str, Any]], Any] | None = None,
     ) -> dict[str, Any]:
         """Resume a saved session and run a follow-up turn in the background."""
@@ -648,11 +741,9 @@ class DroidClient:
         if self.session_busy(session_id):
             raise DroidSessionBusyError("session already has a turn in flight")
         prompt = build_follow_up_prompt(instruction)
-        session = Session.resume(session_id, api_key=self.api_key)
-        try:
-            await session.open()
-        except Exception as exc:
-            raise DroidRunError(f"failed to resume session {session_id}: {exc}") from exc
+        session = await self._open_session(
+            cwd=cwd or workspace_root(), resume_id=session_id, purpose=f"session {session_id}"
+        )
         self._spawn_turn(session, prompt, kind="follow_up", on_complete=on_complete)
         log_event(logger, logging.INFO, "droid.follow_up_sent", session_id=session_id)
         return {"session_id": session_id, "status": "running"}
@@ -661,6 +752,7 @@ class DroidClient:
         self,
         session_id: str,
         *,
+        cwd: Path | None = None,
         on_complete: Callable[[dict[str, Any]], Any] | None = None,
     ) -> dict[str, Any]:
         """Resume a session orphaned by a service restart and nudge it forward."""
@@ -668,11 +760,9 @@ class DroidClient:
             raise DroidRunError("Droid is not configured (FACTORY_API_KEY missing)")
         if self.session_busy(session_id):
             return {"session_id": session_id, "status": "running"}
-        session = Session.resume(session_id, api_key=self.api_key)
-        try:
-            await session.open()
-        except Exception as exc:
-            raise DroidRunError(f"failed to resume session {session_id}: {exc}") from exc
+        session = await self._open_session(
+            cwd=cwd or workspace_root(), resume_id=session_id, purpose=f"session {session_id}"
+        )
         self._spawn_turn(session, RECOVERY_PROMPT_TEMPLATE, kind="recovery", on_complete=on_complete)
         log_event(logger, logging.INFO, "droid.session_recovered", session_id=session_id)
         return {"session_id": session_id, "status": "running"}
@@ -698,6 +788,7 @@ __all__ = [
     "DroidClient",
     "DroidRunError",
     "DroidSessionBusyError",
+    "SetupStatus",
     "build_fix_prompt",
     "build_follow_up_prompt",
     "build_review_prompt",

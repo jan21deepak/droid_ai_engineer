@@ -4,13 +4,26 @@ from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import Boolean, DateTime, Float, Integer, String, Text, UniqueConstraint
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, validates
 
+from app.redaction import redact_text, safe_error
 from app.timeutil import format_sgt, iso_sgt
 
 
 class Base(DeclarativeBase):
     pass
+
+
+class RedactedOutputMixin:
+    """Scrub credentials from agent/tool text before it is stored on a row."""
+
+    @validates("error")
+    def _redact_error(self, _key: str, value: str | None) -> str | None:
+        return safe_error(value) if value else value
+
+    @validates("summary")
+    def _redact_summary(self, _key: str, value: str | None) -> str | None:
+        return redact_text(value) if value else value
 
 
 class TaskStatus:
@@ -88,7 +101,7 @@ class SyncedIssue(Base):
         }
 
 
-class Task(Base):
+class Task(RedactedOutputMixin, Base):
     """One issue-fix run: a local Droid session in a workspace clone."""
 
     __tablename__ = "tasks"
@@ -129,7 +142,8 @@ class Task(Base):
             "pr_state": self.pr_state,
             "merged": self.pr_state == "merged",
             "pr_merged_at": iso_sgt(self.pr_merged_at),
-            "summary": self.summary,
+            "summary": redact_text(self.summary) if self.summary else self.summary,
+            "error": safe_error(self.error) if self.error else self.error,
             "factory_credits": self.factory_credits,
             "estimated_tokens": self.estimated_tokens,
             "cost_usd": self.cost_usd,
@@ -177,7 +191,7 @@ class SyncedPullRequest(Base):
         }
 
 
-class ReviewTask(Base):
+class ReviewTask(RedactedOutputMixin, Base):
     """Tracks a Droid review session against a pull request, including auto-merge."""
 
     __tablename__ = "review_tasks"
@@ -215,8 +229,8 @@ class ReviewTask(Base):
             "status": self.status,
             "merged": self.merged,
             "auto_merge_enabled": self.auto_merge_enabled,
-            "summary": self.summary,
-            "error": self.error,
+            "summary": redact_text(self.summary) if self.summary else self.summary,
+            "error": safe_error(self.error) if self.error else self.error,
             "factory_credits": self.factory_credits,
             "cost_usd": self.cost_usd,
             "created_at": iso_sgt(self.created_at),

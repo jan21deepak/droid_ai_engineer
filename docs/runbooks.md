@@ -20,8 +20,9 @@ operator-only `GET /api/health` (bearer or signed-in session), which reports
 
 1. `GITHUB_WEBHOOK_SECRET` in `.env` must exactly match the secret configured on
    the repo's webhook. Rotating one side without the other causes this.
-2. Re-register the webhook after fixing: `POST /api/webhooks/sync` (needs
-   `PUBLIC_BASE_URL` set).
+2. Update the secret on the webhook in the repository's GitHub settings. Forge
+   never installs or edits webhooks itself (`POST /api/webhooks/sync` is refused
+   by policy).
 
 ### Tasks stuck in RUNNING after a restart
 
@@ -36,10 +37,14 @@ automatically. If rows stay RUNNING for more than `DROID_TURN_TIMEOUT_SECONDS`
 ### PRs not being created despite completed fixes
 
 1. Check the task row's `error` on the dashboard.
-2. Verify `GITHUB_TOKEN` can open PRs on the target repo (same-repo PRs need
+2. Look for `policy.outward_denied` in logs. Publishing needs
+   `FORGE_ALLOW_GITHUB_WRITES=true`, the repository in `FORGE_ALLOWED_REPOSITORIES`
+   and the agent's branch in `FORGE_ALLOWED_BRANCHES`; otherwise the commit stays
+   local by design.
+3. Verify `GITHUB_TOKEN` can open PRs on the target repo (same-repo PRs need
    `contents: write` + `pull requests: write`).
-3. Look for `polling.pr_fallback_error` in logs — the agent may have pushed a
-   branch but forge could not open the PR.
+4. Look for `droid.branch_push_failed` / `polling.pr_fallback_error` in logs:
+   forge's own push failed, or the branch was pushed but the PR could not be opened.
 
 ### Review posts fail with 403 on GitHub
 

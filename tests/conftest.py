@@ -34,6 +34,10 @@ def _reset_access_env() -> None:
     os.environ["FORGE_OPERATOR_TOKEN"] = ""
     os.environ["FORGE_TRUSTED_HOSTS"] = "testserver,test,127.0.0.1,localhost"
     os.environ["FORGE_ALLOWED_REPOSITORIES"] = ""
+    # Outward-action policy defaults: no GitHub writes, no branches, no setup.
+    os.environ["FORGE_ALLOWED_BRANCHES"] = ""
+    os.environ["FORGE_ALLOW_GITHUB_WRITES"] = "false"
+    os.environ["FORGE_ALLOW_PRIVILEGED_SETUP"] = "false"
     os.environ["FORGE_COOKIE_SECURE"] = "auto"
     os.environ.pop("FORGE_SESSION_TTL_SECONDS", None)
     os.environ["PUBLIC_BASE_URL"] = ""

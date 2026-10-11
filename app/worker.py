@@ -4,11 +4,14 @@ Cursor Forge polled a remote API for agent status. Droid Forge sessions run
 locally and finish in background asyncio tasks, so completion is event-driven:
 ``launch_fix_task`` / ``launch_review_task`` start a run and hand the turn
 outcome to ``finalize_fix_task`` / ``finalize_review_task``. The worker loop
-now only reconciles GitHub-side state (PR open/merged, auto-merge).
+(``app.reconcile``) only reconciles GitHub-side state.
+
+Every launch, finalization, review and recovery step re-checks repository and
+outward-action policy (``app.policy``) before any Git or GitHub call, so stored
+work cannot bypass the current configuration.
 """
 
 import asyncio
-import contextlib
 import logging
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
@@ -26,16 +29,59 @@ from app.droid_client import (
     extract_verdict,
     get_droid_client,
     map_outcome_status,
+    review_workspace_dir,
+    task_workspace_dir,
 )
 from app.github import GitHubClient
 from app.logging_conf import log_event
 from app.models import ReviewTask, Task, TaskStatus
+from app.policy import OutwardAction, PolicyDecision, outward_decision, repository_decision
+from app.reconcile import (
+    attempt_auto_merge,
+    finalize_merged_running_tasks,
+    parse_pr_number,
+    poll_github_state,
+    refresh_pr_states,
+    worker_loop,
+)
+from app.redaction import safe_error
 from app.repos import resolve_agent_launch_config
 from app.timeutil import format_sgt
+
+__all__ = [
+    "finalize_merged_running_tasks",
+    "parse_pr_number",
+    "poll_github_state",
+    "refresh_pr_states",
+    "worker_loop",
+]
 
 logger = logging.getLogger("app.worker")
 
 REVIEW_BODY_LIMIT = 60_000
+# Pseudo-action for read/work access to a repository (no GitHub write).
+REPOSITORY_ACCESS = "repository_access"
+
+
+def _policy_denied(action: str, repository: str, *, ref: str | None = None, **ctx: Any) -> PolicyDecision | None:
+    """Check an outward action (or plain repository access) and log a denial."""
+    if action == REPOSITORY_ACCESS:
+        decision = repository_decision(repository)
+    else:
+        decision = outward_decision(action, repository, ref=ref)
+    if decision.allowed:
+        return None
+    log_event(
+        logger,
+        logging.WARNING,
+        "policy.outward_denied",
+        action=action,
+        repo=repository,
+        ref=ref,
+        reason=decision.reason,
+        **ctx,
+    )
+    return decision
 
 
 def _format_runtime(seconds: float | None) -> str:
@@ -59,16 +105,6 @@ def build_completion_comment(task: Task) -> str:
         f"- **Completed at:** {format_sgt(task.completed_at) or 'n/a'}\n\n"
         f"**Summary of changes:**\n\n{task.summary or 'No summary available.'}"
     )
-
-
-def _parse_pr_number(pr_url: str) -> int | None:
-    try:
-        parts = pr_url.rstrip("/").split("/")
-        if "pull" in parts:
-            return int(parts[parts.index("pull") + 1])
-    except (ValueError, IndexError):
-        return None
-    return None
 
 
 def _persist_task_pr_url(task_id: int, pr_url: str) -> None:
@@ -98,6 +134,14 @@ async def launch_fix_task(
     issue_body: str,
 ) -> None:
     """Background launcher: prepare the workspace and start the Droid fix session."""
+    denied = _policy_denied(REPOSITORY_ACCESS, repository, task_id=task_id)
+    if denied is not None:
+        with db_session() as session:
+            db_task = session.get(Task, task_id)
+            if db_task is not None:
+                db_task.status = TaskStatus.FAILED
+                db_task.error = f"blocked by repository policy: {denied.reason}"
+        return
     droid = get_droid_client()
     launch = resolve_agent_launch_config(repository=repository, repository_url=repository_url)
     try:
@@ -118,7 +162,7 @@ async def launch_fix_task(
             db_task = session.get(Task, task_id)
             if db_task is not None:
                 db_task.status = TaskStatus.FAILED
-                db_task.error = f"Droid session failed to start: {exc}"
+                db_task.error = f"Droid session failed to start: {safe_error(exc)}"
         log_event(
             logger,
             logging.ERROR,
@@ -145,6 +189,7 @@ async def launch_fix_task(
         repository=repository,
         issue=issue_number,
         model=launch.get("model") or get_settings().droid_model,
+        setup=result.get("setup"),
     )
 
 
@@ -154,6 +199,18 @@ def spawn_fix_launch(task_id: int, **launch_kwargs: Any) -> asyncio.Task[None]:
     task = asyncio.create_task(launch_fix_task(task_id, **launch_kwargs))
     droid.track(f"launch:task-{task_id}", task)
     return task
+
+
+async def _pull_request_base(task: Task, github: GitHubClient) -> str:
+    launch = resolve_agent_launch_config(repository=task.repository, repository_url=task.repository_url)
+    base = launch.get("starting_ref")
+    if base:
+        return base
+    try:
+        meta = await github.get_repository(task.repository)
+        return str(meta.get("default_branch") or "main")
+    except Exception:
+        return "main"
 
 
 async def ensure_pull_request_for_task(
@@ -170,6 +227,8 @@ async def ensure_pull_request_for_task(
     if task.pull_request_url:
         return task.pull_request_url
     if not branch:
+        return None
+    if _policy_denied(OutwardAction.PULL_REQUEST_CREATE, task.repository, ref=branch, task_id=task.id):
         return None
 
     repository = task.repository
@@ -188,15 +247,7 @@ async def ensure_pull_request_for_task(
         _persist_task_pr_url(task.id, html_url)
         return html_url
 
-    launch = resolve_agent_launch_config(repository=repository, repository_url=task.repository_url)
-    base = launch.get("starting_ref")
-    if not base:
-        try:
-            meta = await github.get_repository(repository)
-            base = meta.get("default_branch") or "main"
-        except Exception:
-            base = "main"
-
+    base = await _pull_request_base(task, github)
     title = task.issue_title or f"Fix #{task.issue_number}"
     if task.issue_number and f"#{task.issue_number}" not in title:
         title = f"{title} (#{task.issue_number})"
@@ -280,13 +331,18 @@ def _apply_outcome_to_task(task: Task | ReviewTask, outcome: dict[str, Any], sta
         task.completed_at = datetime.now(UTC)
 
 
-async def _resolve_pr_url(task: Task, summary: str | None, droid: DroidClient, github: GitHubClient) -> str | None:
-    """Best-effort fallback: ensure the agent's branch is pushed and a PR exists."""
+async def _publish_task_branch(task: Task, summary: str | None, droid: DroidClient) -> str | None:
+    """Push the agent's branch with the app's credential; agents cannot push themselves.
+
+    Returns the branch once it is published, else ``None`` (policy denied or push failed).
+    """
     branch = extract_branch_name(summary) or await droid.current_branch(task.repository, task.id)
     if not branch:
         return None
+    if _policy_denied(OutwardAction.BRANCH_PUSH, task.repository, ref=branch, task_id=task.id):
+        return None
     try:
-        await droid.ensure_branch_pushed(task.repository, task.id, branch)
+        pushed = await droid.ensure_branch_pushed(task.repository, task.id, branch)
     except DroidRunError as exc:
         log_event(
             logger,
@@ -296,6 +352,14 @@ async def _resolve_pr_url(task: Task, summary: str | None, droid: DroidClient, g
             branch=branch,
             error=str(exc),
         )
+        return None
+    return branch if pushed else None
+
+
+async def _resolve_pr_url(task: Task, branch: str | None, github: GitHubClient) -> str | None:
+    """Best-effort fallback: open the PR for a published branch."""
+    if not branch:
+        return None
     try:
         return await ensure_pull_request_for_task(task, branch, github)
     except Exception as exc:
@@ -356,20 +420,24 @@ async def finalize_fix_task(task_id: int, outcome: dict[str, Any]) -> None:
         runtime_seconds=refreshed.duration_seconds,
     )
 
-    pr_url = refreshed.pull_request_url or await _resolve_pr_url(refreshed, summary, droid, github)
+    if _policy_denied(REPOSITORY_ACCESS, refreshed.repository, task_id=task_id):
+        return
+    branch = await _publish_task_branch(refreshed, summary, droid)
+    pr_url = refreshed.pull_request_url or await _resolve_pr_url(refreshed, branch, github)
     # Keep the completion comment accurate: the PR may have just been created
     # above, and `refreshed` is a detached snapshot that does not see it.
     if pr_url and not refreshed.pull_request_url:
         refreshed.pull_request_url = pr_url
 
-    await github.post_issue_comment(
-        refreshed.repository,
-        refreshed.issue_number,
-        build_completion_comment(refreshed),
-    )
+    if not _policy_denied(OutwardAction.ISSUE_COMMENT, refreshed.repository, task_id=task_id):
+        await github.post_issue_comment(
+            refreshed.repository,
+            refreshed.issue_number,
+            build_completion_comment(refreshed),
+        )
 
     if pr_url:
-        pr_number = _parse_pr_number(pr_url)
+        pr_number = parse_pr_number(pr_url)
         if pr_number:
             await start_pr_review(
                 repository=refreshed.repository,
@@ -442,6 +510,8 @@ async def start_pr_review(
     pr_title: str = "",
 ) -> dict[str, Any]:
     """Ensure a review row exists and launch a Droid review session (non-blocking)."""
+    if _policy_denied(REPOSITORY_ACCESS, repository, pr=pr_number):
+        return {"review_id": None, "started": False, "detail": "repository_not_allowed"}
     review_id, _created = ensure_review_task_row(
         repository=repository,
         repository_url=repository_url,
@@ -482,6 +552,10 @@ async def launch_review_task(
     pr_url: str,
 ) -> None:
     """Background launcher for the Droid PR review session."""
+    denied = _policy_denied(REPOSITORY_ACCESS, repository, review_id=review_id)
+    if denied is not None:
+        _mark_row_failed(ReviewTask, review_id, f"blocked by repository policy: {denied.reason}", stamp_completed=True)
+        return
     droid = get_droid_client()
     launch = resolve_agent_launch_config(repository=repository, repository_url=repository_url)
     base_ref = launch.get("starting_ref")
@@ -508,7 +582,7 @@ async def launch_review_task(
             review = session.get(ReviewTask, review_id)
             if review is not None:
                 review.status = TaskStatus.FAILED
-                review.error = f"Droid review session failed to start: {exc}"
+                review.error = f"Droid review session failed to start: {safe_error(exc)}"
                 review.completed_at = datetime.now(UTC)
         log_event(
             logger,
@@ -543,6 +617,8 @@ async def _post_review_verdict(github: GitHubClient, review: ReviewTask, body: s
 
     Returns ``(posted, event)``.
     """
+    if _policy_denied(OutwardAction.PULL_REQUEST_REVIEW, review.repository, review_id=review.id):
+        return False, event
     try:
         await github.create_pull_request_review(review.repository, review.pr_number, body, event=event)
         return True, event
@@ -631,7 +707,7 @@ async def finalize_review_task(review_id: int, outcome: dict[str, Any]) -> None:
     )
 
     if settings.review_auto_merge and event == "APPROVE":
-        merged, auto_merge, error = await _attempt_auto_merge(github, refreshed)
+        merged, auto_merge, error = await attempt_auto_merge(github, refreshed)
         if error and not merged and not auto_merge:
             log_event(
                 logger,
@@ -646,196 +722,6 @@ async def finalize_review_task(review_id: int, outcome: dict[str, Any]) -> None:
                 if db_review is not None:
                     db_review.merged = merged or db_review.merged
                     db_review.auto_merge_enabled = auto_merge
-
-
-# ---------------------------------------------------------------------------
-# GitHub state reconciliation (worker loop)
-# ---------------------------------------------------------------------------
-
-
-async def refresh_pr_states(github: GitHubClient, tasks: list[Task]) -> int:
-    """Sync each Droid-opened PR's open/closed/merged state from GitHub."""
-    updated = 0
-    for task in tasks:
-        if task.pr_state == "merged":
-            continue
-        pr_number = _parse_pr_number(task.pull_request_url or "")
-        if not pr_number:
-            continue
-        try:
-            pr = await github.get_pull_request(task.repository, pr_number)
-        except httpx.HTTPError as exc:
-            log_event(
-                logger,
-                logging.WARNING,
-                "pr.state_refresh_failed",
-                task_id=task.id,
-                pr=task.pull_request_url,
-                error=str(exc),
-            )
-            continue
-
-        merged_at = _parse_iso(pr.get("merged_at"))
-        if pr.get("merged") or merged_at:
-            state = "merged"
-        elif pr.get("state") == "closed":
-            state = "closed"
-        else:
-            state = "open"
-        if state == task.pr_state:
-            continue
-
-        with db_session() as session:
-            db_task = session.get(Task, task.id)
-            assert db_task is not None
-            db_task.pr_state = state
-            db_task.pr_merged_at = merged_at
-            if state == "merged" and db_task.status in TaskStatus.ACTIVE:
-                db_task.status = TaskStatus.COMPLETED
-                if not db_task.completed_at:
-                    db_task.completed_at = datetime.now(UTC)
-        updated += 1
-        log_event(
-            logger,
-            logging.INFO,
-            "pr.state_changed",
-            task_id=task.id,
-            pr=task.pull_request_url,
-            state=state,
-        )
-    return updated
-
-
-def _parse_iso(value: str | None) -> datetime | None:
-    if not value:
-        return None
-    try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-
-
-async def finalize_merged_running_tasks() -> int:
-    """Complete any still-active fix tasks whose PR is already known merged."""
-    updated = 0
-    with db_session() as session:
-        stuck = (
-            session.query(Task)
-            .filter(
-                Task.status.in_(TaskStatus.ACTIVE),
-                Task.pr_state == "merged",
-            )
-            .all()
-        )
-        for task in stuck:
-            task.status = TaskStatus.COMPLETED
-            if not task.completed_at:
-                task.completed_at = datetime.now(UTC)
-            updated += 1
-            log_event(
-                logger,
-                logging.INFO,
-                "task.completed_via_merged_pr",
-                task_id=task.id,
-                pr=task.pull_request_url,
-            )
-    return updated
-
-
-async def _attempt_auto_merge(github: GitHubClient, review: ReviewTask) -> tuple[bool, bool, str | None]:
-    """Try to merge immediately; fall back to enabling GitHub auto-merge.
-
-    No-op when ``Settings.review_auto_merge`` is False (default) so humans can
-    review before merge.
-    """
-    if not get_settings().review_auto_merge:
-        return False, False, None
-    try:
-        await github.merge_pull_request(
-            review.repository,
-            review.pr_number,
-            merge_method="squash",
-            commit_title=f"{review.pr_title} (#{review.pr_number})",
-        )
-        return True, False, None
-    except httpx.HTTPStatusError as exc:
-        detail = ""
-        try:
-            detail = exc.response.json().get("message") or ""
-        except Exception:
-            detail = str(exc)
-        if exc.response.status_code in (405, 409, 422):
-            enabled = await github.enable_auto_merge(review.repository, review.pr_number)
-            if enabled:
-                return False, True, None
-            return False, False, detail or "merge blocked and auto-merge unavailable"
-        return False, False, detail or str(exc)
-    except (httpx.HTTPError, RuntimeError) as exc:
-        return False, False, str(exc)
-
-
-async def poll_github_state(github: GitHubClient | None = None) -> int:
-    """One reconciliation pass over GitHub-side PR / merge state."""
-    github = github or GitHubClient()
-    updated = 0
-
-    with db_session() as session:
-        tasks_with_pr = session.query(Task).filter(Task.pull_request_url.isnot(None)).all()
-    updated += await refresh_pr_states(github, tasks_with_pr)
-    updated += await finalize_merged_running_tasks()
-
-    settings = get_settings()
-    with db_session() as session:
-        pending = (
-            session.query(ReviewTask)
-            .filter(ReviewTask.status == TaskStatus.COMPLETED, ReviewTask.merged.is_(False))
-            .all()
-        )
-
-    for review in pending:
-        try:
-            pr = await github.get_pull_request(review.repository, review.pr_number)
-        except httpx.HTTPError as exc:
-            log_event(
-                logger,
-                logging.WARNING,
-                "review.merge_poll_error",
-                review_id=review.id,
-                error=str(exc),
-            )
-            continue
-        if pr.get("merged") or (pr.get("state") == "closed" and pr.get("merged_at")):
-            with db_session() as session:
-                db_review = session.get(ReviewTask, review.id)
-                assert db_review is not None
-                db_review.merged = True
-                if not db_review.completed_at:
-                    db_review.completed_at = datetime.now(UTC)
-            updated += 1
-            log_event(
-                logger,
-                logging.INFO,
-                "review.auto_merged",
-                review_id=review.id,
-                pr=review.pr_url,
-            )
-        elif pr.get("state") == "closed" and not pr.get("merged"):
-            continue
-        elif settings.review_auto_merge:
-            merged, auto_merge, _ = await _attempt_auto_merge(github, review)
-            if merged or auto_merge:
-                with db_session() as session:
-                    db_review = session.get(ReviewTask, review.id)
-                    assert db_review is not None
-                    if merged:
-                        db_review.merged = True
-                        if not db_review.completed_at:
-                            db_review.completed_at = datetime.now(UTC)
-                    if auto_merge:
-                        db_review.auto_merge_enabled = True
-                updated += 1
-
-    return updated
 
 
 # ---------------------------------------------------------------------------
@@ -856,10 +742,26 @@ def _mark_row_failed[TaskOrReviewRow: Task | ReviewTask](
                 row.completed_at = datetime.now(UTC)
 
 
+def _fail_rows_outside_policy(
+    model: type[Task] | type[ReviewTask],
+    snapshots: list[tuple[int, str | None, str]],
+    *,
+    stamp_completed: bool,
+    id_key: str,
+) -> None:
+    for row_id, _session_id, repository in snapshots:
+        denied = _policy_denied(REPOSITORY_ACCESS, repository, row=f"{id_key}={row_id}")
+        if denied is not None:
+            _mark_row_failed(
+                model, row_id, f"blocked by repository policy: {denied.reason}", stamp_completed=stamp_completed
+            )
+
+
 async def _resume_orphaned_row[TaskOrReviewRow: Task | ReviewTask](
     model: type[TaskOrReviewRow],
     row_id: int,
     session_id: str | None,
+    repository: str,
     droid: DroidClient,
     finalize: Callable[[int, dict[str, Any]], Awaitable[None]],
     *,
@@ -870,17 +772,24 @@ async def _resume_orphaned_row[TaskOrReviewRow: Task | ReviewTask](
 
     Returns 1 when the row was resumed, 0 when it was marked failed.
     """
+    denied = _policy_denied(REPOSITORY_ACCESS, repository, row=f"{id_key}={row_id}")
+    if denied is not None:
+        _mark_row_failed(
+            model, row_id, f"blocked by repository policy: {denied.reason}", stamp_completed=stamp_completed
+        )
+        return 0
     if not session_id:
         _mark_row_failed(model, row_id, "dispatch interrupted by service restart", stamp_completed=stamp_completed)
         log_event(logger, logging.WARNING, "recovery.dispatch_lost", **{id_key: row_id})
         return 0
     try:
-        await droid.resume_interrupted(session_id, on_complete=partial(finalize, row_id))
+        cwd = task_workspace_dir(repository, row_id) if model is Task else review_workspace_dir(repository, row_id)
+        await droid.resume_interrupted(session_id, cwd=cwd, on_complete=partial(finalize, row_id))
     except Exception as exc:
         _mark_row_failed(
             model,
             row_id,
-            f"session lost after service restart: {exc}",
+            f"session lost after service restart: {safe_error(exc)}",
             stamp_completed=stamp_completed,
         )
         log_event(
@@ -907,36 +816,43 @@ async def recover_interrupted_tasks(droid: DroidClient | None = None) -> int:
     session (dispatch interrupted) are marked failed.
     """
     droid = droid or get_droid_client()
-    if not droid.configured:
-        return 0
 
     with db_session() as session:
         fix_rows = session.query(Task).filter(Task.status.in_(TaskStatus.ACTIVE)).all()
-        fix_snapshots = [(t.id, t.droid_session_id) for t in fix_rows]
+        fix_snapshots = [(t.id, t.droid_session_id, t.repository) for t in fix_rows]
         review_rows = session.query(ReviewTask).filter(ReviewTask.status.in_(TaskStatus.ACTIVE)).all()
-        review_snapshots = [(r.id, r.droid_session_id) for r in review_rows]
+        review_snapshots = [(r.id, r.droid_session_id, r.repository) for r in review_rows]
+
+    if not droid.configured:
+        # Nothing can be resumed, but stored work outside current policy is
+        # still refused visibly rather than left looking active.
+        _fail_rows_outside_policy(Task, fix_snapshots, stamp_completed=False, id_key="task_id")
+        _fail_rows_outside_policy(ReviewTask, review_snapshots, stamp_completed=True, id_key="review_id")
+        return 0
 
     recovered = 0
-    for task_id, session_id in fix_snapshots:
+    for task_id, session_id, repository in fix_snapshots:
         if session_id and session_id in droid.active_sessions:
             continue
         recovered += await _resume_orphaned_row(
             Task,
             task_id,
             session_id,
+            repository,
             droid,
             finalize_fix_task,
             stamp_completed=False,
             id_key="task_id",
         )
 
-    for review_id, session_id in review_snapshots:
+    for review_id, session_id, repository in review_snapshots:
         if session_id and session_id in droid.active_sessions:
             continue
         recovered += await _resume_orphaned_row(
             ReviewTask,
             review_id,
             session_id,
+            repository,
             droid,
             finalize_review_task,
             stamp_completed=True,
@@ -953,17 +869,3 @@ async def recover_interrupted_tasks(droid: DroidClient | None = None) -> int:
             reviews=len(review_snapshots),
         )
     return recovered
-
-
-async def worker_loop(stop_event: asyncio.Event) -> None:
-    settings = get_settings()
-    interval = settings.poll_interval_seconds
-    log_event(logger, logging.INFO, "worker.started", interval_seconds=interval)
-    while not stop_event.is_set():
-        try:
-            await poll_github_state()
-        except Exception as exc:
-            log_event(logger, logging.ERROR, "worker.iteration_error", error=str(exc))
-        with contextlib.suppress(TimeoutError):
-            await asyncio.wait_for(stop_event.wait(), timeout=interval)
-    log_event(logger, logging.INFO, "worker.stopped")

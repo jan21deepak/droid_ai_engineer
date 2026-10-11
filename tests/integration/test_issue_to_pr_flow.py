@@ -134,6 +134,9 @@ def flow(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     monkeypatch.setenv("FORGE_ACCESS_MODE", "protected")
     monkeypatch.setenv("FORGE_OPERATOR_TOKEN", "integration-operator-token-0123456789abcdef")
     monkeypatch.setenv("FORGE_ALLOWED_REPOSITORIES", "jan21deepak/superset")
+    # This end-to-end path exercises publication, so it opts in explicitly.
+    monkeypatch.setenv("FORGE_ALLOW_GITHUB_WRITES", "true")
+    monkeypatch.setenv("FORGE_ALLOWED_BRANCHES", "droid/fix-legend-7")
     get_settings.cache_clear()
     with db_session() as session:
         session.add(Repository(full_name="jan21deepak/superset", url="https://github.com/jan21deepak/superset"))

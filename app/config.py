@@ -76,6 +76,14 @@ class Settings(BaseSettings):
     forge_cookie_secure: str = "auto"
     # Comma-separated owner/repo slugs approved for intake and automation.
     forge_allowed_repositories: str = ""
+    # Comma-separated branch names the app may push to or open PRs from.
+    # Empty approves nothing in protected mode (any branch in local_dev).
+    forge_allowed_branches: str = ""
+    # Master switch for every GitHub write (comments, labels, issues, PRs,
+    # reviews, pushes). Off by default so nothing is published unapproved.
+    forge_allow_github_writes: bool = False
+    # Stored per-repository setup commands only execute with this opt-in.
+    forge_allow_privileged_setup: bool = False
 
     # ROI / productivity assumptions (leadership dashboard)
     junior_swe_annual_cost_usd: float = 150_000.0

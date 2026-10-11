@@ -6,6 +6,7 @@ import httpx
 import pytest
 
 from app import worker
+from app.config import get_settings
 from app.database import db_session
 from app.models import ReviewTask, Task, TaskStatus
 
@@ -80,9 +81,16 @@ class StubDroid:
         self.pushed.append(branch)
         return True
 
-    async def resume_interrupted(self, session_id, *, on_complete=None):
+    async def resume_interrupted(self, session_id, *, cwd=None, on_complete=None):
         self.resumed.append(session_id)
         return {"session_id": session_id, "status": "running"}
+
+
+@pytest.fixture
+def github_writes(monkeypatch):
+    """Opt in to GitHub writes for legacy publication-path tests."""
+    monkeypatch.setenv("FORGE_ALLOW_GITHUB_WRITES", "true")
+    get_settings.cache_clear()
 
 
 def add_task(**overrides):
@@ -132,7 +140,7 @@ def failure_outcome(error="droid crashed"):
 
 
 @pytest.mark.asyncio
-async def test_finalize_fix_task_success_opens_pr_comments_and_starts_review(client, monkeypatch):
+async def test_finalize_fix_task_success_opens_pr_comments_and_starts_review(client, monkeypatch, github_writes):
     task_id = add_task()
     github = StubGitHub()
     droid = StubDroid()
@@ -230,7 +238,7 @@ def test_ensure_review_task_row_dedupes_active():
 
 
 @pytest.mark.asyncio
-async def test_finalize_review_task_posts_github_review_with_verdict(client, monkeypatch):
+async def test_finalize_review_task_posts_github_review_with_verdict(client, monkeypatch, github_writes):
     with db_session() as session:
         review = ReviewTask(
             repository="jan21deepak/omnigent",
@@ -272,7 +280,7 @@ async def test_finalize_review_task_posts_github_review_with_verdict(client, mon
 
 
 @pytest.mark.asyncio
-async def test_finalize_review_task_falls_back_to_comment_event(client, monkeypatch):
+async def test_finalize_review_task_falls_back_to_comment_event(client, monkeypatch, github_writes):
     with db_session() as session:
         review = ReviewTask(
             repository="jan21deepak/omnigent",

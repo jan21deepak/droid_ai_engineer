@@ -65,8 +65,9 @@ class FakeSession:
 
     counter = 0
 
-    def __init__(self, *, cwd=None, model=None, config=None, api_key=None):
+    def __init__(self, *, cwd=None, model=None, config=None, runtime=None, api_key=None):
         FakeSession.counter += 1
+        self.runtime = runtime
         self.cwd = cwd
         self.model = model
         self.config = config
@@ -92,6 +93,16 @@ class FakeSession:
     def stream(self, prompt, *, timeout=None, **kwargs):
         self.stream_calls.append(prompt)
         return FakeStream(self.next_result)
+
+
+@pytest.fixture(autouse=True)
+def no_real_droid_process(monkeypatch):
+    """Unit tests never spawn droid; the clean-env launcher is tested in test_agent_env.py."""
+
+    async def fake_runtime(*, cwd, api_key):
+        return droid_client.Runtime()
+
+    monkeypatch.setattr(droid_client, "open_agent_runtime", fake_runtime)
 
 
 class TestPrompts:
@@ -180,7 +191,7 @@ class TestWorkspaces:
         bare = make_bare_repo(tmp_path)
         monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path / "ws"))
         get_settings.cache_clear()
-        monkeypatch.setattr(droid_client, "_remote_url", lambda repository, token: str(bare))
+        monkeypatch.setattr(droid_client, "_remote_url", lambda repository: str(bare))
 
         client = DroidClient(api_key="fk_test")
         ws = await client.prepare_fix_workspace(repository="jan21deepak/demo", task_id=5, starting_ref="main")
@@ -196,8 +207,9 @@ class TestWorkspaces:
     async def test_prepare_fix_workspace_runs_setup_command(self, tmp_path, monkeypatch):
         bare = make_bare_repo(tmp_path)
         monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path / "ws"))
+        monkeypatch.setenv("FORGE_ALLOW_PRIVILEGED_SETUP", "true")
         get_settings.cache_clear()
-        monkeypatch.setattr(droid_client, "_remote_url", lambda repository, token: str(bare))
+        monkeypatch.setattr(droid_client, "_remote_url", lambda repository: str(bare))
 
         client = DroidClient(api_key="fk_test")
         ws = await client.prepare_fix_workspace(
@@ -227,7 +239,7 @@ class TestWorkspaces:
 
         monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path / "ws"))
         get_settings.cache_clear()
-        monkeypatch.setattr(droid_client, "_remote_url", lambda repository, token: str(bare))
+        monkeypatch.setattr(droid_client, "_remote_url", lambda repository: str(bare))
 
         client = DroidClient(api_key="fk_test")
         ws = await client.prepare_review_workspace(
@@ -298,8 +310,8 @@ class TestClient:
         monkeypatch.setattr(droid_client, "Session", FakeSession)
         monkeypatch.setattr(
             DroidClient,
-            "prepare_fix_workspace",
-            lambda self, **kwargs: asyncio.sleep(0, result=Path("/tmp/ws-demo")),
+            "prepare_fix_workspace_with_setup",
+            lambda self, **kwargs: asyncio.sleep(0, result=(Path("/tmp/ws-demo"), "not_configured")),
         )
         outcomes = []
 
@@ -369,8 +381,8 @@ class TestClient:
         monkeypatch.setattr(droid_client, "Session", FakeSession)
         monkeypatch.setattr(
             DroidClient,
-            "prepare_fix_workspace",
-            lambda self, **kwargs: asyncio.sleep(0, result=Path("/tmp/ws-demo")),
+            "prepare_fix_workspace_with_setup",
+            lambda self, **kwargs: asyncio.sleep(0, result=(Path("/tmp/ws-demo"), "not_configured")),
         )
         client = DroidClient(api_key="fk_test")
         await client.start_fix_run(

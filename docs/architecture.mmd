@@ -2,9 +2,9 @@ flowchart LR
     ISSUE["GitHub Issue<br/>labeled Droid-complete"]
     WEBHOOK["Droid Forge FastAPI<br/>POST /webhook / Assign"]
     DB[("SQLite<br/>Task + Repo store<br/>per-repo model + setup cmd")]
-    WS["Workspace Clones<br/>token-authenticated origin"]
-    SDK["droid-sdk Sessions<br/>autonomy HIGH"]
-    FIX["Droid Fix Agent<br/>code, test, push branch"]
+    WS["Workspace Clones<br/>credential-free origin"]
+    SDK["droid-sdk Sessions<br/>clean environment"]
+    FIX["Droid Fix Agent<br/>code, test, commit branch"]
     PR["Same-repo Pull Request<br/>via GitHub PAT"]
     REVIEW["Droid Review Session<br/>on PR head branch"]
     PRREVIEW["GitHub PR Review<br/>approve / request changes"]
@@ -19,7 +19,7 @@ flowchart LR
     WEBHOOK -->|"launch background task"| SDK
     WS -->|"session cwd"| SDK
     SDK --> FIX
-    FIX -->|"BRANCH: pushed"| PR
+    FIX -->|"app push if policy permits"| PR
     PR --> REVIEW
     REVIEW -->|"verdict"| PRREVIEW
     FIX -->|"summary, duration, credits"| COMMENT

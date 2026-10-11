@@ -128,13 +128,16 @@ TRIGGER_LABEL=Droid-complete
 FORGE_ACCESS_MODE=protected
 FORGE_OPERATOR_TOKEN=<at-least-32-random-characters>
 FORGE_ALLOWED_REPOSITORIES=<owner>/<repo>
+FORGE_ALLOWED_BRANCHES=<branch-the-app-may-publish>
+FORGE_ALLOW_GITHUB_WRITES=false   # set true only when GitHub writes are approved
+FORGE_ALLOW_PRIVILEGED_SETUP=false
 ```
 
 Generate the operator token locally and keep it out of commits, logs and
 screenshots, e.g. `python3 -c 'import secrets; print(secrets.token_urlsafe(36))'`.
 See [Operator access](#operator-access) for the full access model.
 
-Optional: `DROID_MODEL` (default `auto` = Factory Router), `DROID_AUTONOMY` (default `high`, needed for git push), `DROID_REVIEW_AUTONOMY` (default `high`, review sessions), `DROID_USD_PER_AGENT_RUN` for ROI estimates, `DROID_TURN_TIMEOUT_SECONDS` (default 3600) for the per-turn wall-clock budget.
+Optional: `DROID_MODEL` (default `auto` = Factory Router), `DROID_AUTONOMY` (default `high`), `DROID_REVIEW_AUTONOMY` (default `high`, review sessions), `DROID_USD_PER_AGENT_RUN` for ROI estimates, `DROID_TURN_TIMEOUT_SECONDS` (default 3600) for the per-turn wall-clock budget.
 
 Verify the Droid key (the SDK uses the same key):
 
@@ -206,15 +209,15 @@ ngrok http 8000
 cloudflared tunnel --url http://localhost:8000
 ```
 
-Set `PUBLIC_BASE_URL` in `.env` to the tunnel URL and restart, then register repositories — forge installs the issues webhook on each repo automatically (or run `POST /api/webhooks/sync`).
+Set `PUBLIC_BASE_URL` in `.env` to the tunnel URL and restart, then add the issues webhook in the repository's GitHub settings (payload URL `<PUBLIC_BASE_URL>/webhook`, content type JSON, secret `GITHUB_WEBHOOK_SECRET`). Forge does not install webhooks itself; `POST /api/webhooks/sync` is refused by policy.
 
-The **Dashboard Assign** flow also works without a tunnel: it labels the issue on GitHub and launches the session directly.
+The **Dashboard Assign** flow also works without a tunnel: it labels the issue on GitHub when `FORGE_ALLOW_GITHUB_WRITES=true` and launches the session directly.
 
 ### 6. Register the repo in the dashboard and trigger Droid
 
 1. Open **http://localhost:8000/dashboard** → **Repositories** tab.
 2. Paste `https://github.com/<owner>/<repo>` and click **Add repository**.
-3. Optionally set a per-repo **model** and **setup command** (e.g. `npm ci`) on the row, then **Save**.
+3. Optionally set a per-repo **model** and **setup command** (e.g. `npm ci`) on the row, then **Save**. A setup command is only stored: it runs before sessions only when `FORGE_ALLOW_PRIVILEGED_SETUP=true`, and the row says so while it is disabled.
 4. Click **Add Issues** (imports open issues from the fork's parent when applicable) or **Sync**.
 5. On the **Issues** tab, select issues → **Assign to Droid**.
 
@@ -236,7 +239,7 @@ gh issue create --repo <owner>/<repo> \
 
 - **Dashboard** tab: fix + review stats, engineering KPIs, daily activity chart (times in **SGT**).
 - Original GitHub issue: ✅ completion comment with session id, PR URL, runtime, summary.
-- Droid pushes a branch; forge opens the **same-repo** PR via PAT; a review session posts a **PR review**; merge state is refreshed from GitHub.
+- Droid commits on a branch; when outward-action policy permits, forge pushes it with its own credential and opens the **same-repo** PR via PAT; a review session posts a **PR review**; merge state is refreshed from GitHub.
 - Follow-ups: `POST /api/tasks/{id}/follow-up` resumes the same Droid session (blocked with 409 while a turn is streaming).
 
 ---
@@ -257,10 +260,10 @@ gh issue create --repo <owner>/<repo> \
 
 Each fix run:
 
-1. **Workspace**: shallow clone of the target repo into `WORKSPACE_ROOT/<owner>/<repo>/task-<id>` with `https://x-access-token:<GITHUB_TOKEN>@github.com/...` as `origin` (so the agent's `git push` works), a Droid Forge git identity, and the optional per-repo setup command.
-2. **Session**: `Session(cwd=<workspace>, model=<per-repo or DROID_MODEL>, config=SessionConfig(autonomy=HIGH, auto_reject_permission_requests=True))`, opened via the SDK and streamed in a background task.
-3. **Turn**: the prompt includes the issue title/body and requires only the requested changes, running the test suite, pushing a new branch to `origin`, *not* opening a PR (automation does), and ending with `BRANCH: <name>`.
-4. **Completion**: `RunResult` gives success/failure, text summary, `duration`, token usage and `factory_credits`; forge persists all of it, extracts the branch (from the `BRANCH:` line or `git rev-parse`), pushes it if the agent somehow didn't, and opens the same-repo PR via PAT (`head=owner:branch`, base = repo default / starting ref).
+1. **Workspace**: shallow clone of the target repo into `WORKSPACE_ROOT/<owner>/<repo>/task-<id>` with the credential-free `https://github.com/<owner>/<repo>.git` as `origin`. The existing Git identity is kept (a Droid Forge identity is only filled in when none is configured). The optional per-repo setup command runs only with `FORGE_ALLOW_PRIVILEGED_SETUP=true`.
+2. **Session**: `Session(cwd=<workspace>, model=<per-repo or DROID_MODEL>, config=SessionConfig(autonomy=HIGH, auto_reject_permission_requests=True))`, opened via the SDK on a clean-environment `droid` process (see [Execution boundary](#execution-boundary)) and streamed in a background task.
+3. **Turn**: the prompt includes the issue title/body and requires only the requested changes, running the test suite, committing on a new branch, *not* pushing or opening a PR, and ending with `BRANCH: <name>`.
+4. **Completion**: `RunResult` gives success/failure, text summary, `duration`, token usage and `factory_credits`; forge persists all of it (credentials redacted), extracts the branch (from the `BRANCH:` line or `git rev-parse`), and, only when outward-action policy permits, pushes it with the app's credential and opens the same-repo PR via PAT (`head=owner:branch`, base = repo default / starting ref).
 
 Failure mapping: `RunSuccess` → completed; `RunInterrupted` / `RunFailure` / timeout → failed (with the SDK error stored on the task).
 
@@ -270,7 +273,7 @@ A second, read-only Droid session checks out the PR head branch (blobless full c
 
 ### Restart recovery
 
-Droid sessions persist on disk (`~/.factory`). On startup, forge finds RUNNING rows whose session is no longer streaming and resumes them with a continuation prompt ("continue where you left off, push your branch, report `BRANCH:`"). Rows that never got a session (dispatch interrupted) are marked failed.
+Droid sessions persist on disk (`~/.factory`). On startup, forge finds RUNNING rows whose session is no longer streaming and resumes them in their own workspace with a continuation prompt ("continue where you left off, commit your work, report `BRANCH:`"), after re-checking repository policy. Rows that never got a session (dispatch interrupted) are marked failed.
 
 ## Operator access
 
@@ -305,6 +308,51 @@ The dashboard, all `/api/*` data and actions, `/metrics`, and the API docs
   `--no-proxy-headers`.
 - **Scope.** This is a trusted single-operator deployment, not multi-user IAM or SSO.
 
+## Repository and outward-action policy
+
+Configured settings, not agent instructions or UI labels, decide what Forge may touch
+(`app/policy.py`). Every check reads current settings, so changed configuration also
+applies to tasks and reviews stored earlier.
+
+- **Repositories.** `FORGE_ALLOWED_REPOSITORIES` gates registration (including a
+  renamed canonical name returned by GitHub), webhook intake, issue/PR assignment,
+  issue sync, fix launch, finalization, follow-up, restart recovery, review launch and
+  PR-state polling. Denied requests return **403** or mark the stored row failed before
+  any Git or GitHub call.
+- **GitHub writes.** `FORGE_ALLOW_GITHUB_WRITES=false` (the default) refuses every
+  comment, label, issue, push, PR and review inside `GitHubClient` and the push helper.
+  Work still runs locally; nothing is published.
+- **Branches.** Pushes and PR heads must be listed in `FORGE_ALLOWED_BRANCHES`.
+- **Never permitted.** Merging, enabling auto-merge and installing webhooks are refused
+  regardless of settings (`POST /api/webhooks/sync` returns **403**).
+- **Setup commands.** Stored per-repository setup commands stay visible in the API and
+  dashboard (`setup_command_execution: disabled_by_policy`) but launch no subprocess
+  unless `FORGE_ALLOW_PRIVILEGED_SETUP=true`. Saving a command over HTTP is not
+  permission to run it.
+
+## Execution boundary
+
+- **App-owned Git credentials.** Workspace remotes are credential-free. Clone, fetch and
+  approved pushes get `GITHUB_TOKEN` transiently through process-scoped `GIT_CONFIG_*`
+  environment variables, as an `Authorization` header scoped to the one repository URL.
+  The token never appears in a remote URL, command-line argument, `.git/config` or
+  credential helper. App-owned Git also disables repository hooks and fsmonitor.
+- **Clean agent environment.** The SDK's `Runtime.env` is merged into the service
+  environment, so it cannot remove variables. Forge instead spawns `droid` through
+  `app/agent_launcher.py`, which `execve`s it with an allowlisted environment (path,
+  locale, proxy/CA settings, Git identity, plus the Factory key the runtime needs).
+  GitHub tokens, the webhook secret, the operator token, `GIT_ASKPASS` and
+  `SSH_AUTH_SOCK` are dropped, and Git credential helpers are reset. Setup commands use
+  the same environment.
+- **Redaction.** Configured credentials (and their Basic-auth/URL-quoted forms), any
+  environment value whose name marks it as a secret, token-shaped strings, URL userinfo
+  and auth headers are masked in nested structures before task/review rows are stored,
+  before API output and in every log record (`app/redaction.py`).
+- **Trusted workload, not a sandbox.** Agents still run as the same OS account and can
+  read whatever that account can, such as other local credential stores or CLI logins.
+  These controls keep publishing credentials out of the agent's environment and Git
+  configuration; they do not isolate hostile code or prevent model/network data flow.
+
 ## Environment Variables
 
 | Variable | Description | Default |
@@ -314,10 +362,13 @@ The dashboard, all `/api/*` data and actions, `/metrics`, and the API docs
 | `FORGE_SESSION_TTL_SECONDS` | Absolute browser-session lifetime | `28800` |
 | `FORGE_TRUSTED_HOSTS` | Comma-separated `Host` values the app answers to | `127.0.0.1,localhost,::1` |
 | `FORGE_COOKIE_SECURE` | `auto` (Secure except plain-HTTP loopback), `true` or `false` | `auto` |
-| `FORGE_ALLOWED_REPOSITORIES` | Comma-separated `owner/repo` slugs approved for intake. Empty approves nothing in protected mode | — |
+| `FORGE_ALLOWED_REPOSITORIES` | Comma-separated `owner/repo` slugs approved for registration, intake, work, reviews and polling. Empty approves nothing in protected mode | — |
+| `FORGE_ALLOWED_BRANCHES` | Comma-separated branches the app may push to or open a PR from. Empty approves nothing in protected mode | — |
+| `FORGE_ALLOW_GITHUB_WRITES` | Master switch for every GitHub write (comments, labels, issues, pushes, PRs, reviews) | `false` |
+| `FORGE_ALLOW_PRIVILEGED_SETUP` | Allow stored per-repository setup commands to run in workspaces | `false` |
 | `GITHUB_WEBHOOK_SECRET` | Shared secret for webhook HMAC validation | — |
 | `PUBLIC_BASE_URL` | Public tunnel URL GitHub can reach (e.g. `https://….trycloudflare.com`). Enables label→webhook dispatch and `POST /api/webhooks/sync` | — |
-| `GITHUB_TOKEN` | PAT used to clone/push branches, open same-repo PRs, comment and review | — |
+| `GITHUB_TOKEN` | PAT used only by app-owned operations: clone/fetch, policy-approved pushes, same-repo PRs, comments and reviews. Never given to agents | — |
 | `FACTORY_API_KEY` | Factory API key (falls back to the droid CLI's own auth when `DROID_ALLOW_CLI_AUTH=true`; required in Docker) | — |
 | `DROID_ALLOW_CLI_AUTH` | Use the local droid CLI's login when `FACTORY_API_KEY` is empty (local runs) | `false` |
 | `DROID_MODEL` | Model id for sessions (`auto` = Factory Router) | `auto` |

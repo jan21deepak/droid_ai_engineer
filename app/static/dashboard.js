@@ -139,7 +139,10 @@
             <input type="text" class="form-control form-control-sm repo-setup-input" data-id="${r.id}"
                    value="${escapeHtml(r.setup_command || "")}"
                    placeholder="e.g. npm ci (optional)"
-                   title="Shell command run in the workspace clone before the session">
+                   title="Stored shell command; runs in the workspace clone only when privileged setup is enabled">
+            ${r.setup_command_execution === "disabled_by_policy"
+              ? `<div class="small text-warning repo-setup-status">Stored, not run: privileged setup is disabled</div>`
+              : ""}
           </td>
           <td class="text-muted small">${r.created_at_display || formatSgt(r.created_at)}</td>
           <td class="text-end text-nowrap">

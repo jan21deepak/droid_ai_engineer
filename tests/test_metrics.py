@@ -1,5 +1,6 @@
 from datetime import UTC, datetime, timedelta
 
+from app.config import get_settings
 from app.database import db_session
 from app.models import Repository, ReviewTask, Task, TaskStatus
 from app.repos import parse_repository_ref
@@ -415,6 +416,8 @@ def test_add_repository_endpoint(client, monkeypatch):
 
 
 def test_add_issues_imports_five_from_parent_and_syncs(client, monkeypatch):
+    monkeypatch.setenv("FORGE_ALLOW_GITHUB_WRITES", "true")
+    get_settings.cache_clear()
     with db_session() as session:
         repo = Repository(
             full_name="jan21deepak/superset",

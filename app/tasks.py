@@ -9,6 +9,7 @@ from app.database import db_session
 from app.droid_client import get_droid_client
 from app.logging_conf import log_event
 from app.models import Task, TaskStatus
+from app.policy import repository_decision
 
 logger = logging.getLogger("app.tasks")
 
@@ -35,7 +36,12 @@ async def create_and_dispatch_task(
     Returns ``{"task_id": int, "session_id": str | None, "status": str}``.
     The Droid session is launched in the background so webhook callers get an
     immediate 202 (GitHub kills webhook deliveries after ~10 seconds).
+    Repositories outside current policy are refused before anything is stored.
     """
+    access = repository_decision(repository)
+    if not access.allowed:
+        log_event(logger, logging.WARNING, "policy.repository_denied", repo=repository[:200], reason=access.reason)
+        raise TaskCreateError(f"repository not approved by policy: {access.reason}", status_code=403)
     with db_session() as session:
         existing = (
             session.query(Task)

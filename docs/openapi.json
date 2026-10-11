@@ -11,7 +11,7 @@
           },
           "setup_command": {
             "default": "",
-            "description": "Optional shell command run in the workspace clone before the session",
+            "description": "Optional shell command for the workspace clone; stored only. It runs before the session only when FORGE_ALLOW_PRIVILEGED_SETUP=true",
             "title": "Setup Command",
             "type": "string"
           },
@@ -118,7 +118,7 @@
                 "type": "null"
               }
             ],
-            "description": "Optional shell command run in the workspace clone before the session",
+            "description": "Optional shell command for the workspace clone; stored only. It runs before the session only when FORGE_ALLOW_PRIVILEGED_SETUP=true",
             "title": "Setup Command"
           },
           "starting_ref": {
@@ -262,7 +262,7 @@
     },
     "/api/issues/assign": {
       "post": {
-        "description": "Add the trigger label on GitHub so the webhook (flow 1) launches the agent.\n\nAlways applies the trigger label on the issue. When ``PUBLIC_BASE_URL`` is\nconfigured, forge waits briefly for the webhook to create the task;\notherwise it dispatches the Droid session directly after labeling\n(same end state, with duplicate protection if the webhook also fires).",
+        "description": "Dispatch selected issues to Droid, labeling them on GitHub when policy permits.\n\nIssues outside repository policy are rejected before any call. With GitHub\nwrites permitted, the trigger label is applied; when ``PUBLIC_BASE_URL`` is\nconfigured, forge waits briefly for the webhook to create the task.\nOtherwise it dispatches the Droid session directly (same end state, with\nduplicate protection if the webhook also fires).",
         "operationId": "assign_issues_to_droid_api_issues_assign_post",
         "requestBody": {
           "content": {
@@ -690,7 +690,7 @@
     },
     "/api/webhooks/sync": {
       "post": {
-        "description": "Ensure trigger label + issues webhook exist on every registered repository.",
+        "description": "Ensure trigger label + issues webhook exist on every registered repository.\n\nInstalling webhooks is never a permitted outward action, so this is\nrefused before any GitHub call; configure the hook in GitHub instead.",
         "operationId": "sync_github_webhooks_api_webhooks_sync_post",
         "responses": {
           "200": {
