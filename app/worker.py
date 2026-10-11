@@ -654,7 +654,10 @@ async def _resume_orphaned_fix(
         return 0
     try:
         await droid.resume_interrupted(
-            session_id, cwd=task_workspace_dir(repository, task_id), on_complete=partial(finalize, task_id)
+            session_id,
+            repository=repository,
+            cwd=task_workspace_dir(repository, task_id),
+            on_complete=partial(finalize, task_id),
         )
     except Exception as exc:
         _mark_row_failed(Task, task_id, f"session lost after service restart: {safe_error(exc)}")

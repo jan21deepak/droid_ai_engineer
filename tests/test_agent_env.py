@@ -252,6 +252,82 @@ class TestGitCredentialTransport:
         )
 
         assert "Droid Forge" not in (ws / ".git" / "config").read_text()
+        assert "[user]" not in (ws / ".git" / "config").read_text()
+        assert global_config.read_text() == "[user]\n\tname = Existing Operator\n\temail = operator@example.com\n"
+
+
+class TestGitIdentityRequired:
+    """A missing or blank identity is reported, never invented or overwritten."""
+
+    @pytest.mark.parametrize(
+        "global_text",
+        [
+            "",
+            "[user]\n\tname = Existing Operator\n",
+            "[user]\n\temail = operator@example.com\n",
+            '[user]\n\tname = "   "\n\temail = operator@example.com\n',
+            '[user]\n\tname = Existing Operator\n\temail = ""\n',
+        ],
+        ids=["none", "name-only", "email-only", "blank-name", "blank-email"],
+    )
+    @pytest.mark.asyncio
+    async def test_unusable_identity_fails_before_setup_without_identity_writes(
+        self, tmp_path, monkeypatch, recorded_subprocesses, global_text
+    ):
+        bare = make_bare_repo(tmp_path)
+        global_config = tmp_path / "gitconfig"
+        global_config.write_text(global_text)
+        monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(global_config))
+        monkeypatch.setenv("FORGE_ALLOW_PRIVILEGED_SETUP", "true")
+        monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path / "ws"))
+        get_settings.cache_clear()
+        monkeypatch.setattr(droid_client, "_remote_url", lambda repository: str(bare))
+        opened: list[dict] = []
+
+        async def fake_open(self, **kwargs):
+            opened.append(kwargs)
+            raise AssertionError("no SDK session may open without a usable Git identity")
+
+        monkeypatch.setattr(DroidClient, "_open_session", fake_open)
+
+        with pytest.raises(droid_client.DroidRunError, match="Git identity"):
+            await DroidClient(api_key="fk").start_fix_run(
+                repository="jan21deepak/allowed",
+                repository_url="https://github.com/jan21deepak/allowed",
+                task_id=6,
+                issue_number=1,
+                issue_title="t",
+                issue_body="b",
+                starting_ref="main",
+                setup_command="touch SETUP_RAN",
+            )
+
+        ws = task_workspace_dir("jan21deepak/allowed", 6)
+        assert opened == []
+        assert not (ws / "SETUP_RAN").exists()
+        assert global_config.read_text() == global_text
+        local = (ws / ".git" / "config").read_text()
+        assert "[user]" not in local and "Droid Forge" not in local
+        for argv, _env in recorded_subprocesses:
+            assert not ("config" in argv and any(arg.startswith("user.") for arg in argv) and "--get" not in argv), argv
+            assert argv[0] == "git"
+
+    @pytest.mark.asyncio
+    async def test_identity_from_environment_is_usable(self, tmp_path, monkeypatch):
+        bare = make_bare_repo(tmp_path)
+        monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+        monkeypatch.setenv("GIT_AUTHOR_NAME", "Env Operator")
+        monkeypatch.setenv("GIT_AUTHOR_EMAIL", "env@example.com")
+        monkeypatch.setenv("GIT_COMMITTER_NAME", "Env Operator")
+        monkeypatch.setenv("GIT_COMMITTER_EMAIL", "env@example.com")
+        monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path / "ws"))
+        get_settings.cache_clear()
+        monkeypatch.setattr(droid_client, "_remote_url", lambda repository: str(bare))
+
+        ws = await DroidClient(api_key="fk").prepare_fix_workspace(
+            repository="jan21deepak/allowed", task_id=7, starting_ref="main"
+        )
+        assert "[user]" not in (ws / ".git" / "config").read_text()
 
 
 class TestPrivilegedSetup:

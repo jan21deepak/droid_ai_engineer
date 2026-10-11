@@ -17,8 +17,10 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
 import re
 import shutil
+import tempfile
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -39,6 +41,15 @@ from app.review_policy import (
     assess_diff,
     build_review_prompt,
     review_session_config,
+)
+from app.workspace_config import (
+    IDENTITY_VARS,
+    ConfigEntry,
+    credential_cleanup_commands,
+    credential_findings,
+    parse_config_list,
+    strip_credential_sections,
+    usable_identity,
 )
 
 logger = logging.getLogger("app.droid")
@@ -206,15 +217,60 @@ def _remote_url(repository: str) -> str:
     return f"https://github.com/{full_name}.git"
 
 
-async def _ensure_commit_identity(ws: Path) -> None:
-    """Keep any configured Git identity; only fill in a fallback when none exists."""
-    try:
-        if await _git(["config", "--get", "user.email"], cwd=ws):
-            return
-    except DroidRunError:
-        pass
-    await _git(["config", "user.name", "Droid Forge"], cwd=ws)
-    await _git(["config", "user.email", "droid-forge@users.noreply.github.com"], cwd=ws)
+MISSING_IDENTITY_ERROR = (
+    "no usable Git identity: configure user.name and user.email (or GIT_AUTHOR_*/GIT_COMMITTER_* "
+    "variables) for the service account; Forge never invents or overrides a commit author"
+)
+
+
+async def _require_commit_identity(ws: Path) -> None:
+    """Use the configured Git identity unchanged; refuse to run without a usable one.
+
+    ``user.useConfigOnly`` stops Git from guessing an author from the host name.
+    """
+    for variable in IDENTITY_VARS:
+        ident = await _git_or_none(["-c", "user.useConfigOnly=true", "var", variable], cwd=ws)
+        if not ident or not usable_identity(ident):
+            raise DroidRunError(MISSING_IDENTITY_ERROR)
+
+
+async def _local_config_entries(ws: Path) -> list[ConfigEntry]:
+    return parse_config_list(await _git(["config", "--local", "--null", "--list"], cwd=ws))
+
+
+async def _remove_legacy_credentials(ws: Path, remote: str) -> None:
+    """Rewrite the workspace-local Git config without credentials; fail if any remain.
+
+    Only ``.git/config`` changes: refs, index, worktree and untracked files are untouched.
+    """
+    git_path = Path(await _git(["rev-parse", "--git-path", "config"], cwd=ws))
+    config_path = git_path if git_path.is_absolute() else ws / git_path
+    original = config_path.read_text()
+    stripped = strip_credential_sections(original)
+    if stripped != original:
+        with tempfile.NamedTemporaryFile("w", dir=config_path.parent, delete=False, prefix="config.") as handle:
+            handle.write(stripped)
+        os.chmod(handle.name, config_path.stat().st_mode & 0o777)
+        os.replace(handle.name, config_path)
+    commands = credential_cleanup_commands(await _local_config_entries(ws), remote)
+    for args in commands:
+        await _git(args, cwd=ws)
+    remaining = credential_findings(await _local_config_entries(ws), remote)
+    if remaining:
+        raise DroidRunError(f"workspace Git config still holds {len(remaining)} credential setting(s); not resuming")
+    if stripped != original or commands:
+        log_event(logger, logging.INFO, "droid.workspace_credentials_removed", workspace=str(ws))
+
+
+async def _prepare_continuation_workspace(repository: str, ws: Path) -> None:
+    """Make an existing task workspace safe to resume in, without setup, clone, fetch or cleanup."""
+    if not (ws / ".git").exists():
+        raise DroidRunError("task workspace is missing; reassign the issue for a fresh run")
+    toplevel = await _git_or_none(["rev-parse", "--show-toplevel"], cwd=ws)
+    if toplevel is None or Path(toplevel).resolve() != ws.resolve():
+        raise DroidRunError("task workspace is not its own Git repository; not resuming")
+    await _remove_legacy_credentials(ws, _remote_url(repository))
+    await _require_commit_identity(ws)
 
 
 class DroidClient:
@@ -399,8 +455,8 @@ class DroidClient:
 
         if (ws / ".git").exists():
             # Reuse (restart recovery for the same task): keep agent state, and
-            # reset the remote so a legacy token-bearing URL is scrubbed.
-            await _git(["remote", "set-url", "origin", remote], cwd=ws)
+            # scrub legacy credentials (token-bearing origin, auth headers) from its config.
+            await _remove_legacy_credentials(ws, remote)
         else:
             ref = (starting_ref or "").strip()
             try:
@@ -412,7 +468,7 @@ class DroidClient:
                 if not ws.exists() or not (ws / ".git").exists():
                     raise
                 # Clone partially succeeded (e.g. unknown ref); keep what we got.
-        await _ensure_commit_identity(ws)
+        await _require_commit_identity(ws)
 
         setup = await self._run_setup_command(ws, (setup_command or "").strip())
         return ws, setup
@@ -751,18 +807,22 @@ class DroidClient:
         session_id: str,
         instruction: str,
         *,
-        cwd: Path | None = None,
+        repository: str,
+        cwd: Path,
         on_complete: Callable[[dict[str, Any]], Any] | None = None,
     ) -> dict[str, Any]:
-        """Resume a saved session and run a follow-up turn in the background."""
+        """Resume a saved session in its task workspace and run a follow-up turn in the background.
+
+        The workspace's legacy credentials are removed (from ``repository``,
+        the task's stored repository) before the session opens.
+        """
         if not self.configured:
             raise DroidRunError("Droid is not configured (FACTORY_API_KEY missing)")
         if self.session_busy(session_id):
             raise DroidSessionBusyError("session already has a turn in flight")
         prompt = build_follow_up_prompt(instruction)
-        session = await self._open_session(
-            cwd=cwd or workspace_root(), resume_id=session_id, purpose=f"session {session_id}"
-        )
+        await _prepare_continuation_workspace(repository, cwd)
+        session = await self._open_session(cwd=cwd, resume_id=session_id, purpose=f"session {session_id}")
         self._spawn_turn(session, prompt, kind="follow_up", on_complete=on_complete)
         log_event(logger, logging.INFO, "droid.follow_up_sent", session_id=session_id)
         return {"session_id": session_id, "status": "running"}
@@ -771,20 +831,21 @@ class DroidClient:
         self,
         session_id: str,
         *,
-        cwd: Path | None = None,
+        repository: str,
+        cwd: Path,
         on_complete: Callable[[dict[str, Any]], Any] | None = None,
     ) -> dict[str, Any]:
         """Resume an implementation session orphaned by a service restart and nudge it forward.
 
-        Only for fix/follow-up sessions; review sessions are never resumed.
+        Only for fix/follow-up sessions; review sessions are never resumed. As
+        with follow-ups, the workspace is cleaned of legacy credentials first.
         """
         if not self.configured:
             raise DroidRunError("Droid is not configured (FACTORY_API_KEY missing)")
         if self.session_busy(session_id):
             return {"session_id": session_id, "status": "running"}
-        session = await self._open_session(
-            cwd=cwd or workspace_root(), resume_id=session_id, purpose=f"session {session_id}"
-        )
+        await _prepare_continuation_workspace(repository, cwd)
+        session = await self._open_session(cwd=cwd, resume_id=session_id, purpose=f"session {session_id}")
         self._spawn_turn(session, RECOVERY_PROMPT_TEMPLATE, kind="recovery", on_complete=on_complete)
         log_event(logger, logging.INFO, "droid.session_recovered", session_id=session_id)
         return {"session_id": session_id, "status": "running"}

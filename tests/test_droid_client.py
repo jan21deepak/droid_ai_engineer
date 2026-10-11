@@ -471,8 +471,13 @@ class TestClient:
             )
 
     @pytest.mark.asyncio
-    async def test_send_follow_up_busy_and_happy_path(self, monkeypatch):
+    async def test_send_follow_up_busy_and_happy_path(self, monkeypatch, tmp_path):
         monkeypatch.setattr(droid_client, "Session", FakeSession)
+        monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_path / "ws"))
+        get_settings.cache_clear()
+        ws = task_workspace_dir("jan21deepak/demo", 8)
+        ws.mkdir(parents=True)
+        subprocess.run(["git", "init", "-q", str(ws)], check=True)
         client = DroidClient(api_key="fk_test")
 
         # Simulate an in-flight run for the session.
@@ -481,10 +486,10 @@ class TestClient:
 
         client.track("sess-busy", asyncio.create_task(forever()))
         with pytest.raises(DroidSessionBusyError):
-            await client.send_follow_up("sess-busy", "Fix CI")
+            await client.send_follow_up("sess-busy", "Fix CI", repository="jan21deepak/demo", cwd=ws)
         client._tasks["sess-busy"].cancel()
 
-        result = await client.send_follow_up("sess-idle", "Fix CI")
+        result = await client.send_follow_up("sess-idle", "Fix CI", repository="jan21deepak/demo", cwd=ws)
         assert result["status"] == "running"
 
     @pytest.mark.asyncio

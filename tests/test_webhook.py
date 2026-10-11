@@ -3,13 +3,14 @@ import hmac
 import json
 
 import pytest
+from sqlalchemy.exc import IntegrityError
 
+import app.database as database
 from app import tasks, worker
 from app.config import get_settings
 from app.database import db_session
 from app.github import parse_issue_event, should_trigger, verify_signature
-from app.intake import reset_deliveries_for_tests
-from app.models import Repository, Task, TaskStatus
+from app.models import Repository, Task, TaskStatus, WebhookDelivery
 from tests.conftest import OPERATOR_TOKEN, PROTECTED_ORIGIN
 
 SECRET = "test-secret"
@@ -71,6 +72,11 @@ class TestParsing:
         payload["issue"]["body"] = None
         assert parse_issue_event(payload).issue_body == ""
 
+    @pytest.mark.parametrize("number", [-1, 0, True, False, 2.5, 2.0, "42", None, 2**40])
+    def test_parse_refuses_non_positive_integer_numbers(self, number):
+        with pytest.raises(ValueError):
+            parse_issue_event(issue_payload(number=number))
+
 
 class TestTriggerRules:
     def test_opened_with_label_triggers(self):
@@ -120,7 +126,6 @@ def intake(protected_mode, monkeypatch):
     """Protected app with one registered, allowlisted repository and recorded side effects."""
     monkeypatch.setenv("FORGE_ALLOWED_REPOSITORIES", APPROVED_REPO)
     get_settings.cache_clear()
-    reset_deliveries_for_tests()
     register()
     spawned: list[int] = []
     github_calls: list[str] = []
@@ -134,7 +139,23 @@ def intake(protected_mode, monkeypatch):
     for name in ("post_issue_comment", "add_issue_label", "ensure_label", "create_issue"):
         monkeypatch.setattr(f"app.github.GitHubClient.{name}", record_github)
     yield {"spawned": spawned, "github": github_calls}
-    reset_deliveries_for_tests()
+
+
+def simulate_restart() -> None:
+    """Drop every in-process cache and reopen the same SQLite database."""
+    database.reset_for_tests()
+    get_settings.cache_clear()
+    database.init_db()
+
+
+def fail_all_tasks() -> None:
+    with db_session() as session:
+        session.query(Task).update({Task.status: TaskStatus.FAILED})
+
+
+def receipts() -> dict[str, int | None]:
+    with db_session() as session:
+        return {row.delivery_id: row.task_id for row in session.query(WebhookDelivery).all()}
 
 
 class TestWebhookEndpoint:
@@ -182,6 +203,94 @@ class TestWebhookEndpoint:
         assert "duplicate" in second.json()["detail"]
         assert task_count() == 1
         assert len(intake["spawned"]) == 1
+
+    def test_redelivery_after_failure_and_restart_does_not_relaunch(self, protected_client, intake):
+        first = self.post(protected_client, approved_payload(), delivery="d-restart")
+        assert first.status_code == 202
+        task_id = first.json()["task_id"]
+        fail_all_tasks()
+        simulate_restart()
+
+        again = self.post(protected_client, approved_payload(), delivery="d-restart")
+        assert again.status_code == 200
+        assert again.json() == {"detail": "duplicate: delivery already processed", "task_id": task_id}
+        assert task_count() == 1
+        assert intake["spawned"] == [task_id]
+
+    def test_duplicate_alias_delivery_is_remembered_across_restart(self, protected_client, intake):
+        first = self.post(protected_client, approved_payload(), delivery="d-original")
+        task_id = first.json()["task_id"]
+        alias = self.post(protected_client, approved_payload(), delivery="d-alias")
+        assert alias.status_code == 200
+        assert receipts() == {"d-original": task_id, "d-alias": task_id}
+        fail_all_tasks()
+        simulate_restart()
+
+        again = self.post(protected_client, approved_payload(), delivery="d-alias")
+        assert again.status_code == 200
+        assert again.json()["task_id"] == task_id
+        assert task_count() == 1
+        assert intake["spawned"] == [task_id]
+
+    def test_receipt_is_committed_before_launch(self, protected_client, intake, monkeypatch):
+        seen: list[dict[str, int | None]] = []
+        monkeypatch.setattr(worker, "spawn_fix_launch", lambda task_id, **kw: seen.append(receipts()))
+        resp = self.post(protected_client, approved_payload(), delivery="d-ordered")
+        assert resp.status_code == 202
+        assert seen == [{"d-ordered": resp.json()["task_id"]}]
+
+    def test_receipt_unique_constraint_rejects_second_row(self):
+        with db_session() as session:
+            session.add(WebhookDelivery(delivery_id="d-unique", task_id=None))
+        with pytest.raises(IntegrityError), db_session() as session:
+            session.add(WebhookDelivery(delivery_id="d-unique", task_id=None))
+
+    def test_concurrent_identical_delivery_loses_race_without_launch(self, protected_client, intake, monkeypatch):
+        """Another process commits the same delivery between our lookup and insert."""
+        with db_session() as session:
+            session.add(WebhookDelivery(delivery_id="d-race", task_id=None))
+        monkeypatch.setattr(tasks, "_delivery_receipt", lambda session, delivery_id: None)
+
+        resp = self.post(protected_client, approved_payload(), delivery="d-race")
+        assert resp.status_code == 200
+        assert "duplicate" in resp.json()["detail"]
+        self.assert_nothing_ran(intake)
+
+    def test_explicit_retry_without_that_delivery_key_is_allowed(self, protected_client, intake):
+        first = self.post(protected_client, approved_payload(), delivery="d-first")
+        fail_all_tasks()
+        simulate_restart()
+
+        retry = self.post(protected_client, approved_payload(), delivery="d-new-label-event")
+        assert retry.status_code == 202
+        assert retry.json()["task_id"] != first.json()["task_id"]
+        fail_all_tasks()
+        unkeyed = self.post(protected_client, approved_payload())
+        assert unkeyed.status_code == 202
+        assert task_count() == 3
+        assert len(intake["spawned"]) == 3
+
+    @pytest.mark.parametrize(
+        "number",
+        [-1, 0, True, False, 2.5, 2.0, "42", None, 2**40, "missing"],
+        ids=["negative", "zero", "true", "false", "fraction", "float-integral", "string", "null", "huge", "missing"],
+    )
+    def test_non_positive_integer_issue_number_rejected(self, protected_client, intake, number):
+        payload = approved_payload()
+        if number == "missing":
+            del payload["issue"]["number"]
+        else:
+            payload["issue"]["number"] = number
+        resp = self.post(protected_client, payload, delivery=f"d-bad-{number!r}")
+        assert resp.status_code == 422
+        self.assert_nothing_ran(intake)
+        assert receipts() == {}
+
+    def test_positive_integer_issue_number_accepted(self, protected_client, intake):
+        resp = self.post(protected_client, approved_payload(number=7), delivery="d-seven")
+        assert resp.status_code == 202
+        with db_session() as session:
+            assert session.query(Task).one().issue_number == 7
 
     def test_registered_repo_match_is_case_insensitive(self, protected_client, intake):
         payload = approved_payload()

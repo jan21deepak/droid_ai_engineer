@@ -171,6 +171,23 @@ class Task(RedactedOutputMixin, Base):
         }
 
 
+class WebhookDelivery(Base):
+    """Receipt for an accepted GitHub delivery (``X-GitHub-Delivery``).
+
+    Written in the same transaction as the task it maps to, before any launch,
+    so a redelivery of the same key never schedules work again: not after the
+    task failed, and not after a restart. ``task_id`` may name a task created
+    by an earlier delivery when this one was accepted as its duplicate.
+    """
+
+    __tablename__ = "webhook_deliveries"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    delivery_id: Mapped[str] = mapped_column(String(128), unique=True, index=True)
+    task_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
+
+
 class SyncedPullRequest(Base):
     """Open, non-draft PRs available for Droid review assignment."""
 

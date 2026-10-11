@@ -507,6 +507,7 @@ async def follow_up_task(task_id: int, payload: FollowUpRequest) -> JSONResponse
         result = await droid.send_follow_up(
             session_id,
             payload.instruction,
+            repository=repository,
             cwd=task_workspace_dir(repository, task_id),
             on_complete=partial(finalize_fix_task, task_id),
         )

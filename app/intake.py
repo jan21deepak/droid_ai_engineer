@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import logging
-from collections import OrderedDict
 from typing import Any
 
 from fastapi import APIRouter, Request
@@ -20,23 +19,7 @@ logger = logging.getLogger("app.api")
 router = APIRouter()
 
 MAX_WEBHOOK_BYTES = 2 * 1024 * 1024
-MAX_REMEMBERED_DELIVERIES = 512
-# Process-local memory of accepted X-GitHub-Delivery ids so a redelivered
-# event cannot launch work again even after the original task failed.
-_accepted_deliveries: OrderedDict[str, int | None] = OrderedDict()
-
-
-def reset_deliveries_for_tests() -> None:
-    _accepted_deliveries.clear()
-
-
-def _remember_delivery(delivery_id: str, task_id: int | None) -> None:
-    if not delivery_id:
-        return
-    _accepted_deliveries[delivery_id] = task_id
-    _accepted_deliveries.move_to_end(delivery_id)
-    while len(_accepted_deliveries) > MAX_REMEMBERED_DELIVERIES:
-        _accepted_deliveries.popitem(last=False)
+MAX_DELIVERY_ID_CHARS = 128
 
 
 def _rejected(status: int, detail: str, reason: str, **ctx: Any) -> JSONResponse:
@@ -70,7 +53,7 @@ def _issue_event(payload: dict[str, Any]) -> IssueEvent | None:
         event = parse_issue_event(payload)
     except (AttributeError, TypeError, ValueError):
         return None
-    if not event.repository or not isinstance(event.repository, str) or not event.issue_number:
+    if not event.repository or not isinstance(event.repository, str):
         return None
     return event
 
@@ -84,7 +67,7 @@ async def webhook(request: Request) -> JSONResponse | dict[str, Any]:
     if isinstance(payload, JSONResponse):
         return payload
 
-    delivery_id = request.headers.get("X-GitHub-Delivery", "").strip()[:128]
+    delivery_id = request.headers.get("X-GitHub-Delivery", "").strip()[:MAX_DELIVERY_ID_CHARS]
     log_event(logger, logging.INFO, "webhook.received", github_event=event_type, action=payload.get("action"))
 
     if event_type == "ping":
@@ -117,9 +100,6 @@ async def webhook(request: Request) -> JSONResponse | dict[str, Any]:
         )
         return {"detail": "ignored: trigger conditions not met"}
 
-    if delivery_id and delivery_id in _accepted_deliveries:
-        return {"detail": "duplicate: delivery already processed", "task_id": _accepted_deliveries[delivery_id]}
-
     try:
         result = await create_and_dispatch_task(
             repository=approved.full_name,
@@ -128,15 +108,14 @@ async def webhook(request: Request) -> JSONResponse | dict[str, Any]:
             issue_title=event.issue_title,
             issue_body=event.issue_body,
             labels=event.labels,
+            delivery_id=delivery_id or None,
         )
     except TaskCreateError as exc:
         if exc.status_code == 200:
-            _remember_delivery(delivery_id, exc.task_id)
             return {"detail": exc.message, "task_id": exc.task_id}
         return JSONResponse(
             status_code=exc.status_code,
             content={"detail": exc.message, "task_id": exc.task_id},
         )
 
-    _remember_delivery(delivery_id, result.get("task_id"))
     return JSONResponse(status_code=202, content={"detail": "accepted", **result})

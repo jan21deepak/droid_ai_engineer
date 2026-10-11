@@ -251,18 +251,18 @@ gh issue create --repo <owner>/<repo> \
 ### GitHub Webhook Flow
 
 1. GitHub delivers an `issues` event to `POST /webhook`. This route does not use operator login or bearer credentials; its only authentication is the webhook HMAC.
-2. Without `GITHUB_WEBHOOK_SECRET` intake is disabled (**503**). The service verifies `X-Hub-Signature-256` with the shared secret (constant-time HMAC compare). Missing/invalid → **401**; malformed JSON or issue payload → **422**.
+2. Without `GITHUB_WEBHOOK_SECRET` intake is disabled (**503**). The service verifies `X-Hub-Signature-256` with the shared secret (constant-time HMAC compare). Missing/invalid → **401**; malformed JSON or issue payload → **422**. `issue.number` must be a positive JSON integer as sent (booleans, fractions, strings, zero and negatives are rejected, never coerced).
 3. Non-issue events are acknowledged and ignored (**200**).
 4. The repository must be both registered in Forge and listed in `FORGE_ALLOWED_REPOSITORIES` → otherwise **403**, and no task is created.
 5. Trigger rule: issue `opened` with the `Droid-complete` label, or the label being added (`labeled`). Anything else is ignored.
-6. Duplicate protection: an active or completed task for the same repo + issue is not recreated, and a redelivered `X-GitHub-Delivery` id is not executed twice.
+6. Duplicate protection: an active or completed task for the same repo + issue is not recreated. Every accepted `X-GitHub-Delivery` id gets a unique receipt row (`webhook_deliveries`) committed with its task before launch, including deliveries accepted as duplicates of an existing task. Redelivering that id never runs again, even after the task failed or the service restarted. A different delivery (for example, re-adding the label) or a dashboard assignment can still retry a failed issue.
 7. A `Task` row is written to SQLite and the launch is fired in a background asyncio task (**202** — the response returns fast because GitHub kills webhook deliveries after ~10 seconds; workspace clones take longer).
 
 ### Droid Session Workflow
 
 Each fix run:
 
-1. **Workspace**: shallow clone of the target repo into `WORKSPACE_ROOT/<owner>/<repo>/task-<id>` with the credential-free `https://github.com/<owner>/<repo>.git` as `origin`. The existing Git identity is kept (a Droid Forge identity is only filled in when none is configured). The optional per-repo setup command runs only with `FORGE_ALLOW_PRIVILEGED_SETUP=true`.
+1. **Workspace**: shallow clone of the target repo into `WORKSPACE_ROOT/<owner>/<repo>/task-<id>` with the credential-free `https://github.com/<owner>/<repo>.git` as `origin`. The service account's configured Git identity (`user.name`/`user.email`, or the `GIT_AUTHOR_*`/`GIT_COMMITTER_*` variables) is used unchanged and is required: if either is missing or blank the run fails before setup or any session, and Forge writes no identity of its own. The optional per-repo setup command runs only with `FORGE_ALLOW_PRIVILEGED_SETUP=true`.
 2. **Session**: `Session(cwd=<workspace>, model=<per-repo or DROID_MODEL>, config=SessionConfig(autonomy=HIGH, auto_reject_permission_requests=True))`, opened via the SDK on a clean-environment `droid` process (see [Execution boundary](#execution-boundary)) and streamed in a background task.
 3. **Turn**: the prompt includes the issue title/body and requires only the requested changes, running the test suite, committing on a new branch, *not* pushing or opening a PR, and ending with `BRANCH: <name>`.
 4. **Completion**: `RunResult` gives success/failure, text summary, `duration`, token usage and `factory_credits`; forge persists all of it (credentials redacted) and inspects the workspace with app-owned Git to record the candidate: `base_sha` (the starting commit), `candidate_sha`, `candidate_branch` and `candidate_status` (`ready`, `dirty`, `no_changes` or `unavailable`). The task API exposes these under `candidate`. Success does not push, open a PR, start a review or grant publication approval.
@@ -281,7 +281,7 @@ Each review is a fresh SDK session (never a resumed one) built from an exact, ap
 
 ### Restart recovery
 
-Droid sessions persist on disk (`~/.factory`). On startup, forge finds RUNNING fix rows whose session is no longer streaming and resumes them in their own workspace with a continuation prompt ("continue where you left off, commit your work, do not push, report `BRANCH:`"), after re-checking repository policy. The resumed turn finishes like any fix run: it records a local candidate and publishes nothing. Rows that never got a session (dispatch interrupted) are marked failed. Interrupted reviews are never resumed: they are marked failed and must be reassigned, which starts a fresh restricted review.
+Droid sessions persist on disk (`~/.factory`). On startup, forge finds RUNNING fix rows whose session is no longer streaming and resumes them in their own workspace with a continuation prompt ("continue where you left off, commit your work, do not push, report `BRANCH:`"), after re-checking repository policy. Before a recovery or follow-up session opens, the workspace's local `.git/config` is cleaned of credentials left by older versions: `origin` is reset to the canonical URL for the task's stored repository, userinfo is stripped from other remote URLs, and auth headers, credential-bearing URL rewrites and local credential helpers are removed. Branches, commits, uncommitted and untracked files are left as they are; no setup, clone, fetch or cleanup runs, and a missing workspace or missing Git identity refuses the continuation. The resumed turn finishes like any fix run: it records a local candidate and publishes nothing. Rows that never got a session (dispatch interrupted) are marked failed. Interrupted reviews are never resumed: they are marked failed and must be reassigned, which starts a fresh restricted review.
 
 ## Operator access
 

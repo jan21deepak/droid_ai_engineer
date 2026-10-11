@@ -42,15 +42,33 @@ class IssueEvent:
     label_added: str | None = None
 
 
+# GitHub issue numbers are positive and fit the INTEGER column comfortably.
+MAX_ISSUE_NUMBER = 2**31 - 1
+
+
+def positive_issue_number(value: object) -> int | None:
+    """The value when it is an actual positive JSON integer; booleans, floats and strings are refused."""
+    if type(value) is not int or not 0 < value <= MAX_ISSUE_NUMBER:
+        return None
+    return value
+
+
 def parse_issue_event(payload: dict[str, Any]) -> IssueEvent:
-    """Extract the relevant fields from a GitHub `issues` webhook payload."""
+    """Extract the relevant fields from a GitHub `issues` webhook payload.
+
+    Raises ``ValueError`` unless ``issue.number`` is a positive integer as sent;
+    nothing is coerced, so a malformed number can never target another issue.
+    """
     repo = payload.get("repository") or {}
     issue = payload.get("issue") or {}
+    number = positive_issue_number(issue.get("number"))
+    if number is None:
+        raise ValueError("issue number must be a positive integer")
     return IssueEvent(
         action=payload.get("action", ""),
         repository=repo.get("full_name", ""),
         repository_url=repo.get("html_url", ""),
-        issue_number=int(issue.get("number", 0)),
+        issue_number=number,
         issue_title=issue.get("title", "") or "",
         issue_body=issue.get("body", "") or "",
         labels=[lbl.get("name", "") for lbl in issue.get("labels", []) or []],

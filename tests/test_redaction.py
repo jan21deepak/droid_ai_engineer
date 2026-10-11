@@ -141,6 +141,63 @@ class TestPersistenceAndDisplay:
         assert not contains_secret(resp.text)
         assert "failed to list issues" in resp.json()["detail"]
 
+    @pytest.mark.parametrize(
+        "rejection",
+        [
+            {"json": {"message": f"Validation failed for {GITHUB_SENTINEL}"}},
+            {"json": {"message": {"field": f"token {WEBHOOK_SENTINEL}", GITHUB_SENTINEL: [OPERATOR_SENTINEL]}}},
+            {"json": [f"unexpected array {GITHUB_SENTINEL}"]},
+            {"content": f"<html>proxy echoed Authorization {GITHUB_SENTINEL}</html>".encode()},
+            {"content": b""},
+        ],
+        ids=["json-text", "json-structured", "json-non-object", "non-json", "empty"],
+    )
+    def test_issue_creation_rejection_and_partial_result_are_scrubbed(self, client, monkeypatch, secrets, rejection):
+        monkeypatch.setenv("FORGE_ALLOWED_REPOSITORIES", "o/r")
+        monkeypatch.setenv("FORGE_ALLOW_GITHUB_WRITES", "true")
+        get_settings.cache_clear()
+        with db_session() as session:
+            repo = Repository(full_name="o/r", url="https://github.com/o/r")
+            session.add(repo)
+            session.flush()
+            repo_id = repo.id
+
+        async def fake_get_repository(self, full_name):
+            return {"full_name": full_name, "parent": {"full_name": "up/r"}}
+
+        async def fake_list_open_issues(self, full_name, per_page=50, max_pages=5):
+            return [
+                {"number": n, "title": f"Parent {n} {OPERATOR_SENTINEL}", "body": "b", "html_url": f"https://x/{n}"}
+                for n in (1, 2)
+            ]
+
+        async def fake_list_issues(self, full_name, state="open", per_page=50, max_pages=5):
+            return []
+
+        created: list[str] = []
+
+        async def fake_create_issue(self, repository, title, body="", labels=None):
+            if created:
+                request = httpx.Request("POST", "https://api.github.com/repos/o/r/issues")
+                response = httpx.Response(422, request=request, **rejection)
+                raise httpx.HTTPStatusError("rejected", request=request, response=response)
+            created.append(title)
+            return {"number": 9, "title": title, "html_url": f"https://github.com/o/r/issues/9?{GITHUB_SENTINEL}"}
+
+        monkeypatch.setattr("app.github.GitHubClient.get_repository", fake_get_repository)
+        monkeypatch.setattr("app.github.GitHubClient.list_open_issues", fake_list_open_issues)
+        monkeypatch.setattr("app.github.GitHubClient.list_issues", fake_list_issues)
+        monkeypatch.setattr("app.github.GitHubClient.create_issue", fake_create_issue)
+
+        resp = client.post(f"/api/repositories/{repo_id}/issues")
+
+        assert resp.status_code == 422
+        assert not contains_secret(resp.text)
+        body = resp.json()
+        assert isinstance(body["detail"], str) and body["detail"]
+        assert len(body["created"]) == 1
+        assert body["created"][0]["number"] == 9
+
 
 class TestLogs:
     def test_structured_context_and_exceptions_are_scrubbed(self, secrets):

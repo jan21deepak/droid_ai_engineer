@@ -23,11 +23,30 @@ from app.github import GitHubClient
 from app.logging_conf import log_event
 from app.models import Repository, SyncedIssue, SyncedPullRequest
 from app.policy import OutwardAction, outward_decision, privileged_setup_allowed, repository_decision
-from app.redaction import safe_error
+from app.redaction import redact, safe_error
 from app.repos import parse_repository_ref
 
 logger = logging.getLogger("app.api")
 router = APIRouter()
+
+GITHUB_REJECTION_FALLBACK = "GitHub rejected the issue"
+
+
+def github_rejection_detail(response: httpx.Response) -> str:
+    """Redacted, bounded text for a GitHub error response, whatever shape its body has."""
+    try:
+        data: Any = response.json()
+    except ValueError:
+        data = None
+    message = data.get("message") if isinstance(data, dict) else data
+    if message is None or message == "":
+        text = response.text.strip()
+    elif isinstance(message, str):
+        text = message
+    else:
+        # Serialize after masking sensitive keys so values and keys both pass the text scrubber.
+        text = json.dumps(redact(message), default=str)
+    return safe_error(text) if text else GITHUB_REJECTION_FALLBACK
 
 
 def repository_payload(repo: Repository) -> dict[str, Any]:
@@ -422,15 +441,14 @@ async def create_repository_issues(repo_id: int) -> JSONResponse | dict[str, Any
                 }
             )
     except httpx.HTTPStatusError as exc:
-        detail = exc.response.json().get("message", "GitHub rejected the issue")
         return JSONResponse(
             status_code=exc.response.status_code,
-            content={"detail": detail, "created": created},
+            content={"detail": github_rejection_detail(exc.response), "created": redact(created)},
         )
     except (httpx.HTTPError, RuntimeError) as exc:
         return JSONResponse(
             status_code=502,
-            content={"detail": f"failed to create issue: {safe_error(exc)}", "created": created},
+            content={"detail": f"failed to create issue: {safe_error(exc)}", "created": redact(created)},
         )
 
     # Keep the selection tab current without requiring a second button click.

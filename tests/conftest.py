@@ -18,7 +18,6 @@ import app.database as database
 from app.auth import reset_sessions_for_tests
 from app.config import get_settings
 from app.droid_client import reset_droid_client_for_tests
-from app.intake import reset_deliveries_for_tests
 from app.models import Base
 
 # Fake operator credential used only by protected-mode tests.
@@ -44,11 +43,22 @@ def _reset_access_env() -> None:
 
 
 @pytest.fixture(autouse=True)
+def git_identity(tmp_path_factory, monkeypatch):
+    """Hermetic Git configuration with a test identity; never the developer's own."""
+    config = tmp_path_factory.mktemp("gitconfig") / "config"
+    config.write_text("[user]\n\tname = Forge Test\n\temail = forge-test@example.com\n")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(config))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    for name in ("GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL", "EMAIL"):
+        monkeypatch.delenv(name, raising=False)
+    return config
+
+
+@pytest.fixture(autouse=True)
 def clean_db(tmp_path):
     get_settings.cache_clear()
     reset_droid_client_for_tests()
     reset_sessions_for_tests()
-    reset_deliveries_for_tests()
     os.environ["DATABASE_URL"] = f"sqlite:///{tmp_path}/tasks.db"
     os.environ["GITHUB_WEBHOOK_SECRET"] = "test-secret"
     os.environ["TRIGGER_LABEL"] = "Droid-complete"
