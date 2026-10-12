@@ -8,6 +8,7 @@ from sqlalchemy import Boolean, DateTime, Float, Integer, String, Text, UniqueCo
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, validates
 
 from app.redaction import redact, redact_text, safe_error
+from app.review_outcomes import REVIEW_TARGET_PULL_REQUEST, github_outcome_dict
 from app.timeutil import format_sgt, iso_sgt
 
 
@@ -150,6 +151,9 @@ class Task(RedactedOutputMixin, Base):
     candidate_branch: Mapped[str | None] = mapped_column(String(255), nullable=True)
     candidate_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
     candidate_recorded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Incremented on every candidate recording, so an operator approval names the exact
+    # recording it saw (NULL on older rows = no candidate recorded since the upgrade).
+    candidate_generation: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # True for rows whose usage columns are a roll-up of their RunAttempt rows. The
     # additive migration leaves it NULL on older rows, whose usage columns are then a
     # historical summary that new attempts never overwrite or re-count.
@@ -185,6 +189,7 @@ class Task(RedactedOutputMixin, Base):
                 "branch": self.candidate_branch,
                 "status": self.candidate_status,
                 "recorded_at": iso_sgt(self.candidate_recorded_at),
+                "generation": self.candidate_generation,
             },
             "accounting_basis": accounting_basis(self.attempts_tracked),
             "kind": "fix",
@@ -278,6 +283,16 @@ class ReviewTask(RedactedOutputMixin, Base):
     findings: Mapped[str | None] = mapped_column(Text, nullable=True)
     # See Task.attempts_tracked.
     attempts_tracked: Mapped[bool | None] = mapped_column(Boolean, nullable=True, default=True)
+    # "candidate" for a pre-publication review of a task's local candidate (pr_number 0,
+    # never posted to GitHub), "pull_request" for an assigned PR. NULL = PR review row
+    # recorded before this column existed.
+    review_target: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    task_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    # What actually reached GitHub for a PR review, kept apart from the AI verdict:
+    # e.g. a self-review APPROVE that GitHub refused and Forge re-posted as COMMENT.
+    github_review_event: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    github_review_outcome: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    github_review_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -309,6 +324,12 @@ class ReviewTask(RedactedOutputMixin, Base):
             "findings": _load_findings(self.findings),
             "accounting_basis": accounting_basis(self.attempts_tracked),
             "kind": "review",
+            "review_target": self.review_target or REVIEW_TARGET_PULL_REQUEST,
+            "task_id": self.task_id,
+            "ai_verdict": self.verdict,
+            "github_outcome": github_outcome_dict(
+                self.github_review_outcome, self.github_review_event, iso_sgt(self.github_review_at)
+            ),
         }
 
 

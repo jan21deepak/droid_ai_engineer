@@ -80,6 +80,11 @@ class Settings(BaseSettings):
     forge_allow_github_writes: bool = False
     # Stored per-repository setup commands only execute with this opt-in.
     forge_allow_privileged_setup: bool = False
+    # App-owned local acceptance checks run against a clean checkout of each
+    # candidate before approval: a JSON list of {"name", "argv", "timeout_seconds"?}.
+    # Operator configuration only (never supplied over HTTP); argv runs without a
+    # shell in the clean agent environment. Empty or invalid blocks approval.
+    forge_acceptance_checks: str = ""
 
     # ROI / productivity assumptions (leadership dashboard)
     junior_swe_annual_cost_usd: float = 150_000.0

@@ -22,12 +22,19 @@ Description:
 
 Requirements:
 - Make only the requested changes described in the issue.
-- Create a new git branch for your work.
+{branch_instruction}
 - Run the project's test suite (or the closest relevant subset if the full suite is impractical) and fix any failures introduced by your changes.
 - Commit all of your work on that branch and leave the working tree clean.
 - Do NOT push, do NOT open a pull request, and do NOT change git remotes or credentials.
-- End your final response with a line of the exact form `BRANCH: <your-branch-name>` followed by a short summary of the completed work.
+- End your final response with a line of the exact form `BRANCH: {branch_line}` followed by a short summary of the completed work.
 """
+
+NEW_BRANCH_INSTRUCTION = "- Create a new git branch for your work."
+# Used when the checked-out ref is itself an approved publication branch, so the
+# candidate stays on it and publication needs no additional branch.
+CURRENT_BRANCH_INSTRUCTION = (
+    "- Work and commit directly on the checked-out branch `{branch}`; do not create or switch to another branch."
+)
 
 FOLLOW_UP_PROMPT_TEMPLATE = """Continue work on this agent session.
 
@@ -58,13 +65,20 @@ def build_fix_prompt(
     issue_title: str,
     issue_body: str,
     starting_ref: str,
+    *,
+    work_branch: str | None = None,
 ) -> str:
+    """``work_branch`` keeps the agent on that checked-out branch instead of creating a new one."""
     return FIX_PROMPT_TEMPLATE.format(
         repository_url=repository_url,
         issue_number=issue_number,
         issue_title=issue_title,
         issue_body=issue_body or "(no description provided)",
         starting_ref=starting_ref or "the repository default branch",
+        branch_instruction=CURRENT_BRANCH_INSTRUCTION.format(branch=work_branch)
+        if work_branch
+        else NEW_BRANCH_INSTRUCTION,
+        branch_line=work_branch or "<your-branch-name>",
     )
 
 

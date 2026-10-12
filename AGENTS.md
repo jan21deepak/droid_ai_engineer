@@ -71,7 +71,8 @@ Before declaring any change done: run `ruff check`, `ruff format --check`,
 - `app/auth.py` / `app/auth_routes.py` — default-deny operator access middleware, sessions, CSRF/Origin/Host checks, login/logout
 - `app/intake.py` — HMAC-signed `/webhook` intake; `app/policy.py` — repository approval policy
 - `app/worker.py` — fix/review launch and attempt-bound finalization
-- `app/candidates.py` — local candidate recording; `app/review_policy.py` — restricted review config, diff checks, verdict parsing; `app/publishing.py` — policy-gated PR creation (not called automatically)
+- `app/candidates.py` — local candidate recording; `app/review_policy.py` — restricted review config, diff checks, verdict parsing; `app/publishing.py` — explicit publish of an approved candidate SHA (push, remote-head check, draft PR; never called automatically)
+- `app/delivery.py` — SHA-bound readiness and operator approval; `app/delivery_models.py` — check runs, approvals, publications; `app/acceptance_checks.py` / `app/check_config.py` — app-run `FORGE_ACCEPTANCE_CHECKS`; `app/candidate_review.py` — restricted pre-publication review; `app/delivery_git.py` — clean checkouts, workspace recheck, push; `app/remote_ci.py` — read-only GitHub CI observation; `app/review_outcomes.py` — AI verdict vs GitHub review outcome; `app/delivery_routes.py` — delivery APIs
 - `app/droid_client.py` — Droid SDK wrapper: workspaces, fix/review sessions, resume
 - `app/github.py` — GitHub REST client: comments, PRs, reviews, webhook signature
 - `app/models.py` — SQLAlchemy `Task` / `ReviewTask` / `Repository` models

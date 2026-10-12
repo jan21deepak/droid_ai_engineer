@@ -8,6 +8,7 @@ from contextlib import contextmanager
 from sqlalchemy import Engine, create_engine, inspect, text
 from sqlalchemy.orm import Session, sessionmaker
 
+import app.delivery_models
 import app.run_models  # noqa: F401  (registers run_attempts on Base.metadata)
 from app.config import get_settings
 from app.logging_conf import log_event

@@ -18,6 +18,7 @@ from pydantic import BaseModel, Field
 
 from app.attempts import list_attempts, parent_accounting
 from app.database import db_session
+from app.delivery import delivery_state
 from app.models import ReviewTask, Task
 from app.recovery import ContinuationRefusedError, continue_task
 from app.run_control import StopReason, StopRefusedError, stop_parent
@@ -138,6 +139,7 @@ async def task_detail(task_id: int) -> JSONResponse | dict[str, Any]:
             "task": task.to_dict(),
             "attempts": [a.to_dict() for a in list_attempts(session, PARENT_TASK, task_id)],
             "accounting": parent_accounting(session, PARENT_TASK, task),
+            "delivery": delivery_state(session, task),
         }
 
 

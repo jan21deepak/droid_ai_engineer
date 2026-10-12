@@ -67,6 +67,21 @@
         "title": "AssignPullsRequest",
         "type": "object"
       },
+      "CandidateRequest": {
+        "properties": {
+          "candidate_sha": {
+            "description": "Full SHA of the candidate commit shown to the operator",
+            "pattern": "^[0-9a-f]{40}([0-9a-f]{24})?$",
+            "title": "Candidate Sha",
+            "type": "string"
+          }
+        },
+        "required": [
+          "candidate_sha"
+        ],
+        "title": "CandidateRequest",
+        "type": "object"
+      },
       "CostEstimateRequest": {
         "properties": {
           "rate_usd_per_credit": {
@@ -953,6 +968,54 @@
         "summary": "Task Detail"
       }
     },
+    "/api/tasks/{task_id}/approve": {
+      "post": {
+        "description": "Approve publication of exactly ``candidate_sha``. Not a GitHub review; grants no merge permission.",
+        "operationId": "approve_api_tasks__task_id__approve_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "task_id",
+            "required": true,
+            "schema": {
+              "title": "Task Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CandidateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Approve"
+      }
+    },
     "/api/tasks/{task_id}/attempts": {
       "get": {
         "operationId": "task_attempts_api_tasks__task_id__attempts_get",
@@ -988,6 +1051,158 @@
           }
         },
         "summary": "Task Attempts"
+      }
+    },
+    "/api/tasks/{task_id}/candidate-review": {
+      "post": {
+        "description": "Start a fresh restricted (Read/Grep/Glob) review of the current candidate. Nothing is posted to GitHub.",
+        "operationId": "review_candidate_api_tasks__task_id__candidate_review_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "task_id",
+            "required": true,
+            "schema": {
+              "title": "Task Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Review Candidate"
+      }
+    },
+    "/api/tasks/{task_id}/checks": {
+      "post": {
+        "description": "Run the configured acceptance checks against the current candidate in a clean checkout.",
+        "operationId": "run_checks_api_tasks__task_id__checks_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "task_id",
+            "required": true,
+            "schema": {
+              "title": "Task Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Run Checks"
+      }
+    },
+    "/api/tasks/{task_id}/ci/refresh": {
+      "post": {
+        "description": "Observe GitHub CI (read-only) for the task's latest pushed publication.",
+        "operationId": "refresh_ci_api_tasks__task_id__ci_refresh_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "task_id",
+            "required": true,
+            "schema": {
+              "title": "Task Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Refresh Ci"
+      }
+    },
+    "/api/tasks/{task_id}/delivery": {
+      "get": {
+        "description": "Candidate, SHA-bound checks/review/approval, destination, publication, remote CI and readiness.",
+        "operationId": "delivery_detail_api_tasks__task_id__delivery_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "task_id",
+            "required": true,
+            "schema": {
+              "title": "Task Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delivery Detail"
       }
     },
     "/api/tasks/{task_id}/follow-up": {
@@ -1036,6 +1251,54 @@
           }
         },
         "summary": "Follow Up Task"
+      }
+    },
+    "/api/tasks/{task_id}/publish": {
+      "post": {
+        "description": "Push the approved candidate to its allowed branch and create or reuse a draft PR.\n\n502 reports a partial publication with every known fact (pushed or not,\nremote head, PR); retrying continues without duplicating the push or PR.",
+        "operationId": "publish_api_tasks__task_id__publish_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "task_id",
+            "required": true,
+            "schema": {
+              "title": "Task Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CandidateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Publish"
       }
     },
     "/api/tasks/{task_id}/recover": {

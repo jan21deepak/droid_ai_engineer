@@ -14,7 +14,7 @@ When a GitHub Issue is labeled `Droid-complete` in a configured repository (e.g.
 2. Persists a **Task** record in SQLite.
 3. Launches a **local Droid session** via the Python SDK (`droid-sdk`) inside a fresh clone of the target repo. The clone's `origin` is credential-free, so the agent cannot push; an optional per-repo **setup command** (e.g. `npm ci`) runs only when privileged setup is enabled.
 4. Streams the agent turn in a background asyncio task; Droid makes the requested changes, runs the project's tests, fixes failures, commits on a new branch, and reports `BRANCH: <name>` plus a summary.
-5. On completion, forge records the **local candidate** (base SHA, candidate commit SHA, branch, and whether the tree was clean), stores the summary, runtime, tokens and Factory credits, and, only when GitHub writes are enabled, posts a ✅ comment on the issue saying nothing was pushed. Publishing is a separate, later step (`app/publishing.py`) that no automatic path calls.
+5. On completion, forge records the **local candidate** (base SHA, candidate commit SHA, branch, and whether the tree was clean), stores the summary, runtime, tokens and Factory credits, and, only when GitHub writes are enabled, posts a ✅ comment on the issue saying nothing was pushed. Publishing is a separate, later step (`app/publishing.py`) that no automatic path calls; see [Delivery](#delivery).
 6. A **second Droid session** reviews a pull request assigned for review. It is restricted to the `Read`, `Grep` and `Glob` tools and sees the exact base-to-head diff; forge stores its structured verdict and findings and posts them as a **GitHub PR review** pinned to the reviewed commit.
 7. Exposes a live **dashboard**, a **metrics endpoint**, an orchestration-grade **health endpoint**, and a **follow-up** API (`POST /api/tasks/{id}/follow-up`) for SDK `Session.resume` + stream.
 
@@ -383,6 +383,37 @@ applies to tasks and reviews stored earlier.
   unless `FORGE_ALLOW_PRIVILEGED_SETUP=true`. Saving a command over HTTP is not
   permission to run it.
 
+## Delivery
+
+A candidate becomes a draft PR only through explicit operator requests, each bound to
+the task's current candidate SHA (`GET /api/tasks/{id}/delivery` shows every fact and
+blocker):
+
+1. `POST /api/tasks/{id}/checks` runs the configured `FORGE_ACCEPTANCE_CHECKS` (a JSON
+   list of `{"name", "argv", "timeout_seconds"}`; argv runs without a shell) in a fresh
+   clone checked out at the candidate SHA, with the clean agent environment. The
+   evaluated SHA is recorded; no configuration, an invalid one, or any failed, timed-out
+   or interrupted check blocks approval.
+2. `POST /api/tasks/{id}/candidate-review` starts a restricted Read/Grep/Glob review of
+   the exact `base..candidate` diff. Its verdict is local evidence; nothing is posted.
+3. `POST /api/tasks/{id}/approve` with `{"candidate_sha": "<full sha>"}` records the
+   operator's approval (SHA, time, evidence ids). It is publication approval only: not
+   a GitHub review and no merge permission. A newer candidate, even a re-recorded same
+   SHA, needs fresh checks, review and approval.
+4. `POST /api/tasks/{id}/publish` with the same SHA re-inspects the workspace (stale or
+   dirty is refused), pushes that SHA without force to the candidate's branch (which
+   must be listed in `FORGE_ALLOWED_BRANCHES` and must not be the default branch),
+   reads the remote head back, then creates or reuses a draft PR and checks its head.
+   A partial failure returns **502** with what is known (pushed or not, remote head,
+   PR); retrying continues without a second push or PR.
+5. `POST /api/tasks/{id}/ci/refresh` (and the poller) read GitHub check runs and
+   commit statuses for the published SHA: `pending`, `failing`, `passing`,
+   `none_reported` or `unavailable` (never treated as passing). Remote CI is observed
+   after publication and is not a prerequisite for it. Forge never merges.
+
+When the task starts from a branch listed in `FORGE_ALLOWED_BRANCHES`, the agent is told
+to commit on that checked-out branch instead of creating another one.
+
 ## Execution boundary
 
 - **App-owned Git credentials.** Workspace remotes are credential-free. Clone, fetch and
@@ -419,6 +450,7 @@ applies to tasks and reviews stored earlier.
 | `FORGE_ALLOWED_BRANCHES` | Comma-separated branches the app may push to or open a PR from. Empty approves nothing in protected mode | — |
 | `FORGE_ALLOW_GITHUB_WRITES` | Master switch for every GitHub write (comments, labels, issues, pushes, PRs, reviews) | `false` |
 | `FORGE_ALLOW_PRIVILEGED_SETUP` | Allow stored per-repository setup commands to run in workspaces | `false` |
+| `FORGE_ACCEPTANCE_CHECKS` | JSON list of local acceptance checks (`name`, `argv`, optional `timeout_seconds`, default 900) run by the app before approval. Empty means not configured, which blocks approval | — |
 | `GITHUB_WEBHOOK_SECRET` | Shared secret for webhook HMAC validation | — |
 | `PUBLIC_BASE_URL` | Public tunnel URL GitHub can reach (e.g. `https://….trycloudflare.com`). Enables label→webhook dispatch and `POST /api/webhooks/sync` | — |
 | `GITHUB_TOKEN` | PAT used only by app-owned operations: clone/fetch, policy-approved pushes, same-repo PRs, comments and reviews. Never given to agents | — |

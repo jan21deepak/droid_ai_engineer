@@ -20,6 +20,7 @@ from app.github import GitHubClient
 from app.logging_conf import log_event
 from app.models import ReviewTask, Task, TaskStatus
 from app.policy import repository_decision
+from app.remote_ci import refresh_published_ci
 
 logger = logging.getLogger("app.worker")
 
@@ -141,11 +142,14 @@ async def poll_github_state(github: GitHubClient | None = None) -> int:
         tasks_with_pr = session.query(Task).filter(Task.pull_request_url.isnot(None)).all()
     updated += await refresh_pr_states(github, tasks_with_pr)
     updated += await finalize_merged_running_tasks()
+    # Observation only: remote CI never changes a task's delivery approval or publication.
+    await refresh_published_ci(github)
 
     with db_session() as session:
         pending = (
             session.query(ReviewTask)
-            .filter(ReviewTask.status == TaskStatus.COMPLETED, ReviewTask.merged.is_(False))
+            # Candidate reviews (pr_number 0) have no pull request to poll.
+            .filter(ReviewTask.status == TaskStatus.COMPLETED, ReviewTask.merged.is_(False), ReviewTask.pr_number > 0)
             .all()
         )
 

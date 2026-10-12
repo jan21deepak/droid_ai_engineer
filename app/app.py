@@ -16,11 +16,13 @@ from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 
 from app import __version__
+from app.acceptance_checks import recover_interrupted_check_runs, shutdown_check_runs
 from app.analytics import fire_and_forget
 from app.auth import AccessControlMiddleware, operator_context, operator_credential_problem
 from app.auth_routes import router as auth_router
 from app.config import ACCESS_MODE_PROTECTED, effective_access_mode, get_settings
 from app.database import check_db_connectivity, db_session, init_db
+from app.delivery_routes import router as delivery_router
 from app.droid_client import get_droid_client
 from app.error_tracking import init_error_tracking
 from app.github import GitHubClient
@@ -29,6 +31,7 @@ from app.logging_conf import log_event, setup_logging
 from app.metrics import compute_metrics, recent_activity
 from app.models import Repository, ReviewTask, SyncedIssue, SyncedPullRequest, Task, TaskStatus
 from app.policy import OutwardAction, outward_decision, repository_decision
+from app.publishing import recover_interrupted_publications
 from app.recovery import recover_interrupted_tasks
 from app.redaction import safe_error
 from app.repository_routes import ensure_repo_automation, sync_repository_pulls
@@ -77,6 +80,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
     droid = get_droid_client()
     await recover_interrupted_tasks(droid)
+    recover_interrupted_check_runs()
+    recover_interrupted_publications()
     stop_event = asyncio.Event()
     worker_task = asyncio.create_task(worker_loop(stop_event))
     watchdog_task = asyncio.create_task(runtime_watchdog(stop_event))
@@ -85,6 +90,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     stop_event.set()
     await worker_task
     await watchdog_task
+    await shutdown_check_runs()
     await droid.shutdown()
 
 
@@ -98,6 +104,7 @@ app.include_router(auth_router)
 app.include_router(intake_router)
 app.include_router(repository_router)
 app.include_router(run_router)
+app.include_router(delivery_router)
 
 
 @app.exception_handler(RequestValidationError)

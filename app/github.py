@@ -617,6 +617,37 @@ class GitHubClient:
                 page += 1
         return reviews
 
+    async def list_commit_check_runs(self, repository: str, sha: str) -> list[dict[str, Any]]:
+        """Check runs GitHub reports for one commit (first 100). Read-only."""
+
+        async def fetch() -> list[dict[str, Any]]:
+            async with httpx.AsyncClient(timeout=20) as client:
+                resp = await client.get(
+                    f"{self.api_url}/repos/{repository}/commits/{sha}/check-runs",
+                    headers=self._headers(),
+                    params={"per_page": 100},
+                )
+                resp.raise_for_status()
+                runs = (resp.json() or {}).get("check_runs") or []
+                return [run for run in runs if isinstance(run, dict)]
+
+        return await retry_with_backoff(fetch)
+
+    async def get_commit_status(self, repository: str, sha: str) -> dict[str, Any]:
+        """Combined commit status (legacy status API) for one commit. Read-only."""
+
+        async def fetch() -> dict[str, Any]:
+            async with httpx.AsyncClient(timeout=20) as client:
+                resp = await client.get(
+                    f"{self.api_url}/repos/{repository}/commits/{sha}/status",
+                    headers=self._headers(),
+                )
+                resp.raise_for_status()
+                data: dict[str, Any] = resp.json() or {}
+                return data
+
+        return await retry_with_backoff(fetch)
+
     async def check_connectivity(self) -> bool:
         try:
             async with httpx.AsyncClient(timeout=5) as client:

@@ -32,7 +32,7 @@ from app.candidates import WorkspaceState
 from app.config import get_settings
 from app.logging_conf import log_event
 from app.models import TaskStatus
-from app.policy import OutwardAction, outward_decision, privileged_setup_allowed
+from app.policy import OutwardAction, configured_publication_branch, outward_decision, privileged_setup_allowed
 from app.prompts import (
     FIX_PROMPT_TEMPLATE,
     FOLLOW_UP_PROMPT_TEMPLATE,
@@ -787,7 +787,14 @@ class DroidClient:
         )
         # The candidate's base: the commit the agent starts from.
         base_sha = await _git_or_none(["rev-parse", "--verify", "HEAD^{commit}"], cwd=ws)
-        prompt = build_fix_prompt(repository_url, issue_number, issue_title, issue_body, starting_ref or "")
+        prompt = build_fix_prompt(
+            repository_url,
+            issue_number,
+            issue_title,
+            issue_body,
+            starting_ref or "",
+            work_branch=configured_publication_branch(starting_ref),
+        )
         session = await self._open_session(
             cwd=ws, model=model or self.model, config=self._fix_session_config(), purpose="session"
         )

@@ -66,6 +66,12 @@ from app.reconcile import (
 )
 from app.redaction import redact_text, safe_error
 from app.repos import resolve_agent_launch_config
+from app.review_outcomes import (
+    REVIEW_TARGET_CANDIDATE,
+    REVIEW_TARGET_PULL_REQUEST,
+    GitHubReviewOutcome,
+    classify_github_outcome,
+)
 from app.review_policy import (
     REVIEW_POLICY_RESTRICTED,
     ReviewBinding,
@@ -371,6 +377,7 @@ def ensure_review_task_row(
             pr_title=pr_title or f"PR #{pr_number}",
             pr_url=pr_url or f"https://github.com/{repository}/pull/{pr_number}",
             status=TaskStatus.QUEUED,
+            review_target=REVIEW_TARGET_PULL_REQUEST,
         )
         session.add(review)
         session.flush()
@@ -571,6 +578,31 @@ async def launch_review_task(
         _fail_review(review_id, f"review context could not be prepared: {safe_error(exc)}")
         log_event(logger, logging.ERROR, "droid.review_context_failed", review_id=review_id, error=str(exc))
         return
+    await run_review_over_context(
+        review_id,
+        context,
+        repository=repository,
+        repository_url=repository_url or f"https://github.com/{repository}",
+        pr_url=pr_url or f"https://github.com/{repository}/pull/{pr_number}",
+        model=launch.get("model"),
+    )
+
+
+async def run_review_over_context(
+    review_id: int,
+    context: ReviewContext,
+    *,
+    repository: str,
+    repository_url: str,
+    pr_url: str,
+    model: str | None,
+) -> None:
+    """Bind an exact review context to a still-unbound row and open its fresh restricted session.
+
+    Shared by pull request reviews and pre-publication candidate reviews; an
+    incomplete context fails the row before any session is opened.
+    """
+    droid = get_droid_client()
     if not _persist_review_context(review_id, context):
         log_event(logger, logging.WARNING, "review.launch_rejected", review_id=review_id, reason="row already bound")
         return
@@ -592,7 +624,7 @@ async def launch_review_task(
             PARENT_REVIEW,
             review_id,
             AttemptKind.REVIEW,
-            requested_model=launch.get("model") or getattr(droid, "model", None) or get_settings().droid_model,
+            requested_model=model or getattr(droid, "model", None) or get_settings().droid_model,
             base_sha=context.base_sha,
             head_sha=context.head_sha,
         ).attempt_id
@@ -602,10 +634,10 @@ async def launch_review_task(
     try:
         result = await droid.start_review_run(
             context=context,
-            repository_url=repository_url or f"https://github.com/{repository}",
+            repository_url=repository_url,
             review_id=review_id,
-            pr_url=pr_url or f"https://github.com/{repository}/pull/{pr_number}",
-            model=launch.get("model"),
+            pr_url=pr_url,
+            model=model,
             on_complete=partial(finalize_review_task, review_id, binding, attempt_id=attempt_id),
             on_session_opened=partial(_bind_review_session, review_id, binding, attempt_id=attempt_id),
             observer=TurnRecorder(attempt_id),
@@ -620,7 +652,6 @@ async def launch_review_task(
             "droid.review_start_failed",
             review_id=review_id,
             repo=repository,
-            pr=pr_number,
             error=str(exc),
         )
         return
@@ -634,7 +665,7 @@ async def launch_review_task(
         attempt_id=attempt_id,
         session_id=result["session_id"],
         repo=repository,
-        pr=pr_number,
+        head_sha=context.head_sha,
     )
 
 
@@ -792,6 +823,7 @@ async def finalize_review_task(
                 review.findings = json.dumps(parsed.findings)
             verdict = review.verdict
             error = review.error
+            local_only = review.review_target == REVIEW_TARGET_CANDIDATE
             target = _ReviewTarget(review_id, review.repository, review.pr_number, binding.head_sha)
     if rejection is not None or attempt is None:
         # A stopped review keeps its outcome; only usage it reports late is retained, once.
@@ -808,19 +840,31 @@ async def finalize_review_task(
         new=status,
     )
 
+    if local_only:
+        # A candidate review has no pull request yet; its verdict is local evidence only.
+        _record_github_outcome(review_id, GitHubReviewOutcome.LOCAL_ONLY, None)
+        log_event(logger, logging.INFO, "review.candidate_completed", review_id=review_id, verdict=verdict)
+        return
     if status != TaskStatus.COMPLETED or not summary:
+        _record_github_outcome(review_id, GitHubReviewOutcome.NOT_POSTED, None)
         log_event(logger, logging.WARNING, "review.failed", review_id=review_id, error=error)
         return
 
     posted = False
-    event = {ReviewVerdict.APPROVE: "APPROVE", ReviewVerdict.REQUEST_CHANGES: "REQUEST_CHANGES"}.get(
+    intended = {ReviewVerdict.APPROVE: "APPROVE", ReviewVerdict.REQUEST_CHANGES: "REQUEST_CHANGES"}.get(
         verdict or "", "COMMENT"
     )
+    event = intended
     # Checked before the head read too: stored work outside current policy gets no GitHub call at all.
-    if not policy_denied(OutwardAction.PULL_REQUEST_REVIEW, target.repository, review_id=review_id):
+    if policy_denied(OutwardAction.PULL_REQUEST_REVIEW, target.repository, review_id=review_id):
+        _record_github_outcome(review_id, GitHubReviewOutcome.POLICY_DENIED, None)
+    else:
         if event == "APPROVE" and not await _pull_request_head_matches(github, target):
             event = "COMMENT"
+        attempted = event
         posted, event = await _post_review_verdict(github, target, summary, event)
+        kind = classify_github_outcome(intended=intended, attempted=attempted, posted_event=event, posted=posted)
+        _record_github_outcome(review_id, kind, event if posted else None)
 
     log_event(
         logger,
@@ -834,6 +878,16 @@ async def finalize_review_task(
         posted=posted,
         reviewed_sha=target.head_sha,
     )
+
+
+def _record_github_outcome(review_id: int, outcome: str, event: str | None) -> None:
+    """Persist what reached GitHub, separately from the AI verdict."""
+    with db_session() as session:
+        review = session.get(ReviewTask, review_id)
+        if review is not None:
+            review.github_review_outcome = outcome
+            review.github_review_event = event
+            review.github_review_at = datetime.now(UTC)
 
 
 # ---------------------------------------------------------------------------

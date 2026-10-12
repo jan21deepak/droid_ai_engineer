@@ -65,6 +65,7 @@ def record_candidate(task_id: int, state: WorkspaceState) -> str | None:
         task.candidate_branch = state.branch
         task.candidate_status = status
         task.candidate_recorded_at = datetime.now(UTC)
+        task.candidate_generation = (task.candidate_generation or 0) + 1
     log_event(
         logger,
         logging.INFO,

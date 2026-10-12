@@ -113,6 +113,12 @@ def ref_decision(ref: str, settings: Settings | None = None) -> PolicyDecision:
     return PolicyDecision(False, f"branch {branch!r} is not in FORGE_ALLOWED_BRANCHES")
 
 
+def configured_publication_branch(ref: str | None, settings: Settings | None = None) -> str | None:
+    """``ref`` as a branch name when FORGE_ALLOWED_BRANCHES lists it explicitly, else ``None``."""
+    branch = _normalize_ref(ref or "")
+    return branch if branch and branch in allowed_branches(settings or get_settings()) else None
+
+
 def outward_decision(
     action: str,
     repository: str,
