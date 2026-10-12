@@ -299,8 +299,18 @@ A completion callback is bound to its attempt id. Only an attempt that is still 
 | `POST /api/attempts/{id}/cost-reconciliation` | Record a manually reconciled amount: `{"usd": …, "source": "…"}` |
 | `POST /api/tasks/{id}/follow-up` | New `follow_up` attempt in the task's session |
 | `POST /api/tasks/{id}/recover` | New `recovery` attempt for an interrupted or failed task (refused for completed tasks) |
+| `POST /api/tasks/{id}/stop` | Durably stop the task's active attempt, then interrupt its live session |
+| `POST /api/reviews/{id}/stop` | The same for a review |
+| `GET /api/run-limits` | In-flight runs, configured limits and the spending check's current state |
 
 All of them sit behind operator access. Continuations re-check repository policy before anything starts; a turn that cannot start closes its attempt as `failed` (usage unknown) and puts the task back in its previous status.
+
+#### Stopping and run limits
+
+- **Stop.** The stop route records `stop_requested_at` and `stop_reason` and marks the attempt and its task or review `stopped` in the database before it asks the SDK to interrupt the session; if the turn has not ended after a short grace period, its stream is cancelled. A completion callback that arrives later cannot turn a stopped attempt back into success: it is rejected, and its terminal usage is retained on the stopped attempt once (`late_usage_retained`). A restart leaves stopped attempts alone. Stopping an already stopped run is idempotent; stopping finished work returns **409**.
+- **One paid turn at a time.** Every implementation, review, follow-up and recovery turn is admitted inside the transaction that creates its attempt. Admission counts active attempts and live SDK sessions against `FORGE_MAX_CONCURRENT_RUNS` (default 1). A follow-up or recovery refused for capacity returns **409** and writes nothing, so the operator can retry later; a queued task or review that reaches the launch step while capacity is full is recorded as `blocked` with the reason.
+- **Runtime and continuations.** A watchdog stops any attempt that has run longer than `DROID_TURN_TIMEOUT_SECONDS` with `stop_reason: runtime_limit`. A task may take at most `FORGE_MAX_CONTINUATIONS` follow-up plus recovery turns; the next one is refused and recorded as a `blocked` attempt.
+- **Spending checks.** `FORGE_BUDGET_POLICY` is checked before every paid turn. `credit_limit` blocks once observed credits reach `FORGE_CREDIT_LIMIT` and also blocks when any attempt's usage is unknown. A missing or invalid input, or an unknown policy name, blocks every paid turn (fail closed). These refusals are persisted as `blocked` attempts with the reason, never spawn a session, and are not counted as unknown cost. `account_cap` records an account-level cap that the account owner confirmed Factory billing enforces (`FORGE_DEMO_ACCOUNT_CAP_USD`): Forge shows observed credits, leaves USD `unknown` unless an explicit estimate or reconciliation exists, and reports `app_enforces_usd_ceiling: false`. It does not invent a credit-to-USD rate or change account settings.
 
 #### Usage accounting
 
@@ -427,6 +437,11 @@ applies to tasks and reviews stored earlier.
 | `DROID_USD_PER_AGENT_RUN` | Flat USD attributed per completed run when real credit usage is unavailable | `0` |
 | `FORGE_USD_PER_CREDIT_ESTIMATE` | Optional explicit USD-per-credit *estimate* rate for attempts with observed credits; ignored unless `FORGE_USD_ESTIMATE_SOURCE` is also set and the rate is finite and positive | — |
 | `FORGE_USD_ESTIMATE_SOURCE` | Provenance label stored with configured estimates | — |
+| `FORGE_MAX_CONCURRENT_RUNS` | Paid Droid turns allowed at once across implementation, review, follow-up and recovery | `1` |
+| `FORGE_MAX_CONTINUATIONS` | Follow-up plus recovery turns allowed per implementation task | `3` |
+| `FORGE_BUDGET_POLICY` | Spending check before every paid turn: `none`, `account_cap` or `credit_limit`. Any other value blocks all paid turns | `none` |
+| `FORGE_DEMO_ACCOUNT_CAP_USD` | `account_cap` only: the USD cap the account owner confirmed Factory billing enforces. Recorded and shown, not enforced by Forge | — |
+| `FORGE_CREDIT_LIMIT` | `credit_limit` only: Factory credits Forge may observe before it blocks new turns. Unknown usage blocks | — |
 
 Time-to-Dollar Savings divides annual cost by **1,920** working hours/year. The service boots without API keys, logs warnings, and reports `degraded` on `/api/health`.
 

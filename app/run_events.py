@@ -61,6 +61,10 @@ class EventType:
     TURN_FINISHED = "turn_finished"
     START_FAILED = "start_failed"
     INTERRUPTED = "interrupted"
+    STOPPED = "stopped"
+    INTERRUPT_REQUESTED = "interrupt_requested"
+    BLOCKED = "blocked"
+    LATE_USAGE_RETAINED = "late_usage_retained"
 
 
 def event_limits() -> dict[str, int]:
@@ -219,6 +223,25 @@ class TurnRecorder:
                 error=type(exc).__name__,
             )
 
+    def admitted(self) -> bool:
+        """Whether the attempt is still active, checked just before the paid turn starts.
+
+        Fails closed: if the attempt cannot be read, no turn is started.
+        """
+        try:
+            with db_session() as session:
+                attempt = session.get(RunAttempt, self.attempt_id)
+                return attempt is not None and attempt.active
+        except Exception as exc:
+            log_event(
+                logger,
+                logging.WARNING,
+                "run_event.admission_check_failed",
+                attempt_id=self.attempt_id,
+                error=type(exc).__name__,
+            )
+            return False
+
     def started(self, kind: str) -> None:
         self._append(EventType.TURN_STARTED, {"kind": kind}, lifecycle=True)
 
@@ -245,6 +268,19 @@ class TurnRecorder:
         if outcome.get("error"):
             payload["error"] = outcome["error"]
         self._append(EventType.TURN_FINISHED, payload, lifecycle=True)
+        # A stopped turn gets no completion callback that counts usage; keep what it reported, once.
+        from app.attempts import retain_late_usage
+
+        try:
+            retain_late_usage(self.attempt_id, outcome)
+        except Exception as exc:
+            log_event(
+                logger,
+                logging.WARNING,
+                "run_event.late_usage_failed",
+                attempt_id=self.attempt_id,
+                error=type(exc).__name__,
+            )
 
 
 __all__ = [

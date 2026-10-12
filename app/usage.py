@@ -222,20 +222,29 @@ def set_reconciliation(attempt: RunAttempt, usd: Any, source: Any) -> None:
     attempt.reconciled_at = datetime.now(UTC)
 
 
-def apply_configured_estimate(attempt: RunAttempt) -> bool:
-    """Apply the operator-configured estimate rate, only when both a valid rate and a source are set."""
+def configured_estimate_rate() -> tuple[float, str] | None:
+    """The operator-configured USD-per-credit estimate and its source, or ``None`` unless both are valid."""
     settings = get_settings()
-    if attempt.estimated_usd is not None or attempt.factory_credits is None:
-        return False
     try:
         configured = float((settings.forge_usd_per_credit_estimate or "").strip())
     except ValueError:
-        return False
+        return None
     rate = finite_number(configured, maximum=MAX_USD_PER_CREDIT)
-    if rate is None or rate <= 0 or clean_source(settings.forge_usd_estimate_source) is None:
+    source = clean_source(settings.forge_usd_estimate_source)
+    if rate is None or rate <= 0 or source is None:
+        return None
+    return float(rate), source
+
+
+def apply_configured_estimate(attempt: RunAttempt) -> bool:
+    """Apply the operator-configured estimate rate, only when both a valid rate and a source are set."""
+    if attempt.estimated_usd is not None or attempt.factory_credits is None:
+        return False
+    configured = configured_estimate_rate()
+    if configured is None:
         return False
     try:
-        set_estimate(attempt, rate, settings.forge_usd_estimate_source)
+        set_estimate(attempt, *configured)
     except CostInputError:
         return False
     return True
@@ -282,6 +291,8 @@ def usage_coverage(attempts: list[RunAttempt], has_history: bool) -> str:
 
 def usd_summary(attempts: list[RunAttempt], *, has_history: bool = False) -> dict[str, Any]:
     """Dollar facts across attempts. A known-only subtotal is never presented as the complete cost."""
+    # Blocked-before-spawn attempts used nothing, so they have no cost to know.
+    attempts = [a for a in attempts if a.usage_source != UsageSource.NOT_STARTED]
     reconciled = [a for a in attempts if a.cost_status == CostStatus.RECONCILED]
     estimated = [a for a in attempts if a.cost_status == CostStatus.ESTIMATED]
     unknown = [a for a in attempts if a.cost_status == CostStatus.UNKNOWN]
@@ -322,6 +333,7 @@ __all__ = [
     "attributable_snapshot_usage",
     "clean_source",
     "clean_usage",
+    "configured_estimate_rate",
     "finalize_usage",
     "finite_number",
     "record_snapshot",

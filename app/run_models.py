@@ -72,6 +72,8 @@ class UsageSource:
     SNAPSHOT_DELTA_LOWER_BOUND = "snapshot_delta_lower_bound"
 
     SNAPSHOT = (SNAPSHOT_FRESH_SESSION, SNAPSHOT_DELTA_LOWER_BOUND)
+    # Blocked before any SDK turn was spawned: nothing was used.
+    NOT_STARTED = "not_started"
 
 
 class CostStatus:
@@ -152,6 +154,9 @@ class RunAttempt(RedactedOutputMixin, Base):
     reconciled_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
     reconciliation_source: Mapped[str | None] = mapped_column(String(200), nullable=True)
     reconciled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Durable stop intent (operator or runtime limit); a stopped attempt never returns to running.
+    stop_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    stop_reason: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
     @property
     def active(self) -> bool:
@@ -224,6 +229,8 @@ class RunAttempt(RedactedOutputMixin, Base):
             "completed_at": iso_sgt(self.completed_at),
             "duration_seconds": self.duration_seconds,
             "outcome_subtype": self.outcome_subtype,
+            "stop_requested_at": iso_sgt(self.stop_requested_at),
+            "stop_reason": self.stop_reason,
             "summary": redact_text(self.summary) if self.summary else self.summary,
             "error": safe_error(self.error) if self.error else self.error,
             "usage": self.usage_dict(),

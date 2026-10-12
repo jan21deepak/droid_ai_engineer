@@ -14,6 +14,7 @@ The rules this module enforces:
 
 from __future__ import annotations
 
+import contextlib
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -28,6 +29,7 @@ from app.logging_conf import log_event
 from app.models import ReviewTask, Task, TaskStatus, accounting_basis
 from app.redaction import redact_text
 from app.run_events import EventType, append_event
+from app.run_limits import LAUNCH_KINDS, RunRefusedError, admission_refusal
 from app.run_models import (
     PARENT_REVIEW,
     PARENT_TASK,
@@ -36,13 +38,16 @@ from app.run_models import (
     AttemptStatus,
     RunAttempt,
     UsageCompleteness,
+    UsageSource,
 )
 from app.usage import (
     ATTRIBUTION_LIMITS,
+    CostInputError,
     apply_configured_estimate,
     apply_snapshot_usage,
     finalize_usage,
     record_terminal_usage,
+    set_estimate,
     sum_known,
     usage_coverage,
     usage_totals,
@@ -125,8 +130,12 @@ def start_attempt(
 
     With ``parent_status`` the parent row moves to that status (and its error is
     cleared) in the same transaction. Raises ``AttemptConflictError`` while the
-    parent has an active attempt, and ``LookupError`` if the parent is missing.
+    parent has an active attempt, ``LookupError`` if the parent is missing, and
+    ``RunRefusedError`` when a run limit or spending check refuses the turn (a
+    durable refusal is committed as a blocked attempt first).
     """
+    refused: RunRefusedError | None = None
+    started: AttemptStart | None = None
     try:
         with db_session() as session:
             parent = get_parent(session, parent_type, parent_id)
@@ -135,33 +144,25 @@ def start_attempt(
             current = active_attempt(session, parent_type, parent_id)
             if current is not None:
                 raise AttemptConflictError(parent_type, parent_id, current.id)
-            last = (
-                session.query(func.max(RunAttempt.sequence))
-                .filter(RunAttempt.parent_type == parent_type, RunAttempt.parent_id == parent_id)
-                .scalar()
-            )
-            attempt = RunAttempt(
-                parent_type=parent_type,
-                parent_id=parent_id,
-                kind=kind,
-                sequence=int(last or 0) + 1,
-                status=AttemptStatus.STARTING,
-                continued_from_attempt_id=continued_from_attempt_id,
-                requested_model=requested_model or None,
-                base_sha=base_sha or None,
-                head_sha=head_sha or None,
-                usage_completeness=UsageCompleteness.UNKNOWN,
-            )
-            session.add(attempt)
-            previous_status, previous_error = parent.status, parent.error
-            if parent_status is not None:
-                parent.status = parent_status
-                parent.error = None
-            session.flush()
-            started = AttemptStart(attempt.id, attempt.sequence, previous_status, previous_error)
+            refused = _refuse_if_limited(session, parent_type, parent, kind)
+            if refused is None:
+                started = _insert_attempt(
+                    session,
+                    parent_type,
+                    parent,
+                    kind,
+                    requested_model=requested_model,
+                    base_sha=base_sha,
+                    head_sha=head_sha,
+                    continued_from_attempt_id=continued_from_attempt_id,
+                    parent_status=parent_status,
+                )
     except IntegrityError:
         # Another writer committed an active attempt (or the same sequence) first.
         raise AttemptConflictError(parent_type, parent_id) from None
+    if refused is not None:
+        raise refused
+    assert started is not None
     log_event(
         logger,
         logging.INFO,
@@ -173,6 +174,109 @@ def start_attempt(
         sequence=started.sequence,
     )
     return started
+
+
+def check_admission(parent_type: str, parent_id: int, kind: str) -> None:
+    """Run the start-time limits early (before workspace work) without starting anything.
+
+    Raises ``RunRefusedError`` exactly as ``start_attempt`` would, recording a
+    durable refusal; the authoritative check still happens in ``start_attempt``.
+    """
+    refused: RunRefusedError | None = None
+    with db_session() as session:
+        parent = get_parent(session, parent_type, parent_id)
+        if parent is None:
+            raise LookupError(f"{parent_type} {parent_id} not found")
+        refused = _refuse_if_limited(session, parent_type, parent, kind)
+    if refused is not None:
+        raise refused
+
+
+def _next_sequence(session: Session, parent_type: str, parent_id: int) -> int:
+    last = (
+        session.query(func.max(RunAttempt.sequence))
+        .filter(RunAttempt.parent_type == parent_type, RunAttempt.parent_id == parent_id)
+        .scalar()
+    )
+    return int(last or 0) + 1
+
+
+def _refuse_if_limited(session: Session, parent_type: str, parent: ParentRow, kind: str) -> RunRefusedError | None:
+    """Record a blocked attempt for a durable refusal; the caller raises the returned error after commit."""
+    refusal = admission_refusal(session, parent_type, parent.id, parent.status, kind)
+    if refusal is None:
+        return None
+    blocked_id = None
+    if refusal.durable:
+        now = datetime.now(UTC)
+        blocked = RunAttempt(
+            parent_type=parent_type,
+            parent_id=parent.id,
+            kind=kind,
+            sequence=_next_sequence(session, parent_type, parent.id),
+            status=AttemptStatus.BLOCKED,
+            outcome_subtype=refusal.code,
+            error=f"blocked before start: {refusal.detail}",
+            created_at=now,
+            completed_at=now,
+            usage_source=UsageSource.NOT_STARTED,
+            usage_completeness=UsageCompleteness.COMPLETE,
+            usage_recorded_at=now,
+        )
+        session.add(blocked)
+        session.flush()
+        blocked_id = blocked.id
+        append_event(
+            session, blocked.id, EventType.BLOCKED, {"code": refusal.code, "reason": refusal.detail}, lifecycle=True
+        )
+        if kind in LAUNCH_KINDS:
+            parent.status = TaskStatus.BLOCKED
+            parent.error = blocked.error
+    log_event(
+        logger,
+        logging.WARNING,
+        "attempt.refused",
+        parent_type=parent_type,
+        parent_id=parent.id,
+        kind=kind,
+        code=refusal.code,
+        reason=refusal.detail,
+        blocked_attempt_id=blocked_id,
+    )
+    return RunRefusedError(refusal, blocked_id)
+
+
+def _insert_attempt(
+    session: Session,
+    parent_type: str,
+    parent: ParentRow,
+    kind: str,
+    *,
+    requested_model: str | None,
+    base_sha: str | None,
+    head_sha: str | None,
+    continued_from_attempt_id: int | None,
+    parent_status: str | None,
+) -> AttemptStart:
+    attempt = RunAttempt(
+        parent_type=parent_type,
+        parent_id=parent.id,
+        kind=kind,
+        sequence=_next_sequence(session, parent_type, parent.id),
+        status=AttemptStatus.STARTING,
+        continued_from_attempt_id=continued_from_attempt_id,
+        requested_model=requested_model or None,
+        base_sha=base_sha or None,
+        head_sha=head_sha or None,
+        usage_completeness=UsageCompleteness.UNKNOWN,
+    )
+    session.add(attempt)
+    previous_status, previous_error = parent.status, parent.error
+    if parent_status is not None:
+        parent.status = parent_status
+        parent.error = None
+    session.flush()
+    return AttemptStart(attempt.id, attempt.sequence, previous_status, previous_error)
 
 
 def set_attempt_running(attempt: RunAttempt, *, session_id: str | None = None, base_sha: str | None = None) -> bool:
@@ -263,9 +367,9 @@ def finish_attempt(attempt: RunAttempt, *, status: str, outcome: dict[str, Any],
     finalize_usage(attempt, usage_from_outcome(outcome))
 
 
-def interrupt_attempt(session: Session, attempt: RunAttempt, reason: str) -> None:
-    """Mark an orphaned attempt interrupted, keeping any usage it had already observed."""
-    attempt.status = AttemptStatus.INTERRUPTED
+def _close_without_result(attempt: RunAttempt, status: str, reason: str) -> None:
+    """End an attempt that has no terminal result, keeping the usage it had already observed."""
+    attempt.status = status
     attempt.error = reason
     attempt.completed_at = datetime.now(UTC)
     if attempt.usage_completeness != UsageCompleteness.COMPLETE:
@@ -273,6 +377,11 @@ def interrupt_attempt(session: Session, attempt: RunAttempt, reason: str) -> Non
         observed = any(getattr(attempt, name) is not None for name in USAGE_FIELDS)
         attempt.usage_completeness = UsageCompleteness.PARTIAL if observed else UsageCompleteness.UNKNOWN
         apply_configured_estimate(attempt)
+
+
+def interrupt_attempt(session: Session, attempt: RunAttempt, reason: str) -> None:
+    """Mark an orphaned attempt interrupted, keeping any usage it had already observed."""
+    _close_without_result(attempt, AttemptStatus.INTERRUPTED, reason)
     append_event(
         session,
         attempt.id,
@@ -280,6 +389,64 @@ def interrupt_attempt(session: Session, attempt: RunAttempt, reason: str) -> Non
         {"reason": attempt.error, "usage_completeness": attempt.usage_completeness},
         lifecycle=True,
     )
+
+
+def stop_attempt(session: Session, attempt: RunAttempt, stop_reason: str, message: str) -> None:
+    """Record durable stop intent on an active attempt; it never returns to running afterwards."""
+    attempt.stop_requested_at = datetime.now(UTC)
+    attempt.stop_reason = stop_reason[:32]
+    attempt.outcome_subtype = f"stopped_{stop_reason}"[:64]
+    _close_without_result(attempt, AttemptStatus.STOPPED, message)
+    append_event(
+        session,
+        attempt.id,
+        EventType.STOPPED,
+        {"reason": stop_reason, "message": message, "usage_completeness": attempt.usage_completeness},
+        lifecycle=True,
+    )
+
+
+def _usage_values(attempt: RunAttempt) -> tuple[Any, ...]:
+    return (*(getattr(attempt, name) for name in USAGE_FIELDS), attempt.usage_source)
+
+
+def retain_late_usage(attempt_id: int, outcome: dict[str, Any]) -> bool:
+    """Keep usage a stopped turn reported after its stop, without changing its stopped outcome.
+
+    A terminal result is counted once (it replaces snapshot-derived partial
+    usage); otherwise newer attributable snapshots replace older ones. Nothing
+    is ever added twice, and the attempt and its parent stay stopped.
+    """
+    with db_session() as session:
+        attempt = session.get(RunAttempt, attempt_id)
+        if attempt is None or attempt.status != AttemptStatus.STOPPED:
+            return False
+        before = _usage_values(attempt)
+        if not record_terminal_usage(attempt, usage_from_outcome(outcome)):
+            apply_snapshot_usage(attempt)
+        if _usage_values(attempt) == before:
+            return False
+        if attempt.estimate_rate_usd_per_credit is not None and attempt.estimate_source:
+            with contextlib.suppress(CostInputError):
+                set_estimate(attempt, attempt.estimate_rate_usd_per_credit, attempt.estimate_source)
+        else:
+            apply_configured_estimate(attempt)
+        append_event(
+            session,
+            attempt.id,
+            EventType.LATE_USAGE_RETAINED,
+            {
+                "source": attempt.usage_source,
+                "usage_completeness": attempt.usage_completeness,
+                "factory_credits": attempt.factory_credits,
+            },
+            lifecycle=True,
+        )
+        parent = get_parent(session, attempt.parent_type, attempt.parent_id)
+        if parent is not None:
+            rollup_parent_usage(session, attempt.parent_type, parent)
+    log_event(logger, logging.INFO, "attempt.late_usage_retained", attempt_id=attempt_id)
+    return True
 
 
 def record_attempt_candidate(attempt_id: int, head_sha: str | None) -> None:
@@ -362,6 +529,7 @@ __all__ = [
     "AttemptConflictError",
     "AttemptStart",
     "active_attempt",
+    "check_admission",
     "claim_active_attempt",
     "fail_attempt_start",
     "finish_attempt",
@@ -374,8 +542,10 @@ __all__ = [
     "record_attempt_candidate",
     "record_terminal_usage",
     "restore_parent_after_failed_start",
+    "retain_late_usage",
     "rollup_parent_usage",
     "set_attempt_running",
     "start_attempt",
+    "stop_attempt",
     "usage_from_outcome",
 ]

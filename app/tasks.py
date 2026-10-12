@@ -8,11 +8,14 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app import worker
+from app.attempts import check_admission
 from app.database import db_session
 from app.droid_client import get_droid_client
 from app.logging_conf import log_event
 from app.models import Task, TaskStatus, WebhookDelivery
 from app.policy import repository_decision
+from app.run_limits import RunRefusedError
+from app.run_models import PARENT_TASK, AttemptKind
 
 logger = logging.getLogger("app.tasks")
 
@@ -140,6 +143,18 @@ async def create_and_dispatch_task(
     if not droid.configured:
         log_event(logger, logging.WARNING, "droid.not_configured", task_id=task_id)
         return {"task_id": task_id, "session_id": None, "status": TaskStatus.QUEUED}
+
+    try:
+        check_admission(PARENT_TASK, task_id, AttemptKind.FIX)
+    except RunRefusedError as exc:
+        return {
+            "task_id": task_id,
+            "session_id": None,
+            "status": TaskStatus.BLOCKED,
+            "detail": exc.code,
+            "reason": exc.detail,
+            "blocked_attempt_id": exc.blocked_attempt_id,
+        }
 
     # Launch in the background: workspace clone + session open can take longer
     # than GitHub's webhook delivery window. The task flips to RUNNING (with a

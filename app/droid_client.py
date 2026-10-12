@@ -18,7 +18,6 @@ import asyncio
 import contextlib
 import logging
 import os
-import re
 import shutil
 import tempfile
 from collections.abc import Callable
@@ -34,6 +33,14 @@ from app.config import get_settings
 from app.logging_conf import log_event
 from app.models import TaskStatus
 from app.policy import OutwardAction, outward_decision, privileged_setup_allowed
+from app.prompts import (
+    FIX_PROMPT_TEMPLATE,
+    FOLLOW_UP_PROMPT_TEMPLATE,
+    RECOVERY_PROMPT_TEMPLATE,
+    build_fix_prompt,
+    build_follow_up_prompt,
+    extract_branch_name,
+)
 from app.redaction import safe_error
 from app.repos import parse_repository_ref
 from app.review_policy import (
@@ -69,53 +76,11 @@ class SetupStatus:
     TIMED_OUT = "timed_out"
 
 
-# Agent prompts describe a local candidate only. Publishing is an app-owned step
-# that requires checks, a restricted review and operator approval of the exact
-# commit, so no prompt grants or implies publication authority.
-FIX_PROMPT_TEMPLATE = """You are working in a local clone of the repository: {repository_url}
-(checkout of ref "{starting_ref}"). Your result is a local candidate commit; you have no
-credentials to publish it, and the application decides separately whether it is published.
-
-Resolve the following GitHub issue (#{issue_number}):
-
-Title: {issue_title}
-
-Description:
-{issue_body}
-
-Requirements:
-- Make only the requested changes described in the issue.
-- Create a new git branch for your work.
-- Run the project's test suite (or the closest relevant subset if the full suite is impractical) and fix any failures introduced by your changes.
-- Commit all of your work on that branch and leave the working tree clean.
-- Do NOT push, do NOT open a pull request, and do NOT change git remotes or credentials.
-- End your final response with a line of the exact form `BRANCH: <your-branch-name>` followed by a short summary of the completed work.
-"""
-
-FOLLOW_UP_PROMPT_TEMPLATE = """Continue work on this agent session.
-
-Follow-up instruction:
-{instruction}
-
-Requirements:
-- Keep working on the existing local branch.
-- Run relevant tests after changes.
-- Commit all of your changes on the branch and leave the working tree clean. Do NOT push or open a pull request.
-- End your final response with a line of the exact form `BRANCH: <your-branch-name>` and summarize what you changed.
-"""
-
-RECOVERY_PROMPT_TEMPLATE = """Your previous turn in this session was interrupted, and the operator asked
-for it to be resumed. Continue the task from where you left off.
-
-- If the work is already complete, restate your final summary.
-- Make sure all of your work is committed on your local branch. Do NOT push or open a pull request.
-- End your final response with a line of the exact form `BRANCH: <your-branch-name>` and a short summary.
-"""
-
-_BRANCH_RE = re.compile(r"^\s*BRANCH:\s*([A-Za-z0-9._/-]+)\s*$", re.MULTILINE)
-
 GIT_TIMEOUT_SECONDS = 300.0
 SETUP_TIMEOUT_SECONDS = 900.0
+# After an SDK interrupt request, how long a stopped turn may take to wind down before it is cancelled.
+STOP_GRACE_SECONDS = 15.0
+INTERRUPT_REQUEST_TIMEOUT_SECONDS = 5.0
 
 
 class DroidRunError(Exception):
@@ -124,34 +89,6 @@ class DroidRunError(Exception):
 
 class DroidSessionBusyError(DroidRunError):
     """Raised when the session already has an active turn in flight."""
-
-
-def build_fix_prompt(
-    repository_url: str,
-    issue_number: int,
-    issue_title: str,
-    issue_body: str,
-    starting_ref: str,
-) -> str:
-    return FIX_PROMPT_TEMPLATE.format(
-        repository_url=repository_url,
-        issue_number=issue_number,
-        issue_title=issue_title,
-        issue_body=issue_body or "(no description provided)",
-        starting_ref=starting_ref or "the repository default branch",
-    )
-
-
-def build_follow_up_prompt(instruction: str) -> str:
-    return FOLLOW_UP_PROMPT_TEMPLATE.format(instruction=instruction.strip() or "Continue.")
-
-
-def extract_branch_name(text: str | None) -> str | None:
-    """Pull the agent-reported branch name from a turn result."""
-    if not text:
-        return None
-    match = _BRANCH_RE.search(text)
-    return match.group(1) if match else None
 
 
 def _usage_categories(usage: object | None) -> dict[str, Any] | None:
@@ -168,6 +105,25 @@ def _reported_model(session: Session) -> str | None:
     except Exception:
         return None
     return model if isinstance(model, str) and model else None
+
+
+def _result_outcome(result: Any) -> dict[str, Any]:
+    """Outcome fields from a completed turn's terminal result."""
+    usage = getattr(result, "usage", None)
+    tokens = None
+    if usage is not None:
+        tokens = (getattr(usage, "input_tokens", 0) or 0) + (getattr(usage, "output_tokens", 0) or 0)
+    duration = getattr(result, "duration", None)
+    return {
+        "success": bool(result.success),
+        "subtype": getattr(result, "subtype", ""),
+        "text": getattr(result, "text", "") or "",
+        "duration_seconds": duration.total_seconds() if duration else None,
+        "credits": getattr(usage, "factory_credits", None) if usage else None,
+        "tokens": tokens or None,
+        "usage": _usage_categories(usage),
+        "error": None,
+    }
 
 
 def map_outcome_status(outcome: dict[str, Any]) -> str:
@@ -308,6 +264,9 @@ class DroidClient:
         self.timeout_seconds = float(settings.droid_turn_timeout_seconds or 3600.0)
         # Background asyncio tasks: session_id / "launch:<id>" -> Task
         self._tasks: dict[str, asyncio.Task[Any]] = {}
+        # Open SDK sessions with a turn in flight, kept so a stop can interrupt them.
+        self._sessions: dict[str, Session] = {}
+        self.stop_grace_seconds = STOP_GRACE_SECONDS
 
     @property
     def configured(self) -> bool:
@@ -320,7 +279,9 @@ class DroidClient:
 
     @property
     def active_sessions(self) -> set[str]:
-        return {key for key, task in self._tasks.items() if not key.startswith("launch:") and not task.done()}
+        return {
+            key for key, task in self._tasks.items() if not key.startswith(("launch:", "stop:")) and not task.done()
+        }
 
     # ---- registry -------------------------------------------------------
 
@@ -335,6 +296,36 @@ class DroidClient:
     def session_busy(self, session_id: str) -> bool:
         task = self._tasks.get(session_id)
         return bool(task and not task.done())
+
+    async def interrupt_run(self, session_id: str | None) -> dict[str, Any]:
+        """Ask the SDK to interrupt the turn in flight on ``session_id``; cancel it if it does not wind down.
+
+        Returns what was done. A session with no turn in flight is left alone,
+        so a repeated or late stop is harmless.
+        """
+        result: dict[str, Any] = {"live_turn": False, "interrupt_sent": False, "interrupt_error": None}
+        task = self._tasks.get(session_id) if session_id else None
+        if session_id is None or task is None or task.done():
+            return result
+        result["live_turn"] = True
+        session = self._sessions.get(session_id)
+        interrupt = getattr(session, "interrupt", None)
+        if callable(interrupt):
+            try:
+                await asyncio.wait_for(interrupt(), timeout=INTERRUPT_REQUEST_TIMEOUT_SECONDS)
+                result["interrupt_sent"] = True
+            except Exception as exc:
+                result["interrupt_error"] = safe_error(exc)
+        if not self.session_busy(f"stop:{session_id}"):
+            self.track(f"stop:{session_id}", asyncio.create_task(self._cancel_if_still_running(task, session_id)))
+        log_event(logger, logging.WARNING, "droid.turn_interrupt_requested", session_id=session_id, **result)
+        return result
+
+    async def _cancel_if_still_running(self, task: asyncio.Task[Any], session_id: str) -> None:
+        done, _pending = await asyncio.wait({task}, timeout=self.stop_grace_seconds)
+        if not done:
+            task.cancel()
+            log_event(logger, logging.WARNING, "droid.turn_cancelled_after_stop", session_id=session_id)
 
     async def shutdown(self) -> None:
         """Cancel in-flight runs; Droid sessions save state and stay resumable."""
@@ -633,6 +624,17 @@ class DroidClient:
 
     # ---- session runs ------------------------------------------------------
 
+    @staticmethod
+    async def _admit_turn(session: Session, observer: TurnObserver | None, kind: str) -> bool:
+        """Last check before the paid turn: an attempt stopped after its session opened never streams."""
+        admitted = getattr(observer, "admitted", None)
+        if not callable(admitted) or admitted():
+            return True
+        with contextlib.suppress(Exception):
+            await session.close()
+        log_event(logger, logging.WARNING, "droid.turn_not_admitted", session_id=session.id, kind=kind)
+        return False
+
     async def _run_turn(
         self,
         session: Session,
@@ -645,6 +647,9 @@ class DroidClient:
         session_id = session.id
         outcome: dict[str, Any] = {"session_id": session_id, "kind": kind, "reported_model": _reported_model(session)}
         events = 0
+        if not await self._admit_turn(session, observer, kind):
+            outcome.update(success=False, subtype="not_admitted", text="", error="attempt is no longer active")
+            return outcome
         if observer is not None:
             observer.started(kind)
         try:
@@ -663,22 +668,7 @@ class DroidClient:
                             session_id=session_id,
                             events=events,
                         )
-            result = stream.result
-            usage = getattr(result, "usage", None)
-            tokens = None
-            if usage is not None:
-                tokens = (getattr(usage, "input_tokens", 0) or 0) + (getattr(usage, "output_tokens", 0) or 0)
-            duration = getattr(result, "duration", None)
-            outcome.update(
-                success=bool(result.success),
-                subtype=getattr(result, "subtype", ""),
-                text=getattr(result, "text", "") or "",
-                duration_seconds=duration.total_seconds() if duration else None,
-                credits=getattr(usage, "factory_credits", None) if usage else None,
-                tokens=tokens or None,
-                usage=_usage_categories(usage),
-                error=None,
-            )
+            outcome.update(_result_outcome(stream.result))
         except asyncio.CancelledError:
             outcome.update(success=False, subtype="cancelled", text="", error="run cancelled")
             raise
@@ -758,6 +748,13 @@ class DroidClient:
             self._run_turn(session, prompt, kind=kind, on_complete=on_complete, observer=observer)
         )
         self.track(session_id, task)
+        self._sessions[session_id] = session
+
+        def _forget(_task: asyncio.Task[Any]) -> None:
+            if self._sessions.get(session_id) is session:
+                del self._sessions[session_id]
+
+        task.add_done_callback(_forget)
         return session_id
 
     async def start_fix_run(
@@ -932,6 +929,9 @@ def reset_droid_client_for_tests() -> None:
 
 
 __all__ = [
+    "FIX_PROMPT_TEMPLATE",
+    "FOLLOW_UP_PROMPT_TEMPLATE",
+    "RECOVERY_PROMPT_TEMPLATE",
     "DroidClient",
     "DroidRunError",
     "DroidSessionBusyError",

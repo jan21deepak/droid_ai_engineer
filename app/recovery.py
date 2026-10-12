@@ -37,6 +37,7 @@ from app.models import ReviewTask, Task, TaskStatus
 from app.policy import repository_decision
 from app.redaction import safe_error
 from app.run_events import TurnRecorder
+from app.run_limits import RunRefusedError
 from app.run_models import PARENT_REVIEW, PARENT_TASK, AttemptKind, AttemptStatus, RunAttempt
 from app.worker import REPOSITORY_ACCESS, policy_denied
 
@@ -216,18 +217,7 @@ async def continue_task(task_id: int, kind: str, instruction: str = "") -> dict[
         raise ContinuationRefusedError(409, "task completed; send a follow-up instead of a recovery")
     if droid.session_busy(session_id):
         raise ContinuationRefusedError(409, "the Droid session is still running a turn; retry when it finishes")
-    try:
-        start = start_attempt(
-            PARENT_TASK,
-            task_id,
-            kind,
-            continued_from_attempt_id=previous_id,
-            parent_status=TaskStatus.RUNNING,
-        )
-    except AttemptConflictError as exc:
-        raise ContinuationRefusedError(
-            409, "task already has an active attempt", active_attempt_id=exc.active_attempt_id
-        ) from None
+    start = _start_continuation_attempt(task_id, kind, previous_id)
 
     on_complete = partial(worker.finalize_fix_task, task_id, attempt_id=start.attempt_id)
     cwd = task_workspace_dir(repository, task_id)
@@ -251,7 +241,8 @@ async def continue_task(task_id: int, kind: str, instruction: str = "") -> dict[
         _abandon_start(task_id, start.attempt_id, error, start)
         raise ContinuationRefusedError(502, error) from None
 
-    mark_attempt_running(
+    # False when the attempt was stopped while it was starting; it stays stopped.
+    still_active = mark_attempt_running(
         start.attempt_id, session_id=result.get("session_id") or session_id, base_sha=result.get("base_sha")
     )
     log_event(
@@ -271,8 +262,33 @@ async def continue_task(task_id: int, kind: str, instruction: str = "") -> dict[
         "sequence": start.sequence,
         "kind": kind,
         "session_id": result.get("session_id") or session_id,
-        "status": "running",
+        "status": AttemptStatus.RUNNING if still_active else AttemptStatus.STOPPED,
     }
+
+
+def _start_continuation_attempt(task_id: int, kind: str, previous_id: int | None) -> AttemptStart:
+    """Commit the continuation attempt, mapping conflicts and limit refusals to HTTP refusals."""
+    try:
+        start = start_attempt(
+            PARENT_TASK,
+            task_id,
+            kind,
+            continued_from_attempt_id=previous_id,
+            parent_status=TaskStatus.RUNNING,
+        )
+    except AttemptConflictError as exc:
+        raise ContinuationRefusedError(
+            409, "task already has an active attempt", active_attempt_id=exc.active_attempt_id
+        ) from None
+    except RunRefusedError as exc:
+        raise ContinuationRefusedError(
+            409,
+            exc.detail,
+            code=exc.code,
+            blocked=exc.blocked_attempt_id is not None,
+            blocked_attempt_id=exc.blocked_attempt_id,
+        ) from None
+    return start
 
 
 def _abandon_start(task_id: int, attempt_id: int, error: str, start: AttemptStart) -> None:

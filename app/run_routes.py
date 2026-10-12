@@ -1,5 +1,5 @@
 """Operator APIs for run attempts: task/review detail, attempt detail and timeline,
-explicit dollar estimates/reconciliation, follow-up and recovery.
+explicit dollar estimates/reconciliation, follow-up, recovery, stop and run limits.
 
 All routes sit behind the default-deny operator access middleware. Detail
 responses report only recorded facts: an attempt's agent outcome is not an
@@ -20,7 +20,9 @@ from app.attempts import list_attempts, parent_accounting
 from app.database import db_session
 from app.models import ReviewTask, Task
 from app.recovery import ContinuationRefusedError, continue_task
+from app.run_control import StopReason, StopRefusedError, stop_parent
 from app.run_events import event_limits, list_events
+from app.run_limits import run_limits_summary
 from app.run_models import PARENT_REVIEW, PARENT_TASK, AttemptKind, RunAttempt
 from app.usage import MAX_USD, MAX_USD_PER_CREDIT, SOURCE_LIMIT, CostInputError, set_estimate, set_reconciliation
 
@@ -88,6 +90,41 @@ async def recover_task(task_id: int) -> JSONResponse | dict[str, Any]:
     its status and usage; the recovery is appended after it.
     """
     return await _continue(task_id, AttemptKind.RECOVERY)
+
+
+async def _stop(parent_type: str, parent_id: int) -> JSONResponse | dict[str, Any]:
+    try:
+        return await stop_parent(parent_type, parent_id, reason=StopReason.OPERATOR)
+    except StopRefusedError as exc:
+        return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+
+
+@router.post("/api/tasks/{task_id}/stop", response_model=None)
+async def stop_task(task_id: int) -> JSONResponse | dict[str, Any]:
+    """Durably stop the task's active implementation, follow-up or recovery turn.
+
+    The stop is recorded before the SDK is asked to interrupt; a late result
+    cannot return the task to running or mark it successful, and a restart
+    never resumes it. Repeating the stop is harmless.
+    """
+    return await _stop(PARENT_TASK, task_id)
+
+
+@router.post("/api/reviews/{review_id}/stop", response_model=None)
+async def stop_review(review_id: int) -> JSONResponse | dict[str, Any]:
+    """Durably stop a review that is waiting to start or running."""
+    return await _stop(PARENT_REVIEW, review_id)
+
+
+@router.get("/api/run-limits", response_model=None)
+async def run_limits() -> dict[str, Any]:
+    """Concurrency, runtime and continuation limits plus the configured spending check.
+
+    Under the ``account_cap`` policy the dollar cap is enforced by the Factory
+    account, not by Forge; dollars stay unknown without a verified rate.
+    """
+    with db_session() as session:
+        return run_limits_summary(session)
 
 
 @router.get("/api/tasks/{task_id}", response_model=None)

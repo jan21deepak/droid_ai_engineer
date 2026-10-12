@@ -108,6 +108,12 @@ def github_writes(monkeypatch):
     get_settings.cache_clear()
 
 
+def allow_concurrent_seed_runs(monkeypatch):
+    """Seed several active rows at once, as a database from before the one-run limit could hold."""
+    monkeypatch.setenv("FORGE_MAX_CONCURRENT_RUNS", "10")
+    get_settings.cache_clear()
+
+
 def running_attempt(parent_type, parent_id, kind=AttemptKind.FIX, session_id=None):
     """The committed, running attempt a launch would have created for an active row."""
     attempt_id = start_attempt(parent_type, parent_id, kind).attempt_id
@@ -542,7 +548,8 @@ async def test_launch_review_starts_fresh_restricted_session_with_exact_context(
 
 
 @pytest.mark.asyncio
-async def test_recovery_interrupts_orphans_and_resumes_nothing(client):
+async def test_recovery_interrupts_orphans_and_resumes_nothing(client, monkeypatch):
+    allow_concurrent_seed_runs(monkeypatch)
     running_id = add_task(droid_session_id="sess-orphan")
     running_attempt_id = running_attempt(PARENT_TASK, running_id, session_id="sess-orphan")
     queued_id = add_task(issue_number=3, droid_session_id=None, status=TaskStatus.QUEUED)
@@ -582,7 +589,8 @@ async def test_recovery_closes_orphaned_reviews_even_without_droid(client):
 
 
 @pytest.mark.asyncio
-async def test_recovery_skips_live_sessions(client):
+async def test_recovery_skips_live_sessions(client, monkeypatch):
+    allow_concurrent_seed_runs(monkeypatch)
     task_id = add_task(droid_session_id="sess-live")
     attempt_id = running_attempt(PARENT_TASK, task_id, session_id="sess-live")
     review_id = add_review(droid_session_id="sess-live-review")

@@ -34,9 +34,13 @@ class TaskStatus:
     FAILED = "failed"
     # Work orphaned by a service restart; it waits for an explicit operator continuation.
     INTERRUPTED = "interrupted"
+    # Stopped by the operator or a runtime limit; never restarted without an explicit continuation.
+    STOPPED = "stopped"
+    # Refused before any paid turn by a run limit or spending check (reason in ``error``).
+    BLOCKED = "blocked"
 
     ACTIVE = (QUEUED, RUNNING)
-    ALL = (QUEUED, RUNNING, COMPLETED, FAILED, INTERRUPTED)
+    ALL = (QUEUED, RUNNING, COMPLETED, FAILED, INTERRUPTED, STOPPED, BLOCKED)
 
 
 ACCOUNTING_ATTEMPTS = "attempts"

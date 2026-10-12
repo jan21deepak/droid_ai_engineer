@@ -33,6 +33,7 @@ from app.recovery import recover_interrupted_tasks
 from app.redaction import safe_error
 from app.repository_routes import ensure_repo_automation, sync_repository_pulls
 from app.repository_routes import router as repository_router
+from app.run_control import runtime_watchdog
 from app.run_routes import router as run_router
 from app.tasks import TaskCreateError, create_and_dispatch_task
 from app.tracing import RequestIDMiddleware
@@ -78,10 +79,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     await recover_interrupted_tasks(droid)
     stop_event = asyncio.Event()
     worker_task = asyncio.create_task(worker_loop(stop_event))
+    watchdog_task = asyncio.create_task(runtime_watchdog(stop_event))
     log_event(logger, logging.INFO, "app.started", version=__version__, agent_runtime="droid-sdk")
     yield
     stop_event.set()
     await worker_task
+    await watchdog_task
     await droid.shutdown()
 
 

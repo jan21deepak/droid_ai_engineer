@@ -95,6 +95,20 @@ class Settings(BaseSettings):
     forge_usd_per_credit_estimate: str = ""
     forge_usd_estimate_source: str = ""
 
+    # Run limits (app.run_limits). At most this many paid Droid turns run at
+    # once across implementation, review, follow-up and recovery.
+    forge_max_concurrent_runs: int = 1
+    # Follow-up + recovery turns allowed per implementation task.
+    forge_max_continuations: int = 3
+    # Spending check applied before every paid turn: none | account_cap | credit_limit.
+    # Any other value blocks every paid turn (fail closed).
+    forge_budget_policy: str = "none"
+    # account_cap: the account-level USD cap the account owner confirmed is
+    # enforced by Factory billing. Forge records it; it does not enforce dollars.
+    forge_demo_account_cap_usd: str = ""
+    # credit_limit: Factory credits Forge may observe being used before it blocks new turns.
+    forge_credit_limit: str = ""
+
 
 @lru_cache
 def get_settings() -> Settings:

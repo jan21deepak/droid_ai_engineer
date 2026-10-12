@@ -787,6 +787,61 @@
         "summary": "Review Detail"
       }
     },
+    "/api/reviews/{review_id}/stop": {
+      "post": {
+        "description": "Durably stop a review that is waiting to start or running.",
+        "operationId": "stop_review_api_reviews__review_id__stop_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "review_id",
+            "required": true,
+            "schema": {
+              "title": "Review Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Stop Review"
+      }
+    },
+    "/api/run-limits": {
+      "get": {
+        "description": "Concurrency, runtime and continuation limits plus the configured spending check.\n\nUnder the ``account_cap`` policy the dollar cap is enforced by the Factory\naccount, not by Forge; dollars stay unknown without a verified rate.",
+        "operationId": "run_limits_api_run_limits_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Run Limits"
+      }
+    },
     "/api/session": {
       "get": {
         "description": "Describe the caller's access mode and session expiry (never returns credentials).",
@@ -1019,6 +1074,44 @@
           }
         },
         "summary": "Recover Task"
+      }
+    },
+    "/api/tasks/{task_id}/stop": {
+      "post": {
+        "description": "Durably stop the task's active implementation, follow-up or recovery turn.\n\nThe stop is recorded before the SDK is asked to interrupt; a late result\ncannot return the task to running or mark it successful, and a restart\nnever resumes it. Repeating the stop is harmless.",
+        "operationId": "stop_task_api_tasks__task_id__stop_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "task_id",
+            "required": true,
+            "schema": {
+              "title": "Task Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Stop Task"
       }
     },
     "/api/tasks/{task_id}/timeline": {

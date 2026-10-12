@@ -33,11 +33,13 @@ from sqlalchemy.orm import Session
 
 from app.attempts import (
     AttemptConflictError,
+    check_admission,
     claim_active_attempt,
     fail_attempt_start,
     finish_attempt,
     mark_attempt_running,
     record_attempt_candidate,
+    retain_late_usage,
     rollup_parent_usage,
     set_attempt_running,
     start_attempt,
@@ -74,6 +76,7 @@ from app.review_policy import (
     review_base_ref,
 )
 from app.run_events import TurnRecorder
+from app.run_limits import RunRefusedError
 from app.run_models import PARENT_REVIEW, PARENT_TASK, AttemptKind, RunAttempt
 
 __all__ = [
@@ -129,11 +132,7 @@ async def launch_fix_task(
     """Background launcher: prepare the workspace and start the Droid fix session."""
     denied = policy_denied(REPOSITORY_ACCESS, repository, task_id=task_id)
     if denied is not None:
-        with db_session() as session:
-            db_task = session.get(Task, task_id)
-            if db_task is not None:
-                db_task.status = TaskStatus.FAILED
-                db_task.error = f"blocked by repository policy: {denied.reason}"
+        _mark_row_failed(Task, task_id, f"blocked by repository policy: {denied.reason}")
         return
     droid = get_droid_client()
     launch = resolve_agent_launch_config(repository=repository, repository_url=repository_url)
@@ -156,12 +155,9 @@ async def launch_fix_task(
         )
     except Exception as exc:
         error = f"Droid session failed to start: {safe_error(exc)}"
-        fail_attempt_start(attempt_id, error)
-        with db_session() as session:
-            db_task = session.get(Task, task_id)
-            if db_task is not None:
-                db_task.status = TaskStatus.FAILED
-                db_task.error = error
+        # A task stopped while it was starting keeps its stopped outcome.
+        if fail_attempt_start(attempt_id, error):
+            _mark_row_failed(Task, task_id, error)
         log_event(
             logger,
             logging.ERROR,
@@ -214,7 +210,7 @@ def _start_fix_attempt(task_id: int, requested_model: str | None) -> int | None:
             requested_model=requested_model or get_settings().droid_model,
             parent_status=TaskStatus.RUNNING,
         ).attempt_id
-    except (AttemptConflictError, LookupError) as exc:
+    except (AttemptConflictError, LookupError, RunRefusedError) as exc:
         log_event(logger, logging.WARNING, "attempt.start_rejected", task_id=task_id, reason=str(exc))
         return None
 
@@ -278,20 +274,23 @@ async def finalize_fix_task(task_id: int, outcome: dict[str, Any], *, attempt_id
             log_event(logger, logging.WARNING, "droid.task_missing", task_id=task_id)
             return
         attempt = claim_active_attempt(session, attempt_id, PARENT_TASK, task_id)
-        if attempt is None:
-            log_event(
-                logger,
-                logging.WARNING,
-                "attempt.callback_rejected",
-                task_id=task_id,
-                attempt_id=attempt_id,
-                reason="attempt is not active for this task",
-            )
-            return
-        old_status = task.status
-        _apply_outcome_to_task(session, task, attempt, outcome, status, summary)
-        repository = task.repository
-        session_id = task.droid_session_id
+        if attempt is not None:
+            old_status = task.status
+            _apply_outcome_to_task(session, task, attempt, outcome, status, summary)
+            repository = task.repository
+            session_id = task.droid_session_id
+    if attempt is None:
+        log_event(
+            logger,
+            logging.WARNING,
+            "attempt.callback_rejected",
+            task_id=task_id,
+            attempt_id=attempt_id,
+            reason="attempt is not active for this task",
+        )
+        # A stopped attempt keeps its outcome; only usage it reports late is retained, once.
+        retain_late_usage(attempt_id, outcome)
+        return
 
     log_event(
         logger,
@@ -420,6 +419,15 @@ async def start_pr_review(
         # Closed rather than left queued, so a later assignment can start fresh.
         _fail_review(review_id, "review not started: Droid is not configured")
         return {"review_id": review_id, "started": False, "detail": "droid_not_configured"}
+    refused = _review_refusal(review_id)
+    if refused is not None:
+        return {
+            "review_id": review_id,
+            "started": False,
+            "detail": refused.code,
+            "reason": refused.detail,
+            "blocked_attempt_id": refused.blocked_attempt_id,
+        }
 
     launch = asyncio.create_task(
         launch_review_task(
@@ -440,6 +448,17 @@ async def start_pr_review(
 
 def _fail_review(review_id: int, error: str) -> None:
     _mark_row_failed(ReviewTask, review_id, error, stamp_completed=True)
+
+
+def _review_refusal(review_id: int) -> RunRefusedError | None:
+    """Run limits and spending checks for a review before any GitHub or workspace work."""
+    try:
+        check_admission(PARENT_REVIEW, review_id, AttemptKind.REVIEW)
+    except RunRefusedError as exc:
+        return exc
+    except LookupError:
+        return None
+    return None
 
 
 def _awaiting_launch(review: ReviewTask | None) -> bool:
@@ -534,6 +553,8 @@ async def launch_review_task(
     if not _review_awaits_launch(review_id):
         log_event(logger, logging.WARNING, "review.launch_rejected", review_id=review_id, reason="row already bound")
         return
+    if _review_refusal(review_id) is not None:
+        return
     droid = get_droid_client()
     launch = resolve_agent_launch_config(repository=repository, repository_url=repository_url)
     base_ref = await _pull_request_base_ref(repository, pr_number)
@@ -575,7 +596,7 @@ async def launch_review_task(
             base_sha=context.base_sha,
             head_sha=context.head_sha,
         ).attempt_id
-    except (AttemptConflictError, LookupError) as exc:
+    except (AttemptConflictError, LookupError, RunRefusedError) as exc:
         log_event(logger, logging.WARNING, "review.launch_rejected", review_id=review_id, reason=str(exc))
         return
     try:
@@ -591,8 +612,8 @@ async def launch_review_task(
         )
     except Exception as exc:
         error = f"Droid review session failed to start: {safe_error(exc)}"
-        fail_attempt_start(attempt_id, error)
-        _fail_review(review_id, error)
+        if fail_attempt_start(attempt_id, error):
+            _fail_review(review_id, error)
         log_event(
             logger,
             logging.ERROR,
@@ -757,21 +778,25 @@ async def finalize_review_task(
                 reason=rejection,
                 credits=outcome.get("credits"),
             )
-            return
-        old_status = review.status
-        _apply_outcome_to_task(session, review, attempt, outcome, status, summary)
-        if status == TaskStatus.COMPLETED and summary:
-            parsed = effective_verdict(
-                parse_review_output(summary),
-                review_policy=binding.review_policy,
-                diff_complete=binding.diff_complete,
-                reviewed_sha=binding.head_sha,
-            )
-            review.verdict = parsed.verdict
-            review.findings = json.dumps(parsed.findings)
-        verdict = review.verdict
-        error = review.error
-        target = _ReviewTarget(review_id, review.repository, review.pr_number, binding.head_sha)
+        else:
+            old_status = review.status
+            _apply_outcome_to_task(session, review, attempt, outcome, status, summary)
+            if status == TaskStatus.COMPLETED and summary:
+                parsed = effective_verdict(
+                    parse_review_output(summary),
+                    review_policy=binding.review_policy,
+                    diff_complete=binding.diff_complete,
+                    reviewed_sha=binding.head_sha,
+                )
+                review.verdict = parsed.verdict
+                review.findings = json.dumps(parsed.findings)
+            verdict = review.verdict
+            error = review.error
+            target = _ReviewTarget(review_id, review.repository, review.pr_number, binding.head_sha)
+    if rejection is not None or attempt is None:
+        # A stopped review keeps its outcome; only usage it reports late is retained, once.
+        retain_late_usage(attempt_id, outcome)
+        return
 
     log_event(
         logger,
@@ -822,7 +847,8 @@ def _mark_row_failed[TaskOrReviewRow: Task | ReviewTask](
     """Mark a Task/ReviewTask row failed with the given error message."""
     with db_session() as session:
         row = session.get(model, row_id)
-        if row is not None:
+        # Only work still waiting or running fails; stopped and blocked outcomes are kept.
+        if row is not None and row.status in TaskStatus.ACTIVE:
             row.status = TaskStatus.FAILED
             row.error = error
             if stamp_completed:
