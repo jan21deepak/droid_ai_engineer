@@ -2,34 +2,7 @@
   const $ = (sel, root = document) => root.querySelector(sel);
   const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
 
-  const CSRF_TOKEN = document.querySelector('meta[name="csrf-token"]')?.getAttribute("content") || "";
-
-  // Same-origin API calls: send the session CSRF token on writes and return
-  // to the sign-in page when the operator session has ended.
-  async function apiFetch(url, options = {}) {
-    const opts = { credentials: "same-origin", ...options };
-    const method = (opts.method || "GET").toUpperCase();
-    if (method !== "GET" && method !== "HEAD" && CSRF_TOKEN) {
-      opts.headers = { ...(opts.headers || {}), "X-CSRF-Token": CSRF_TOKEN };
-    }
-    const res = await fetch(url, opts);
-    if (res.status === 401) {
-      window.location.assign(`/login?next=${encodeURIComponent(window.location.pathname)}`);
-    }
-    return res;
-  }
-
-  function showAlert(el, message, type = "success") {
-    if (!el) return;
-    el.className = `alert alert-${type}`;
-    el.textContent = message;
-    el.classList.remove("d-none");
-  }
-
-  function hideAlert(el) {
-    if (!el) return;
-    el.classList.add("d-none");
-  }
+  const { apiFetch, showAlert, hideAlert, escapeHtml } = window.Forge;
 
   function formatMoney(n) {
     return `$${Number(n || 0).toLocaleString(undefined, {
@@ -55,24 +28,20 @@
     return `${SGT_FORMATTER.format(parsed).replace(",", "")} SGT`;
   }
 
-  function statusBadge(status) {
-    const map = {
-      completed: "success",
-      failed: "danger",
-      running: "primary",
-      queued: "secondary",
-    };
-    const cls = map[status] || "secondary";
-    const label = (status || "unknown").replace(/^./, (c) => c.toUpperCase());
-    return `<span class="badge text-bg-${cls}">${label}</span>`;
-  }
+  const STATUS_LABELS = {
+    completed: ["success", "Agent turn completed"],
+    failed: ["danger", "Failed"],
+    running: ["primary", "Running"],
+    queued: ["secondary", "Queued"],
+    stopped: ["warning", "Stopped"],
+    interrupted: ["warning", "Interrupted"],
+    blocked: ["warning", "Blocked"],
+  };
 
-  function escapeHtml(str) {
-    return String(str || "")
-      .replace(/&/g, "&amp;")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;")
-      .replace(/"/g, "&quot;");
+  function statusBadge(status, isReview = false) {
+    const [cls, label] = STATUS_LABELS[status] || ["secondary", status || "Unknown"];
+    const text = isReview && status === "completed" ? "Review completed" : label;
+    return `<span class="badge text-bg-${cls}">${escapeHtml(text)}</span>`;
   }
 
   // ---- Repositories ----
@@ -401,11 +370,18 @@
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.detail || "Assignment failed");
-      showAlert(alert, `Assigned ${data.accepted} issue(s) to Droid.`, "success");
+      const refused = (data.results || []).filter((r) => !r.ok);
+      const refusedText = refused.length
+        ? ` ${refused.length} not started: ${refused.map((r) => r.detail).join("; ")}.`
+        : "";
+      showAlert(
+        alert,
+        `Assigned ${data.accepted} issue(s) to Droid. Follow progress on the Overview tab or each task's detail page.${refusedText}`,
+        refused.length ? "warning" : "success"
+      );
       await loadIssues();
       await refreshMetrics();
-      const tab = new bootstrap.Tab($("#metrics-tab"));
-      tab.show();
+      document.dispatchEvent(new CustomEvent("forge:refresh-overview"));
     } catch (err) {
       showAlert(alert, err.message, "danger");
     } finally {
@@ -611,16 +587,18 @@
         const typeBadge = isReview
           ? `<span class="badge text-bg-dark">Review</span>`
           : `<span class="badge text-bg-primary">Fix</span>`;
+        const reviewLabel = t.review_target === "candidate" ? "Candidate review" : `PR #${Number(t.pr_number)}`;
         const target = isReview
-          ? `PR #${t.pr_number} <span class="text-muted small">${escapeHtml((t.pr_title || "").slice(0, 60))}</span>`
-          : `#${t.issue_number} <span class="text-muted small">${escapeHtml((t.issue_title || "").slice(0, 60))}</span>`;
+          ? `<a href="/reviews/${Number(t.id)}" class="detail-link">${reviewLabel}</a> <span class="text-muted small">${escapeHtml((t.pr_title || "").slice(0, 60))}</span>`
+          : `<a href="/tasks/${Number(t.id)}" class="detail-link">#${Number(t.issue_number)}</a> <span class="text-muted small">${escapeHtml((t.issue_title || "").slice(0, 60))}</span>`;
         const linkUrl = isReview ? t.pr_url : t.pull_request_url;
-        const link = linkUrl
-          ? `<a href="${linkUrl}" target="_blank" rel="noopener">View PR</a>`
+        const safeLink = window.Forge.safeUrl(linkUrl);
+        const link = safeLink
+          ? `<a href="${escapeHtml(safeLink)}" target="_blank" rel="noopener">View PR</a>`
           : `<span class="text-muted">—</span>`;
-        let statusLabel = statusBadge(t.status);
-        if (t.status === "completed" && t.merged) {
-          statusLabel = `<span class="badge text-bg-success">Completed · Merged</span>`;
+        let statusLabel = statusBadge(t.status, isReview);
+        if (t.merged) {
+          statusLabel += ` <span class="badge text-bg-info" title="Observed on GitHub; Forge never merges">Merged (observed)</span>`;
         }
         const session = t.droid_session_url
           ? `<a class="btn btn-sm btn-outline-dark" href="${t.droid_session_url}" target="_blank" rel="noopener">${isReview ? "Droid Review" : "Droid Fix"}</a>`

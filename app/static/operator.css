@@ -1,0 +1,198 @@
+/* Operator overview, detail pages and accessible feedback (layered on dashboard.css). */
+
+.skip-link {
+    position: absolute;
+    top: 0.5rem;
+    left: 0.5rem;
+    z-index: 2000;
+    padding: 0.4rem 0.8rem;
+    background: var(--nf-surface-solid);
+    color: var(--nf-cyan);
+    border: 1px solid var(--nf-border-hot);
+    border-radius: 0.4rem;
+}
+
+/* A clearly visible keyboard focus ring on every interactive control. */
+a:focus-visible,
+button:focus-visible,
+.btn:focus-visible,
+.nav-link:focus-visible,
+.form-control:focus-visible,
+.form-select:focus-visible,
+summary:focus-visible,
+.alert:focus-visible {
+    outline: 3px solid var(--nf-amber) !important;
+    outline-offset: 2px;
+    box-shadow: none !important;
+}
+
+.btn:disabled,
+.btn.disabled {
+    opacity: 0.55;
+    cursor: not-allowed;
+}
+
+.btn[aria-busy="true"] {
+    cursor: progress;
+}
+
+h1, .h4, h2, .h5, h3, .h6 {
+    color: var(--nf-text);
+}
+
+.overview-lede {
+    max-width: 60rem;
+}
+
+.overview-card-title {
+    color: var(--nf-text);
+    font-size: 0.8rem;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    margin-bottom: 0.25rem;
+}
+
+.overview-definition {
+    color: var(--nf-muted);
+    font-size: 0.78rem;
+    line-height: 1.35;
+    margin-top: 0.35rem;
+}
+
+.overview-card.tone-cyan .stat-value { color: var(--nf-cyan); }
+.overview-card.tone-lime .stat-value { color: var(--nf-lime); }
+.overview-card.tone-amber .stat-value { color: var(--nf-amber); }
+.overview-card.tone-purple .stat-value { color: var(--nf-purple); }
+.overview-card.tone-red .stat-value { color: var(--nf-red); }
+
+.overview-title {
+    max-width: 280px;
+}
+
+.outcome-cell {
+    max-width: 320px;
+    white-space: normal !important;
+}
+
+.detail-link {
+    font-weight: 600;
+}
+
+.section-nav .nav-link {
+    color: var(--nf-muted);
+    border: 1px solid var(--nf-border);
+    font-size: 0.82rem;
+    padding: 0.25rem 0.75rem;
+}
+
+.section-nav .nav-link:hover {
+    color: var(--nf-cyan);
+}
+
+.breadcrumb a {
+    color: var(--nf-cyan);
+}
+
+.breadcrumb-item.active {
+    color: var(--nf-text);
+}
+
+.detail-dl {
+    display: grid;
+    grid-template-columns: minmax(9rem, max-content) 1fr;
+    gap: 0.3rem 1rem;
+    margin-bottom: 0.75rem;
+    font-size: 0.88rem;
+}
+
+.detail-dl dt {
+    color: var(--nf-muted);
+    font-weight: 500;
+}
+
+.detail-dl dd {
+    margin: 0;
+    min-width: 0;
+    overflow-wrap: anywhere;
+}
+
+code.sha {
+    color: var(--nf-cyan);
+    font-size: 0.8rem;
+    overflow-wrap: anywhere;
+    word-break: break-all;
+}
+
+.summary-text {
+    white-space: pre-wrap;
+    max-height: 14rem;
+    overflow: auto;
+}
+
+.output-tail {
+    max-height: 12rem;
+    overflow: auto;
+    font-size: 0.75rem;
+    color: var(--nf-text);
+    background: rgba(0, 0, 0, 0.35);
+    padding: 0.5rem;
+    border-radius: 0.4rem;
+}
+
+.blockers {
+    font-size: 0.84rem;
+    padding-left: 1.1rem;
+}
+
+.blockers code {
+    color: var(--nf-amber);
+}
+
+.findings li,
+.check-results li {
+    margin-bottom: 0.35rem;
+}
+
+.timeline {
+    max-height: 28rem;
+    overflow: auto;
+}
+
+.timeline-item {
+    display: grid;
+    grid-template-columns: 11rem 10rem 9rem 1fr;
+    gap: 0.5rem;
+    padding: 0.45rem 1rem;
+    border-bottom: 1px solid rgba(124, 92, 255, 0.12);
+    align-items: baseline;
+}
+
+.tl-payload {
+    overflow-wrap: anywhere;
+}
+
+.tl-kv {
+    margin-right: 0.6rem;
+}
+
+.guide-steps li {
+    margin-bottom: 0.55rem;
+}
+
+.modal-content {
+    background: var(--nf-surface-solid);
+    border: 1px solid var(--nf-border-hot);
+    color: var(--nf-text);
+}
+
+@media (max-width: 768px) {
+    .timeline-item {
+        grid-template-columns: 1fr;
+        gap: 0.15rem;
+    }
+
+    .detail-dl {
+        grid-template-columns: 1fr;
+    }
+}

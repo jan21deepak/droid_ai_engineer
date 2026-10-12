@@ -50,6 +50,30 @@
         "title": "AssignIssuesRequest",
         "type": "object"
       },
+      "AssignPullByNumberRequest": {
+        "properties": {
+          "pr_number": {
+            "description": "Pull request number",
+            "maximum": 10000000.0,
+            "minimum": 1.0,
+            "title": "Pr Number",
+            "type": "integer"
+          },
+          "repository": {
+            "description": "Registered repository, owner/name",
+            "maxLength": 255,
+            "minLength": 3,
+            "title": "Repository",
+            "type": "string"
+          }
+        },
+        "required": [
+          "repository",
+          "pr_number"
+        ],
+        "title": "AssignPullByNumberRequest",
+        "type": "object"
+      },
       "AssignPullsRequest": {
         "properties": {
           "pull_ids": {
@@ -494,6 +518,23 @@
         "summary": "Assign Issues To Droid"
       }
     },
+    "/api/overview": {
+      "get": {
+        "description": "Delivery-stage counts and the most recent tasks, keeping completion, acceptance, publication, CI and merge apart.",
+        "operationId": "overview_api_overview_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Overview"
+      }
+    },
     "/api/pulls": {
       "get": {
         "description": "Return review-ready PRs, refreshing from GitHub for every registered repo.",
@@ -550,6 +591,43 @@
           }
         },
         "summary": "Assign Pulls To Droid"
+      }
+    },
+    "/api/pulls/assign-number": {
+      "post": {
+        "description": "Start a restricted review of an existing (open, draft or ready) PR in a registered repository.",
+        "operationId": "assign_pull_by_number_api_pulls_assign_number_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AssignPullByNumberRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Assign Pull By Number"
       }
     },
     "/api/repositories": {
@@ -762,6 +840,55 @@
           }
         },
         "summary": "Sync Repository Issues"
+      }
+    },
+    "/api/reviews": {
+      "get": {
+        "description": "Recent reviews, newest first. ``target`` is ``pull_request``, ``candidate`` or ``all``.",
+        "operationId": "list_reviews_api_reviews_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 20,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "target",
+            "required": false,
+            "schema": {
+              "default": "pull_request",
+              "title": "Target",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Reviews"
       }
     },
     "/api/reviews/{review_id}": {
@@ -1560,6 +1687,84 @@
           }
         },
         "summary": "Metrics"
+      }
+    },
+    "/reviews/{review_id}": {
+      "get": {
+        "operationId": "review_page_reviews__review_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "review_id",
+            "required": true,
+            "schema": {
+              "title": "Review Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Review Page"
+      }
+    },
+    "/tasks/{task_id}": {
+      "get": {
+        "operationId": "task_page_tasks__task_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "task_id",
+            "required": true,
+            "schema": {
+              "title": "Task Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Task Page"
       }
     },
     "/webhook": {

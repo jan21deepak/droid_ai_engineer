@@ -73,6 +73,7 @@ Before declaring any change done: run `ruff check`, `ruff format --check`,
 - `app/worker.py` — fix/review launch and attempt-bound finalization
 - `app/candidates.py` — local candidate recording; `app/review_policy.py` — restricted review config, diff checks, verdict parsing; `app/publishing.py` — explicit publish of an approved candidate SHA (push, remote-head check, draft PR; never called automatically)
 - `app/delivery.py` — SHA-bound readiness and operator approval; `app/delivery_models.py` — check runs, approvals, publications; `app/acceptance_checks.py` / `app/check_config.py` — app-run `FORGE_ACCEPTANCE_CHECKS`; `app/candidate_review.py` — restricted pre-publication review; `app/delivery_git.py` — clean checkouts, workspace recheck, push; `app/remote_ci.py` — read-only GitHub CI observation; `app/review_outcomes.py` — AI verdict vs GitHub review outcome; `app/delivery_routes.py` — delivery APIs
+- `app/overview.py` — executive overview stages and counts (`/api/overview`); `app/ui_routes.py` / `app/ui_templates.py` — `/tasks/{id}` and `/reviews/{id}` pages; `app/review_routes.py` — review list and assign-by-number; `app/static/` — plain JS over the JSON APIs (no build step)
 - `app/droid_client.py` — Droid SDK wrapper: workspaces, fix/review sessions, resume
 - `app/github.py` — GitHub REST client: comments, PRs, reviews, webhook signature
 - `app/models.py` — SQLAlchemy `Task` / `ReviewTask` / `Repository` models

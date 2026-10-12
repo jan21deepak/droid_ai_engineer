@@ -5,20 +5,18 @@ import json
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
-from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 
 from app import __version__
 from app.acceptance_checks import recover_interrupted_check_runs, shutdown_check_runs
 from app.analytics import fire_and_forget
-from app.auth import AccessControlMiddleware, operator_context, operator_credential_problem
+from app.auth import AccessControlMiddleware, operator_credential_problem
 from app.auth_routes import router as auth_router
 from app.config import ACCESS_MODE_PROTECTED, effective_access_mode, get_settings
 from app.database import check_db_connectivity, db_session, init_db
@@ -36,30 +34,16 @@ from app.recovery import recover_interrupted_tasks
 from app.redaction import safe_error
 from app.repository_routes import ensure_repo_automation, sync_repository_pulls
 from app.repository_routes import router as repository_router
+from app.review_routes import router as review_router
 from app.run_control import runtime_watchdog
 from app.run_routes import router as run_router
 from app.tasks import TaskCreateError, create_and_dispatch_task
 from app.tracing import RequestIDMiddleware
+from app.ui_routes import router as ui_router
+from app.ui_templates import STATIC_DIR, page_context, templates
 from app.worker import start_pr_review, worker_loop
 
 logger = logging.getLogger("app.api")
-
-BASE_DIR = Path(__file__).resolve().parent
-STATIC_DIR = BASE_DIR / "static"
-templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
-
-
-def asset_version() -> str:
-    """Cache-busting token for static assets.
-
-    Browsers otherwise hold onto dashboard.js/css across deploys and silently run
-    stale UI code against a newer API.
-    """
-    try:
-        newest = max(path.stat().st_mtime for path in STATIC_DIR.glob("dashboard.*"))
-    except ValueError:
-        return __version__
-    return f"{__version__}-{int(newest)}"
 
 
 @asynccontextmanager
@@ -99,12 +83,14 @@ app = FastAPI(title="droid-ai-engineer", version=__version__, lifespan=lifespan)
 app.add_middleware(AccessControlMiddleware)
 # Request tracing: every request gets an X-Request-ID echoed into logs.
 app.add_middleware(RequestIDMiddleware)
-app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 app.include_router(auth_router)
 app.include_router(intake_router)
 app.include_router(repository_router)
 app.include_router(run_router)
 app.include_router(delivery_router)
+app.include_router(review_router)
+app.include_router(ui_router)
 
 
 @app.exception_handler(RequestValidationError)
@@ -486,16 +472,8 @@ async def dashboard(request: Request) -> Response:
     with db_session() as session:
         stats = compute_metrics(session)
         activity = recent_activity(session, page=1, page_size=10)
-    operator = operator_context(request)
     return templates.TemplateResponse(
         request,
         "dashboard.html",
-        {
-            "stats": stats,
-            "tasks": activity["tasks"],
-            "activity": activity,
-            "asset_version": asset_version(),
-            "csrf_token": operator.csrf_token if operator else "",
-            "auth_method": operator.method if operator else "",
-        },
+        page_context(request, stats=stats, tasks=activity["tasks"], activity=activity),
     )

@@ -400,7 +400,7 @@ class GitHubClient:
     async def list_open_pull_requests(
         self, full_name: str, per_page: int = 50, max_pages: int = 5
     ) -> list[dict[str, Any]]:
-        """List open, non-draft pull requests for a repository."""
+        """List open pull requests for a repository, drafts included (each item keeps its ``draft`` flag)."""
         pulls: list[dict[str, Any]] = []
         async with httpx.AsyncClient(timeout=30) as client:
             for page in range(1, max_pages + 1):
@@ -413,10 +413,7 @@ class GitHubClient:
                 batch = resp.json()
                 if not batch:
                     break
-                for item in batch:
-                    if item.get("draft"):
-                        continue
-                    pulls.append(item)
+                pulls.extend(batch)
                 if len(batch) < per_page:
                     break
         return pulls

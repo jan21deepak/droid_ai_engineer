@@ -484,9 +484,22 @@ Time-to-Dollar Savings divides annual cost by **1,920** working hours/year. The 
 
 ## Dashboard
 
-`GET /dashboard` — neon dark UI, auto-refreshes every 15 seconds while the Dashboard tab is active:
+`GET /dashboard` — neon dark UI that opens on the **Overview** after sign-in. Sections are
+addressable by hash (`#overview`, `#repos`, `#issues`, `#reviews`, `#metrics`, `#guide`):
 
-- Repositories / Issues / Dashboard tabs
+- **Overview** (`GET /api/overview`): counts each delivery stage separately. These are agent turn
+  completed, awaiting checks or review, awaiting approval, accepted (operator-approved), published as
+  a draft PR, remote CI by state, merged (observed only) and needs attention. Each task links to its
+  detail page.
+- **Task detail** (`/tasks/{id}`): lifecycle, attempts, bounded timeline, candidate SHA, checks,
+  restricted review, approval, publication and remote CI, with explicit follow-up, stop, continue,
+  run checks, start review, approve and publish controls. Approve and publish open a confirmation
+  that names the destination and the full commit SHA. Blocked, stale or unready cases show the
+  reason instead of an enabled button.
+- **PR reviews**: assign a review by pull request number (`POST /api/pulls/assign-number`, draft PRs
+  included) or from the synced list, and see `GET /api/reviews`. Each review page (`/reviews/{id}`)
+  shows the reviewed head, findings, AI verdict and GitHub outcome. Forge never merges.
+- Repositories / Issues / Activity tabs; the Activity tab auto-refreshes every 15 seconds while visible
 - Per-repo **model** override + **setup command**
 - Fix + review time stats (active Droid working time)
 - Engineering KPIs (avg PR cycle time, PRs delivered, merge rate, change failure rate)

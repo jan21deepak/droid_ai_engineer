@@ -1,0 +1,81 @@
+        <!-- PR review assignment -->
+        <div class="tab-pane fade" id="reviews" role="tabpanel" aria-labelledby="reviews-tab">
+            <div class="mb-3">
+                <h2 class="h5 mb-1">Review an existing pull request</h2>
+                <p class="text-muted small mb-0">
+                    Starts a fresh restricted Droid review (Read, Grep and Glob only) of the PR's exact base..head diff.
+                    A review never publishes changes, approves delivery or merges.
+                </p>
+            </div>
+            <div class="card shadow-sm border-0 mb-4">
+                <div class="card-body">
+                    <form id="assign-pr-form" class="row g-2 align-items-end" novalidate>
+                        <div class="col-md-6">
+                            <label class="form-label small text-muted mb-1" for="assign-pr-repo">Repository</label>
+                            <select class="form-select" id="assign-pr-repo" required>
+                                <option value="">Loading repositories…</option>
+                            </select>
+                        </div>
+                        <div class="col-md-3">
+                            <label class="form-label small text-muted mb-1" for="assign-pr-number">Pull request number</label>
+                            <input type="text" inputmode="numeric" class="form-control" id="assign-pr-number" required
+                                   placeholder="e.g. 12" aria-describedby="assign-pr-help">
+                        </div>
+                        <div class="col-md-3 d-grid">
+                            <button type="submit" class="btn btn-primary" id="assign-pr-btn">Assign for review</button>
+                        </div>
+                        <div class="col-12">
+                            <div class="form-text" id="assign-pr-help">Open pull requests, including draft PRs, can be reviewed.</div>
+                        </div>
+                    </form>
+                    <div id="reviews-alert" class="alert mt-3 d-none" role="alert"></div>
+                </div>
+            </div>
+
+            <div class="card shadow-sm border-0 mb-4">
+                <div class="card-header fw-semibold d-flex justify-content-between align-items-center">
+                    <span>Open pull requests</span>
+                    <button type="button" class="btn btn-sm btn-outline-secondary" id="refresh-pulls">Load open pull requests</button>
+                </div>
+                <div class="table-responsive">
+                    <table class="table table-hover align-middle mb-0">
+                        <thead>
+                        <tr>
+                            <th scope="col">Pull request</th>
+                            <th scope="col">Repository</th>
+                            <th scope="col">Head</th>
+                            <th scope="col">State</th>
+                            <th scope="col" class="text-end">Action</th>
+                        </tr>
+                        </thead>
+                        <tbody id="pulls-tbody">
+                        <tr><td colspan="5" class="text-center text-muted py-4">Select “Load open pull requests” to read them from GitHub.</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <div class="card shadow-sm border-0">
+                <div class="card-header fw-semibold d-flex justify-content-between align-items-center">
+                    <span>Recent PR reviews</span>
+                    <button type="button" class="btn btn-sm btn-outline-secondary" id="refresh-reviews">Refresh</button>
+                </div>
+                <div class="table-responsive">
+                    <table class="table table-hover align-middle mb-0">
+                        <thead>
+                        <tr>
+                            <th scope="col">Review</th>
+                            <th scope="col">Pull request</th>
+                            <th scope="col">Status</th>
+                            <th scope="col">Reviewed head</th>
+                            <th scope="col">AI verdict</th>
+                            <th scope="col">GitHub outcome</th>
+                        </tr>
+                        </thead>
+                        <tbody id="reviews-tbody">
+                        <tr><td colspan="6" class="text-center text-muted py-4">Loading…</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>

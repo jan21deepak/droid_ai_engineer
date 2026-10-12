@@ -1,0 +1,74 @@
+        <!-- Executive overview (landing) -->
+        <div class="tab-pane fade show active" id="overview" role="tabpanel" aria-labelledby="overview-tab">
+            <div class="d-flex justify-content-between align-items-start flex-wrap gap-2 mb-3">
+                <div>
+                    <h1 class="h4 mb-1">Delivery overview</h1>
+                    <p class="text-muted small mb-0 overview-lede">
+                        Each stage is counted separately. An agent finishing a turn is not acceptance,
+                        acceptance is not publication, a draft pull request is not passing CI, and Forge never merges.
+                    </p>
+                </div>
+                <button type="button" class="btn btn-outline-secondary btn-sm" id="refresh-overview">Refresh overview</button>
+            </div>
+            <div id="overview-alert" class="alert d-none" role="alert"></div>
+            <p class="visually-hidden" id="overview-status" aria-live="polite"></p>
+
+            <div class="row g-3 mb-4" id="overview-cards">
+                {% for key, title, tone in [
+                    ('agent_completed', 'Agent turns completed', 'muted'),
+                    ('awaiting_evidence', 'Awaiting checks or review', 'amber'),
+                    ('awaiting_approval', 'Awaiting your approval', 'cyan'),
+                    ('accepted', 'Accepted (operator-approved)', 'lime'),
+                    ('published', 'Published as draft PR', 'purple'),
+                    ('merged', 'Merged (observed on GitHub)', 'muted'),
+                    ('needs_attention', 'Needs attention', 'red'),
+                    ('agent_running', 'Agent turns running', 'cyan'),
+                ] %}
+                <div class="col-6 col-lg-3">
+                    <div class="card shadow-sm border-0 h-100 overview-card tone-{{ tone }}" data-card="{{ key }}">
+                        <div class="card-body">
+                            <div class="overview-card-title">{{ title }}</div>
+                            <div class="stat-value" data-ov="{{ key }}">—</div>
+                            <p class="overview-definition mb-0" data-def="{{ key }}"></p>
+                        </div>
+                    </div>
+                </div>
+                {% endfor %}
+            </div>
+
+            <div class="card shadow-sm border-0 mb-4">
+                <div class="card-header fw-semibold">Remote CI on published work</div>
+                <div class="card-body">
+                    <p class="overview-definition mb-2" data-def="remote_ci"></p>
+                    <ul class="list-inline mb-0" id="overview-ci">
+                        <li class="list-inline-item text-muted">Loading…</li>
+                    </ul>
+                </div>
+            </div>
+
+            <div class="card shadow-sm border-0">
+                <div class="card-header fw-semibold d-flex justify-content-between align-items-center flex-wrap gap-2">
+                    <span>Tasks by delivery stage</span>
+                    <span class="text-muted small" id="overview-shown"></span>
+                </div>
+                <div class="table-responsive">
+                    <table class="table table-hover align-middle mb-0">
+                        <caption class="visually-hidden">Tasks with their delivery stage, checks, review and remote CI</caption>
+                        <thead>
+                        <tr>
+                            <th scope="col">Task</th>
+                            <th scope="col">Stage</th>
+                            <th scope="col">Checks</th>
+                            <th scope="col">Review</th>
+                            <th scope="col">Remote CI</th>
+                            <th scope="col">Pull request</th>
+                        </tr>
+                        </thead>
+                        <tbody id="overview-tbody">
+                        <tr><td colspan="6" class="text-center text-muted py-4">Loading…</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+                <div class="card-footer small text-muted" id="overview-reviews"></div>
+            </div>
+        </div>

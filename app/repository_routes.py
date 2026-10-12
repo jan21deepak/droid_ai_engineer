@@ -286,11 +286,11 @@ def _persist_synced_issues(full_name: str, repo_url: str, issues: list[dict[str,
 
 
 def _persist_synced_pulls(full_name: str, repo_url: str, pulls: list[dict[str, Any]]) -> int:
-    """Replace synced open, non-draft PRs for a repository."""
+    """Replace synced open PRs (drafts included, e.g. Forge's own draft PRs) for a repository."""
     deduped: dict[int, dict[str, Any]] = {}
     for item in pulls:
         number = int(item.get("number") or 0)
-        if not number or item.get("draft"):
+        if not number:
             continue
         if (item.get("state") or "open") != "open":
             continue

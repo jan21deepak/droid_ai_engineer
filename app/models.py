@@ -214,7 +214,7 @@ class WebhookDelivery(Base):
 
 
 class SyncedPullRequest(Base):
-    """Open, non-draft PRs available for Droid review assignment."""
+    """Open PRs (draft or ready) available for Droid review assignment."""
 
     __tablename__ = "synced_pull_requests"
     __table_args__ = (UniqueConstraint("repository", "pr_number", name="uq_repo_pr"),)

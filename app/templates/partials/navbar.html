@@ -1,0 +1,20 @@
+<a class="visually-hidden-focusable skip-link" href="#main">Skip to main content</a>
+<nav class="navbar neon-navbar mb-4" aria-label="Droid Forge">
+    <div class="container">
+        <a class="navbar-brand brand mb-0 text-decoration-none" href="/dashboard#overview">
+            <span class="brand-mark" aria-hidden="true">⚡</span>
+            <span class="brand-name">Droid Forge</span>
+            <span class="brand-dash" aria-hidden="true">—</span>
+            <span class="brand-tag">The AI Engineer That Delivers</span>
+        </a>
+        {% if auth_method == 'session' %}
+        <form method="post" action="/logout" class="d-flex align-items-center gap-2 mb-0" id="logout-form">
+            <span class="badge text-bg-success" id="access-badge">Operator signed in</span>
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <button type="submit" class="btn btn-sm btn-outline-light" id="logout-btn">Sign out</button>
+        </form>
+        {% elif auth_method == 'local_dev' %}
+        <span class="badge text-bg-warning" id="access-badge" title="FORGE_ACCESS_MODE=local_dev">Local development mode: operator sign-in disabled</span>
+        {% endif %}
+    </div>
+</nav>
