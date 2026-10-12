@@ -504,7 +504,10 @@ def parent_accounting(session: Session, parent_type: str, parent: ParentRow) -> 
         }
     attempt_credits = sum_known([a.factory_credits for a in attempts])
     history_credits = history["factory_credits"] if history else None
-    has_history = history is not None and history_credits is not None
+    history_coverage: str | None = None
+    if history is not None:
+        recorded = history_credits is not None or history["estimated_tokens"] is not None
+        history_coverage = UsageCompleteness.PARTIAL if recorded else UsageCompleteness.UNKNOWN
     completeness = [a.usage_completeness or UsageCompleteness.UNKNOWN for a in attempts]
     unsuccessful = [a for a in attempts if a.status != AttemptStatus.COMPLETED]
     return {
@@ -519,7 +522,7 @@ def parent_accounting(session: Session, parent_type: str, parent: ParentRow) -> 
         "usage_totals": usage_totals(attempts),
         "historical_summary": history,
         "observed_factory_credits": sum_known([attempt_credits, history_credits]),
-        "coverage": usage_coverage(attempts, has_history),
+        "coverage": usage_coverage(attempts, history_coverage),
         "usd": usd_summary(attempts, has_history=history is not None),
         "attribution_limits": list(ATTRIBUTION_LIMITS),
     }

@@ -11,10 +11,10 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from droid_sdk import ToolCall
+from droid_sdk import TokenUsageUpdate, ToolCall
 
 from app import droid_client, reconcile, recovery, run_control, tasks, worker
-from app.attempts import start_attempt
+from app.attempts import fail_attempt_start, start_attempt
 from app.candidates import WorkspaceState
 from app.config import get_settings
 from app.database import db_session
@@ -562,6 +562,94 @@ class TestSpendingChecks:
         [blocked] = attempts_of(PARENT_TASK, other)
         assert blocked["outcome_subtype"] == "spending_check_input_missing"
         assert "unknown usage" in blocked["error"]
+
+    def test_credit_limit_refuses_tokens_only_terminal_usage_before_spawn_and_across_restart(
+        self, monkeypatch, api, droid
+    ):
+        task_id = add_task()
+        asyncio.run(launch(task_id))
+        asyncio.run(droid.turns[0]["on_complete"](turn(None)))
+        [finished] = attempts_of(PARENT_TASK, task_id)
+        assert (finished["usage"]["completeness"], finished["usage"]["factory_credits"]) == ("complete", None)
+        assert finished["usage"]["input_tokens"] == 10
+        configure(monkeypatch, FORGE_BUDGET_POLICY="credit_limit", FORGE_CREDIT_LIMIT="100")
+
+        spending = api.get("/api/run-limits").json()["spending"]
+        assert (spending["allowed"], spending["code"]) == (False, "spending_check_input_missing")
+        assert spending["attempts_missing_factory_credits"] == 1
+        refused = api.post(f"/api/tasks/{task_id}/follow-up", json={"instruction": "more"})
+        assert refused.status_code == 409 and refused.json()["code"] == "spending_check_input_missing"
+        assert len(droid.turns) == 1
+
+        asyncio.run(recovery.recover_interrupted_tasks(droid))
+        blocked = attempts_of(PARENT_TASK, task_id)[-1]
+        assert (blocked["status"], blocked["outcome_subtype"]) == ("blocked", "spending_check_input_missing")
+        assert "no observed Factory credits" in blocked["error"]
+        again = api.post(f"/api/tasks/{task_id}/follow-up", json={"instruction": "more"})
+        assert again.status_code == 409 and again.json()["code"] == "spending_check_input_missing"
+        assert len(droid.turns) == 1
+
+    def test_credit_limit_refuses_tokens_only_partial_usage(self, monkeypatch, droid):
+        task_id = add_task()
+        asyncio.run(launch(task_id))
+        attempt_id = attempts_of(PARENT_TASK, task_id)[0]["id"]
+        recorder = TurnRecorder(attempt_id, snapshot_interval=0)
+        recorder.observe(
+            TokenUsageUpdate(
+                input_tokens=40,
+                output_tokens=3,
+                cache_creation_tokens=0,
+                cache_read_tokens=0,
+                thinking_tokens=0,
+                factory_credits=None,
+            )
+        )
+        asyncio.run(recovery.recover_interrupted_tasks(droid))
+        [partial] = attempts_of(PARENT_TASK, task_id)
+        assert (partial["usage"]["completeness"], partial["usage"]["factory_credits"]) == ("partial", None)
+        configure(monkeypatch, FORGE_BUDGET_POLICY="credit_limit", FORGE_CREDIT_LIMIT="100")
+
+        other = add_task(issue_number=12)
+        asyncio.run(launch(other))
+        assert len(droid.turns) == 1
+        assert status_of(Task, other) == TaskStatus.BLOCKED
+        [blocked] = attempts_of(PARENT_TASK, other)
+        assert blocked["outcome_subtype"] == "spending_check_input_missing"
+
+    def test_credit_limit_admits_known_zero_lower_bounds_and_unstarted_turns(self, monkeypatch, api, droid):
+        zero = add_task()
+        asyncio.run(launch(zero))
+        asyncio.run(droid.turns[0]["on_complete"](turn(0)))
+        lower_bound = add_task(issue_number=13)
+        asyncio.run(launch(lower_bound))
+        recorder = TurnRecorder(attempts_of(PARENT_TASK, lower_bound)[0]["id"], snapshot_interval=0)
+        recorder.observe(
+            TokenUsageUpdate(
+                input_tokens=40,
+                output_tokens=3,
+                cache_creation_tokens=0,
+                cache_read_tokens=0,
+                thinking_tokens=0,
+                factory_credits=6,
+            )
+        )
+        asyncio.run(recovery.recover_interrupted_tasks(droid))
+        never_started = add_task(issue_number=14)
+        attempt_id = start_attempt(PARENT_TASK, never_started, AttemptKind.FIX).attempt_id
+        fail_attempt_start(attempt_id, "Droid session failed to start")
+        configure(monkeypatch, FORGE_BUDGET_POLICY="unlimited")
+        refused_launch = add_task(issue_number=15)
+        asyncio.run(launch(refused_launch))
+        assert attempts_of(PARENT_TASK, refused_launch)[0]["status"] == "blocked"
+        configure(monkeypatch, FORGE_BUDGET_POLICY="credit_limit", FORGE_CREDIT_LIMIT="100")
+
+        spending = api.get("/api/run-limits").json()["spending"]
+        assert (spending["allowed"], spending["observed_factory_credits"]) == (True, 6)
+        assert spending["attempts_missing_factory_credits"] == 0
+        assert any("lower bound" in note for note in spending["notes"])
+        follow_up = api.post(f"/api/tasks/{zero}/follow-up", json={"instruction": "more"})
+        assert follow_up.status_code == 200, follow_up.text
+        assert len(droid.turns) == 3
 
     def test_unknown_policy_fails_closed(self, monkeypatch, droid):
         configure(monkeypatch, FORGE_BUDGET_POLICY="unlimited")

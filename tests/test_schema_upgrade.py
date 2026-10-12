@@ -268,3 +268,40 @@ def test_legacy_rows_stay_readable_and_new_follow_up_is_counted_once(old_db, pro
     assert after["task"]["factory_credits"] == 40.0
     assert after["task"]["accounting_basis"] == ACCOUNTING_LEGACY_SUMMARY
     assert after["task"]["cost_usd"] == 0.25
+
+
+def test_unknown_legacy_work_keeps_coverage_partial_after_complete_recovery(old_db, protected_mode, monkeypatch):
+    """An old active task with no recorded usage, interrupted on startup, then explicitly recovered for 7 credits."""
+    upgrade()
+    droid = FakeDroid()
+    monkeypatch.setattr(worker, "get_droid_client", lambda: droid)
+    monkeypatch.setattr(recovery, "get_droid_client", lambda: droid)
+    monkeypatch.setattr(worker, "GitHubClient", lambda: FakeGitHub())
+    monkeypatch.setattr(reconcile, "GitHubClient", lambda: FakeGitHub())
+    from app.app import app
+
+    with TestClient(app, base_url=PROTECTED_BASE_URL) as api:
+        api.headers.update(BEARER)
+        before = api.get(f"/api/tasks/{ACTIVE_TASK}").json()
+        assert before["task"]["status"] == TaskStatus.INTERRUPTED
+        assert before["accounting"]["coverage"] == UsageCompleteness.UNKNOWN
+
+        resp = api.post(f"/api/tasks/{ACTIVE_TASK}/recover")
+        assert resp.status_code == 200, resp.text
+        asyncio.run(droid.turns[0]["on_complete"](turn(7, session_id="sess-old-live")))
+        asyncio.run(droid.turns[0]["on_complete"](turn(7, session_id="sess-old-live")))
+        after = api.get(f"/api/tasks/{ACTIVE_TASK}").json()
+
+    [attempt] = after["attempts"]
+    assert (attempt["kind"], attempt["status"], attempt["usage"]["factory_credits"]) == ("recovery", "completed", 7)
+    assert attempt["usage"]["completeness"] == UsageCompleteness.COMPLETE
+    accounting = after["accounting"]
+    history = accounting["historical_summary"]
+    assert (history["factory_credits"], history["per_turn"]) == (None, UsageCompleteness.UNKNOWN)
+    assert accounting["attempt_count"] == 1
+    assert accounting["attempt_factory_credits"] == 7
+    assert accounting["observed_factory_credits"] == 7
+    # The earlier legacy work used an unknown amount, so 7 is only the known subtotal.
+    assert accounting["coverage"] == UsageCompleteness.PARTIAL
+    assert accounting["usd"]["total_usd"] is None
+    assert after["task"]["factory_credits"] is None

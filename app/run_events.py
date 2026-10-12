@@ -183,7 +183,10 @@ class TurnRecorder:
         self.attempt_id = attempt_id
         self._clock = clock
         self._interval = snapshot_interval
-        self._pending: dict[str, int | float] | None = None
+        # Coalesced, not-yet-persisted snapshots: each category's first and latest value, and how many.
+        self._pending_first: dict[str, int | float] = {}
+        self._pending_latest: dict[str, int | float] = {}
+        self._pending_count = 0
         self._last_persisted: float | None = None
         self.dropped = 0
 
@@ -203,14 +206,15 @@ class TurnRecorder:
             )
 
     def _flush_snapshot(self) -> None:
-        snapshot, self._pending = self._pending, None
-        if snapshot is None:
+        if not self._pending_count:
             return
+        first, snapshot, count = self._pending_first, self._pending_latest, self._pending_count
+        self._pending_first, self._pending_latest, self._pending_count = {}, {}, 0
         self._last_persisted = self._clock()
         try:
             with db_session() as session:
                 attempt = session.get(RunAttempt, self.attempt_id)
-                if attempt is None or not record_snapshot(attempt, snapshot):
+                if attempt is None or not record_snapshot(attempt, snapshot, first=first, observations=count):
                     return
                 if not append_event(session, self.attempt_id, EventType.USAGE, {"cumulative": snapshot}):
                     self.dropped += 1
@@ -248,7 +252,11 @@ class TurnRecorder:
     def observe(self, message: object) -> None:
         snapshot = snapshot_from(message)
         if snapshot is not None:
-            self._pending = snapshot
+            # A category absent from this update was not reported in it; keep what was seen earlier.
+            for name, value in snapshot.items():
+                self._pending_first.setdefault(name, value)
+            self._pending_latest.update(snapshot)
+            self._pending_count += 1
             if self._last_persisted is None or self._clock() - self._last_persisted >= self._interval:
                 self._flush_snapshot()
             return

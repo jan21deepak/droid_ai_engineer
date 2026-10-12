@@ -93,15 +93,27 @@ def _set_usage(attempt: RunAttempt, values: Mapping[str, int | float], *, source
 def record_terminal_usage(attempt: RunAttempt, usage: Mapping[str, Any] | None) -> bool:
     """Store a turn's terminal usage once; a repeat delivery changes nothing.
 
-    A terminal result replaces any snapshot-derived partial usage, because it is
-    the turn's own total.
+    Each category the terminal result reports replaces any snapshot-derived
+    value, because it is the turn's own total. A category the result omits (or
+    reports invalidly) keeps only this turn's attributable snapshot value, and
+    the usage is then partial; a cumulative snapshot is never added on top.
     """
-    if attempt.usage_source == UsageSource.TERMINAL_RESULT:
+    if attempt.usage_source in UsageSource.TERMINAL:
         return False
     values = clean_usage(usage)
     if not values:
         return False
-    _set_usage(attempt, values, source=UsageSource.TERMINAL_RESULT, completeness=UsageCompleteness.COMPLETE)
+    attributable = attributable_snapshot_usage(attempt)
+    filled = {k: v for k, v in attributable[0].items() if k not in values} if attributable else {}
+    if filled:
+        _set_usage(
+            attempt,
+            {**filled, **values},
+            source=UsageSource.TERMINAL_WITH_SNAPSHOT,
+            completeness=UsageCompleteness.PARTIAL,
+        )
+    else:
+        _set_usage(attempt, values, source=UsageSource.TERMINAL_RESULT, completeness=UsageCompleteness.COMPLETE)
     return True
 
 
@@ -115,16 +127,39 @@ def _load_snapshot(attempt: RunAttempt) -> dict[str, Any]:
     return raw if isinstance(raw, dict) else {}
 
 
-def record_snapshot(attempt: RunAttempt, raw: Mapping[str, Any] | None) -> bool:
-    """Keep the first and latest session-cumulative snapshot seen in this turn. Never a turn charge."""
-    values = clean_usage(raw)
-    if not values:
+def _stored_values(stored: Mapping[str, Any], key: str) -> dict[str, int | float]:
+    value = stored.get(key)
+    return clean_usage(value if isinstance(value, dict) else None)
+
+
+def record_snapshot(
+    attempt: RunAttempt,
+    raw: Mapping[str, Any] | None,
+    *,
+    first: Mapping[str, Any] | None = None,
+    observations: int = 1,
+) -> bool:
+    """Keep each category's first and latest session-cumulative value seen in this turn. Never a turn charge.
+
+    ``raw`` holds the latest values; ``first`` (default ``raw``) the earliest
+    values of the same batch when several observations were coalesced. A
+    category missing from an update was not reported in it, so its earlier
+    values are kept rather than cleared.
+    """
+    latest = clean_usage(raw)
+    if not latest:
         return False
+    earliest = clean_usage(first) if first is not None else latest
     stored = _load_snapshot(attempt)
-    first = stored.get("first") if isinstance(stored.get("first"), dict) else values
+    merged_first = {**earliest, **_stored_values(stored, "first")}
+    for name, value in latest.items():
+        merged_first.setdefault(name, value)
+    merged_latest = {**_stored_values(stored, "latest"), **latest}
     previous = stored.get("count")
-    count = (previous if isinstance(previous, int) else 0) + 1
-    attempt.usage_snapshot = json.dumps({"first": first, "latest": values, "count": count}, sort_keys=True)
+    count = (previous if isinstance(previous, int) else 0) + max(1, observations)
+    attempt.usage_snapshot = json.dumps(
+        {"first": merged_first, "latest": merged_latest, "count": count}, sort_keys=True
+    )
     attempt.usage_snapshot_at = datetime.now(UTC)
     return True
 
@@ -134,16 +169,17 @@ def attributable_snapshot_usage(attempt: RunAttempt) -> tuple[dict[str, int | fl
 
     A fresh session's cumulative snapshot is entirely this turn's. In a resumed
     session the cumulative counter may include earlier turns (or restart with
-    the process), so only growth observed during this turn is counted, as a
-    lower bound. Anything else is ambiguous and is not invented as a charge.
+    the process), so only growth observed during this turn is counted, per
+    category from that category's own first observation, as a lower bound. A
+    category seen once, or anything else ambiguous, is not invented as a charge.
     """
     stored = _load_snapshot(attempt)
-    latest = clean_usage(stored.get("latest") if isinstance(stored.get("latest"), dict) else None)
+    latest = _stored_values(stored, "latest")
     if not latest:
         return None
     if attempt.kind in FRESH_SESSION_KINDS:
         return latest, UsageSource.SNAPSHOT_FRESH_SESSION
-    first = clean_usage(stored.get("first") if isinstance(stored.get("first"), dict) else None)
+    first = _stored_values(stored, "first")
     delta: dict[str, int | float] = {}
     for name, value in latest.items():
         start = first.get(name)
@@ -154,7 +190,7 @@ def attributable_snapshot_usage(attempt: RunAttempt) -> tuple[dict[str, int | fl
 
 def apply_snapshot_usage(attempt: RunAttempt) -> bool:
     """Without a terminal result, keep attributable snapshot usage as a partial observation."""
-    if attempt.usage_source == UsageSource.TERMINAL_RESULT:
+    if attempt.usage_source in UsageSource.TERMINAL:
         return False
     attributable = attributable_snapshot_usage(attempt)
     if attributable is None:
@@ -281,11 +317,15 @@ def _coverage(states: list[str]) -> str:
     return UsageCompleteness.PARTIAL
 
 
-def usage_coverage(attempts: list[RunAttempt], has_history: bool) -> str:
+def usage_coverage(attempts: list[RunAttempt], history: str | None) -> str:
+    """Usage coverage across attempts plus a legacy summary's coverage (``None`` without one).
+
+    A legacy summary is never complete: older code overwrote it per turn, so
+    it is ``partial`` when it recorded any usage and ``unknown`` when it did not.
+    """
     states = [a.usage_completeness or UsageCompleteness.UNKNOWN for a in attempts]
-    if has_history:
-        # A legacy summary has no per-turn breakdown (older code overwrote it per turn).
-        states.append(UsageCompleteness.PARTIAL)
+    if history is not None:
+        states.append(history)
     return _coverage(states)
 
 

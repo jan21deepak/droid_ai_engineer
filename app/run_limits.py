@@ -110,14 +110,26 @@ def in_flight_runs(session: Session) -> list[str]:
     return sorted(keys | _live_sessions())
 
 
-def _usage_unverifiable(attempt: RunAttempt) -> bool:
-    """A finished attempt that may have used credits Forge never observed."""
+def _may_have_consumed(attempt: RunAttempt) -> bool:
+    """A finished attempt whose turn may have spent credits (it was not proven never to start)."""
     return (
         not attempt.active
-        and (attempt.usage_completeness or UsageCompleteness.UNKNOWN) == UsageCompleteness.UNKNOWN
         and attempt.usage_source != UsageSource.NOT_STARTED
         and attempt.outcome_subtype != "start_failed"
     )
+
+
+def _usage_unverifiable(attempt: RunAttempt) -> bool:
+    """A finished attempt that may have used credits Forge never observed."""
+    return (
+        _may_have_consumed(attempt)
+        and (attempt.usage_completeness or UsageCompleteness.UNKNOWN) == UsageCompleteness.UNKNOWN
+    )
+
+
+def _credits_missing(attempt: RunAttempt) -> bool:
+    """A finished attempt that may have spent Factory credits but reported none, whatever its token usage."""
+    return _may_have_consumed(attempt) and attempt.factory_credits is None
 
 
 def observed_credit_usage(session: Session) -> dict[str, Any]:
@@ -129,6 +141,7 @@ def observed_credit_usage(session: Session) -> dict[str, Any]:
     return {
         "observed_factory_credits": sum_known([a.factory_credits for a in attempts] + legacy),
         "attempts_with_unverifiable_usage": sum(1 for a in attempts if _usage_unverifiable(a)),
+        "attempts_missing_factory_credits": sum(1 for a in attempts if _credits_missing(a)),
         "attempts_with_partial_usage": completeness.count(UsageCompleteness.PARTIAL),
         "legacy_summaries": sum(1 for value in legacy if value is not None),
     }
@@ -207,11 +220,12 @@ def spending_status(session: Session) -> dict[str, Any]:
                 "FORGE_BUDGET_POLICY=credit_limit requires FORGE_CREDIT_LIMIT (a positive number of Factory credits)",
             )
         status["credit_limit"] = limit
-        if usage["attempts_with_unverifiable_usage"]:
+        # The check's required input is Factory credits; token counts or "complete" usage do not supply it.
+        if usage["attempts_missing_factory_credits"]:
             return refuse(
                 RefusalCode.SPENDING_INPUT_MISSING,
-                f"{usage['attempts_with_unverifiable_usage']} finished attempt(s) have unknown usage, so observed "
-                "credits cannot be checked against FORGE_CREDIT_LIMIT",
+                f"{usage['attempts_missing_factory_credits']} finished attempt(s) have no observed Factory credits "
+                "(unknown usage), so observed credits cannot be checked against FORGE_CREDIT_LIMIT",
             )
         if credits is not None and credits >= limit:
             return refuse(

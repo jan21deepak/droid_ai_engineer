@@ -64,11 +64,17 @@ class UsageSource:
 
     # The SDK's completed-turn result: the turn's own total, counted once.
     TERMINAL_RESULT = "terminal_result"
-    # No terminal result; the latest session-cumulative snapshot of a turn that
-    # opened a fresh session (nothing earlier in that session to subtract).
+    # A terminal result that omitted some categories, which were filled from this
+    # turn's attributable snapshots (see the snapshot sources below). Partial.
+    TERMINAL_WITH_SNAPSHOT = "terminal_result_with_snapshot"
+
+    TERMINAL = (TERMINAL_RESULT, TERMINAL_WITH_SNAPSHOT)
+    # No terminal result; the latest session-cumulative value of each category in
+    # a turn that opened a fresh session (nothing earlier in that session to subtract).
     SNAPSHOT_FRESH_SESSION = "snapshot_fresh_session"
-    # No terminal result in a resumed session: latest minus first snapshot seen
-    # during this turn. A lower bound, since usage before the first snapshot is missed.
+    # No terminal result in a resumed session: per category, latest minus first
+    # value seen during this turn. A lower bound, since usage before a category's
+    # first observation is missed; a category seen only once contributes nothing.
     SNAPSHOT_DELTA_LOWER_BOUND = "snapshot_delta_lower_bound"
 
     SNAPSHOT = (SNAPSHOT_FRESH_SESSION, SNAPSHOT_DELTA_LOWER_BOUND)
