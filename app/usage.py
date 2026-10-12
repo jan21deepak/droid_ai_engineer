@@ -1,0 +1,335 @@
+"""Per-attempt usage and dollar accounting rules.
+
+- Every usage category is kept separately and ``None`` means *not observed*;
+  categories are never added into an invented "billable" total.
+- A completed turn's terminal result is that turn's contribution and is
+  counted once. TokenUsageUpdate snapshots are session-cumulative: they are
+  stored as snapshots and only become a (partial) contribution when no terminal
+  result arrived and the snapshot can be attributed to this turn.
+- Dollars are never derived implicitly from Factory credits. An estimate needs
+  an explicit rate and source; a reconciled value needs a supplied amount and
+  source. Both are kept distinct, and unknown is never shown as zero.
+- Every number is validated: finite, non-negative and bounded.
+"""
+
+from __future__ import annotations
+
+import json
+import math
+from collections.abc import Iterable, Mapping
+from datetime import UTC, datetime
+from typing import Any
+
+from app.config import get_settings
+from app.redaction import redact_text
+from app.run_models import (
+    USAGE_FIELDS,
+    AttemptKind,
+    CostStatus,
+    RunAttempt,
+    UsageCompleteness,
+    UsageSource,
+)
+
+MAX_TOKENS = 10**15
+MAX_CREDITS = 1e12
+MAX_USD = 1_000_000.0
+MAX_USD_PER_CREDIT = 1_000.0
+SOURCE_LIMIT = 200
+
+INTEGER_FIELDS = tuple(name for name in USAGE_FIELDS if name != "factory_credits")
+# Kinds whose turn opens a brand-new SDK session, so its cumulative snapshot is all this turn's.
+FRESH_SESSION_KINDS = (AttemptKind.FIX, AttemptKind.REVIEW)
+
+ATTRIBUTION_LIMITS = (
+    "Usage is what the Droid SDK reported to this service; delegated child-session usage is not observed separately.",
+    "Snapshot-derived usage (no terminal result) is partial; in resumed sessions it is a lower bound.",
+    "Token categories are reported separately and are not summed into a billable total.",
+    "No billing connector: dollar values are explicit estimates or manually reconciled values only.",
+)
+
+
+class CostInputError(ValueError):
+    """A dollar estimate or reconciliation that cannot be applied to this attempt."""
+
+    def __init__(self, detail: str, status_code: int = 422):
+        super().__init__(detail)
+        self.detail = detail
+        self.status_code = status_code
+
+
+def finite_number(value: Any, *, integer: bool = False, maximum: float | None = None) -> int | float | None:
+    """``value`` as a safe non-negative finite number, or ``None`` when it is not one."""
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if value < 0 or (maximum is not None and value > maximum):
+        return None
+    return int(value) if integer else float(value)
+
+
+def clean_usage(raw: Mapping[str, Any] | None) -> dict[str, int | float]:
+    """Only the validly reported categories of ``raw``; missing or invalid ones are omitted (unknown)."""
+    if not raw:
+        return {}
+    cleaned: dict[str, int | float] = {}
+    for name in USAGE_FIELDS:
+        integer = name in INTEGER_FIELDS
+        value = finite_number(raw.get(name), integer=integer, maximum=MAX_TOKENS if integer else MAX_CREDITS)
+        if value is not None:
+            cleaned[name] = value
+    return cleaned
+
+
+def _set_usage(attempt: RunAttempt, values: Mapping[str, int | float], *, source: str, completeness: str) -> None:
+    for name in USAGE_FIELDS:
+        setattr(attempt, name, values.get(name))
+    attempt.usage_source = source
+    attempt.usage_completeness = completeness
+    attempt.usage_recorded_at = datetime.now(UTC)
+
+
+def record_terminal_usage(attempt: RunAttempt, usage: Mapping[str, Any] | None) -> bool:
+    """Store a turn's terminal usage once; a repeat delivery changes nothing.
+
+    A terminal result replaces any snapshot-derived partial usage, because it is
+    the turn's own total.
+    """
+    if attempt.usage_source == UsageSource.TERMINAL_RESULT:
+        return False
+    values = clean_usage(usage)
+    if not values:
+        return False
+    _set_usage(attempt, values, source=UsageSource.TERMINAL_RESULT, completeness=UsageCompleteness.COMPLETE)
+    return True
+
+
+def _load_snapshot(attempt: RunAttempt) -> dict[str, Any]:
+    if not attempt.usage_snapshot:
+        return {}
+    try:
+        raw = json.loads(attempt.usage_snapshot)
+    except ValueError:
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def record_snapshot(attempt: RunAttempt, raw: Mapping[str, Any] | None) -> bool:
+    """Keep the first and latest session-cumulative snapshot seen in this turn. Never a turn charge."""
+    values = clean_usage(raw)
+    if not values:
+        return False
+    stored = _load_snapshot(attempt)
+    first = stored.get("first") if isinstance(stored.get("first"), dict) else values
+    previous = stored.get("count")
+    count = (previous if isinstance(previous, int) else 0) + 1
+    attempt.usage_snapshot = json.dumps({"first": first, "latest": values, "count": count}, sort_keys=True)
+    attempt.usage_snapshot_at = datetime.now(UTC)
+    return True
+
+
+def attributable_snapshot_usage(attempt: RunAttempt) -> tuple[dict[str, int | float], str] | None:
+    """The part of this turn's snapshots that is attributable to the turn, with its source label.
+
+    A fresh session's cumulative snapshot is entirely this turn's. In a resumed
+    session the cumulative counter may include earlier turns (or restart with
+    the process), so only growth observed during this turn is counted, as a
+    lower bound. Anything else is ambiguous and is not invented as a charge.
+    """
+    stored = _load_snapshot(attempt)
+    latest = clean_usage(stored.get("latest") if isinstance(stored.get("latest"), dict) else None)
+    if not latest:
+        return None
+    if attempt.kind in FRESH_SESSION_KINDS:
+        return latest, UsageSource.SNAPSHOT_FRESH_SESSION
+    first = clean_usage(stored.get("first") if isinstance(stored.get("first"), dict) else None)
+    delta: dict[str, int | float] = {}
+    for name, value in latest.items():
+        start = first.get(name)
+        if start is not None and value > start:
+            delta[name] = value - start
+    return (delta, UsageSource.SNAPSHOT_DELTA_LOWER_BOUND) if delta else None
+
+
+def apply_snapshot_usage(attempt: RunAttempt) -> bool:
+    """Without a terminal result, keep attributable snapshot usage as a partial observation."""
+    if attempt.usage_source == UsageSource.TERMINAL_RESULT:
+        return False
+    attributable = attributable_snapshot_usage(attempt)
+    if attributable is None:
+        return False
+    values, source = attributable
+    _set_usage(attempt, values, source=source, completeness=UsageCompleteness.PARTIAL)
+    return True
+
+
+def finalize_usage(attempt: RunAttempt, terminal_usage: Mapping[str, Any] | None) -> None:
+    """Terminal usage when reported, otherwise attributable snapshots; then any configured estimate."""
+    if not record_terminal_usage(attempt, terminal_usage):
+        apply_snapshot_usage(attempt)
+    apply_configured_estimate(attempt)
+
+
+# ---------------------------------------------------------------------------
+# Dollars
+# ---------------------------------------------------------------------------
+
+
+def clean_source(value: Any) -> str | None:
+    """A bounded, single-line, redacted provenance label, or ``None`` when unusable."""
+    if not isinstance(value, str):
+        return None
+    text = " ".join(value.split())
+    if not text or len(text) > SOURCE_LIMIT:
+        return None
+    return redact_text(text)
+
+
+def set_estimate(attempt: RunAttempt, rate_usd_per_credit: Any, source: Any) -> None:
+    """Estimate this attempt's dollars from its observed credits at an explicit rate. Not a bill."""
+    rate = finite_number(rate_usd_per_credit, maximum=MAX_USD_PER_CREDIT)
+    if rate is None or rate <= 0:
+        raise CostInputError("rate_usd_per_credit must be a finite number above 0 and at most 1000")
+    label = clean_source(source)
+    if label is None:
+        raise CostInputError("source must be a non-empty label of at most 200 characters")
+    if attempt.active:
+        raise CostInputError("attempt is still running; estimate it after it ends", 409)
+    if attempt.factory_credits is None:
+        raise CostInputError("no Factory credits were observed for this attempt; its cost stays unknown", 409)
+    estimate = finite_number(round(attempt.factory_credits * rate, 6), maximum=MAX_USD)
+    if estimate is None:
+        raise CostInputError("estimate exceeds the supported range")
+    attempt.estimated_usd = estimate
+    attempt.estimate_rate_usd_per_credit = rate
+    attempt.estimate_source = label
+    attempt.estimated_at = datetime.now(UTC)
+
+
+def set_reconciliation(attempt: RunAttempt, usd: Any, source: Any) -> None:
+    """Record a manually supplied dollar amount (e.g. from an invoice), kept apart from any estimate."""
+    value = finite_number(usd, maximum=MAX_USD)
+    if value is None:
+        raise CostInputError("usd must be a finite number from 0 to 1000000")
+    label = clean_source(source)
+    if label is None:
+        raise CostInputError("source must be a non-empty label of at most 200 characters")
+    if attempt.active:
+        raise CostInputError("attempt is still running; reconcile it after it ends", 409)
+    attempt.reconciled_usd = value
+    attempt.reconciliation_source = label
+    attempt.reconciled_at = datetime.now(UTC)
+
+
+def apply_configured_estimate(attempt: RunAttempt) -> bool:
+    """Apply the operator-configured estimate rate, only when both a valid rate and a source are set."""
+    settings = get_settings()
+    if attempt.estimated_usd is not None or attempt.factory_credits is None:
+        return False
+    try:
+        configured = float((settings.forge_usd_per_credit_estimate or "").strip())
+    except ValueError:
+        return False
+    rate = finite_number(configured, maximum=MAX_USD_PER_CREDIT)
+    if rate is None or rate <= 0 or clean_source(settings.forge_usd_estimate_source) is None:
+        return False
+    try:
+        set_estimate(attempt, rate, settings.forge_usd_estimate_source)
+    except CostInputError:
+        return False
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Aggregates
+# ---------------------------------------------------------------------------
+
+
+def sum_known(values: Iterable[Any]) -> float | None:
+    known = [float(v) for v in values if v is not None]
+    return sum(known) if known else None
+
+
+def usage_totals(attempts: list[RunAttempt]) -> dict[str, Any]:
+    """Per-category sums of observed contributions, with how many attempts observed each category."""
+    totals: dict[str, Any] = {}
+    observed: dict[str, int] = {}
+    for name in USAGE_FIELDS:
+        values = [getattr(a, name) for a in attempts if getattr(a, name) is not None]
+        observed[name] = len(values)
+        total = sum_known(values)
+        totals[name] = int(total) if total is not None and name in INTEGER_FIELDS else total
+    totals["attempts_observed"] = observed
+    return totals
+
+
+def _coverage(states: list[str]) -> str:
+    if not states or all(s == UsageCompleteness.UNKNOWN for s in states):
+        return UsageCompleteness.UNKNOWN
+    if all(s == UsageCompleteness.COMPLETE for s in states):
+        return UsageCompleteness.COMPLETE
+    return UsageCompleteness.PARTIAL
+
+
+def usage_coverage(attempts: list[RunAttempt], has_history: bool) -> str:
+    states = [a.usage_completeness or UsageCompleteness.UNKNOWN for a in attempts]
+    if has_history:
+        # A legacy summary has no per-turn breakdown (older code overwrote it per turn).
+        states.append(UsageCompleteness.PARTIAL)
+    return _coverage(states)
+
+
+def usd_summary(attempts: list[RunAttempt], *, has_history: bool = False) -> dict[str, Any]:
+    """Dollar facts across attempts. A known-only subtotal is never presented as the complete cost."""
+    reconciled = [a for a in attempts if a.cost_status == CostStatus.RECONCILED]
+    estimated = [a for a in attempts if a.cost_status == CostStatus.ESTIMATED]
+    unknown = [a for a in attempts if a.cost_status == CostStatus.UNKNOWN]
+    states = [UsageCompleteness.UNKNOWN] * len(unknown) + [UsageCompleteness.COMPLETE] * len(reconciled)
+    # An estimate only covers the credits that were observed.
+    states += [
+        UsageCompleteness.COMPLETE if a.usage_completeness == UsageCompleteness.COMPLETE else UsageCompleteness.PARTIAL
+        for a in estimated
+    ]
+    if has_history:
+        states.append(UsageCompleteness.UNKNOWN)
+    coverage = _coverage(states)
+    reconciled_subtotal = sum_known(a.reconciled_usd for a in reconciled)
+    estimated_subtotal = sum_known(a.estimated_usd for a in estimated)
+    known = sum_known([reconciled_subtotal, estimated_subtotal])
+    return {
+        "coverage": coverage,
+        "billed_usd": None,
+        "attempts_unknown": len(unknown),
+        "attempts_estimated": len(estimated),
+        "attempts_reconciled": len(reconciled),
+        "reconciled_usd_subtotal": reconciled_subtotal,
+        # Estimates of attempts that also have a reconciled value are superseded, not added.
+        "estimated_usd_subtotal": estimated_subtotal,
+        "estimates_superseded_by_reconciliation": sum(1 for a in reconciled if a.estimated_usd is not None),
+        "known_usd_subtotal": known,
+        "total_usd": known if coverage == UsageCompleteness.COMPLETE else None,
+        "estimate_sources": sorted({a.estimate_source for a in estimated if a.estimate_source}),
+        "reconciliation_sources": sorted({a.reconciliation_source for a in reconciled if a.reconciliation_source}),
+    }
+
+
+__all__ = [
+    "ATTRIBUTION_LIMITS",
+    "CostInputError",
+    "apply_configured_estimate",
+    "apply_snapshot_usage",
+    "attributable_snapshot_usage",
+    "clean_source",
+    "clean_usage",
+    "finalize_usage",
+    "finite_number",
+    "record_snapshot",
+    "record_terminal_usage",
+    "set_estimate",
+    "set_reconciliation",
+    "sum_known",
+    "usage_coverage",
+    "usage_totals",
+    "usd_summary",
+]

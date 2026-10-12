@@ -149,7 +149,52 @@ def test_two_upgrades_preserve_old_rows_and_invent_nothing(old_db):
     assert first["attempts"] == (0,)
     assert first["tracked"] == [(None,)] * 4
     names = {name for _, name, _ in first_schema}
-    assert {"run_attempts", "uq_attempt_one_active", "webhook_deliveries"} <= names
+    assert {"run_attempts", "run_events", "uq_attempt_one_active", "webhook_deliveries"} <= names
+
+
+LEDGER_COLUMNS = (
+    "usage_snapshot",
+    "usage_snapshot_at",
+    "estimated_usd",
+    "estimate_rate_usd_per_credit",
+    "estimate_source",
+    "estimated_at",
+    "reconciled_usd",
+    "reconciliation_source",
+    "reconciled_at",
+)
+
+
+def test_attempts_table_from_before_the_usage_ledger_is_upgraded_in_place(old_db):
+    upgrade()
+    conn = sqlite3.connect(old_db)
+    conn.execute("DROP TABLE run_events")
+    for column in LEDGER_COLUMNS:
+        conn.execute(f"ALTER TABLE run_attempts DROP COLUMN {column}")
+    conn.execute(
+        "INSERT INTO run_attempts (id, parent_type, parent_id, kind, sequence, status, created_at, "
+        "factory_credits, usage_source, usage_completeness) "
+        "VALUES (5, 'task', ?, 'follow_up', 1, 'completed', ?, 5.0, 'terminal_result', 'complete')",
+        (COMPLETED_TASK, CREATED),
+    )
+    conn.commit()
+    before = conn.execute("SELECT id, parent_id, kind, status, factory_credits FROM run_attempts").fetchall()
+    conn.close()
+
+    upgrade()
+    upgrade()
+
+    conn = sqlite3.connect(old_db)
+    try:
+        assert (
+            conn.execute("SELECT id, parent_id, kind, status, factory_credits FROM run_attempts").fetchall() == before
+        )
+        added = conn.execute(f"SELECT {', '.join(LEDGER_COLUMNS)} FROM run_attempts").fetchall()
+        # Nothing is back-filled: no invented snapshot, estimate or reconciliation.
+        assert added == [(None,) * len(LEDGER_COLUMNS)]
+        assert conn.execute("SELECT count(*) FROM run_events").fetchone() == (0,)
+    finally:
+        conn.close()
 
 
 def test_legacy_rows_stay_readable_and_new_follow_up_is_counted_once(old_db, protected_mode, monkeypatch):
@@ -213,6 +258,12 @@ def test_legacy_rows_stay_readable_and_new_follow_up_is_counted_once(old_db, pro
     assert accounting["historical_summary"]["factory_credits"] == 40.0
     assert accounting["observed_factory_credits"] == 45
     assert accounting["coverage"] == UsageCompleteness.PARTIAL
+    assert accounting["usage_totals"]["factory_credits"] == 5
+    # The legacy dollar figure stays history; the new attempt's dollars are unknown, not zero.
+    assert accounting["historical_summary"]["cost_usd"] == 0.25
+    assert accounting["usd"]["coverage"] == UsageCompleteness.UNKNOWN
+    assert accounting["usd"]["known_usd_subtotal"] is None
+    assert attempt["cost"]["status"] == "unknown"
     # The historical summary stays as recorded; the new turn is not folded into it.
     assert after["task"]["factory_credits"] == 40.0
     assert after["task"]["accounting_basis"] == ACCOUNTING_LEGACY_SUMMARY

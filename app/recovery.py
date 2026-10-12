@@ -36,6 +36,7 @@ from app.logging_conf import log_event
 from app.models import ReviewTask, Task, TaskStatus
 from app.policy import repository_decision
 from app.redaction import safe_error
+from app.run_events import TurnRecorder
 from app.run_models import PARENT_REVIEW, PARENT_TASK, AttemptKind, AttemptStatus, RunAttempt
 from app.worker import REPOSITORY_ACCESS, policy_denied
 
@@ -67,7 +68,7 @@ def _interrupt_orphaned_attempts(
     for attempt in query.all():
         if attempt.session_id and attempt.session_id in live:
             continue
-        interrupt_attempt(attempt, reason)
+        interrupt_attempt(session, attempt, reason)
         count += 1
     return count
 
@@ -230,13 +231,16 @@ async def continue_task(task_id: int, kind: str, instruction: str = "") -> dict[
 
     on_complete = partial(worker.finalize_fix_task, task_id, attempt_id=start.attempt_id)
     cwd = task_workspace_dir(repository, task_id)
+    observer = TurnRecorder(start.attempt_id)
     try:
         if kind == AttemptKind.FOLLOW_UP:
             result = await droid.send_follow_up(
-                session_id, instruction, repository=repository, cwd=cwd, on_complete=on_complete
+                session_id, instruction, repository=repository, cwd=cwd, on_complete=on_complete, observer=observer
             )
         else:
-            result = await droid.resume_interrupted(session_id, repository=repository, cwd=cwd, on_complete=on_complete)
+            result = await droid.resume_interrupted(
+                session_id, repository=repository, cwd=cwd, on_complete=on_complete, observer=observer
+            )
     except DroidSessionBusyError:
         _abandon_start(task_id, start.attempt_id, "session already had a turn in flight", start)
         raise ContinuationRefusedError(

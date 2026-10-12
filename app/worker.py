@@ -73,6 +73,7 @@ from app.review_policy import (
     parse_review_output,
     review_base_ref,
 )
+from app.run_events import TurnRecorder
 from app.run_models import PARENT_REVIEW, PARENT_TASK, AttemptKind, RunAttempt
 
 __all__ = [
@@ -151,6 +152,7 @@ async def launch_fix_task(
             setup_command=launch.get("setup_command") or "",
             model=launch.get("model"),
             on_complete=partial(finalize_fix_task, task_id, attempt_id=attempt_id),
+            observer=TurnRecorder(attempt_id),
         )
     except Exception as exc:
         error = f"Droid session failed to start: {safe_error(exc)}"
@@ -585,6 +587,7 @@ async def launch_review_task(
             model=launch.get("model"),
             on_complete=partial(finalize_review_task, review_id, binding, attempt_id=attempt_id),
             on_session_opened=partial(_bind_review_session, review_id, binding, attempt_id=attempt_id),
+            observer=TurnRecorder(attempt_id),
         )
     except Exception as exc:
         error = f"Droid review session failed to start: {safe_error(exc)}"

@@ -1,8 +1,11 @@
-"""Operator APIs for run attempts: task/review detail, attempt detail, follow-up and recovery.
+"""Operator APIs for run attempts: task/review detail, attempt detail and timeline,
+explicit dollar estimates/reconciliation, follow-up and recovery.
 
 All routes sit behind the default-deny operator access middleware. Detail
 responses report only recorded facts: an attempt's agent outcome is not an
 acceptance, publication, CI result or merge, and unobserved facts are ``null``.
+Dollar values are never derived from credits implicitly: an estimate needs an
+explicit rate and source, and a reconciliation a supplied amount and source.
 """
 
 from __future__ import annotations
@@ -17,7 +20,9 @@ from app.attempts import list_attempts, parent_accounting
 from app.database import db_session
 from app.models import ReviewTask, Task
 from app.recovery import ContinuationRefusedError, continue_task
+from app.run_events import event_limits, list_events
 from app.run_models import PARENT_REVIEW, PARENT_TASK, AttemptKind, RunAttempt
+from app.usage import MAX_USD, MAX_USD_PER_CREDIT, SOURCE_LIMIT, CostInputError, set_estimate, set_reconciliation
 
 router = APIRouter()
 
@@ -28,6 +33,30 @@ class FollowUpRequest(BaseModel):
         min_length=1,
         description="Follow-up prompt for the existing Droid session",
     )
+
+
+class CostEstimateRequest(BaseModel):
+    rate_usd_per_credit: float = Field(
+        ...,
+        gt=0,
+        le=MAX_USD_PER_CREDIT,
+        strict=True,
+        allow_inf_nan=False,
+        description="Explicit USD per Factory credit used for this estimate (not a verified billing rate)",
+    )
+    source: str = Field(..., min_length=1, max_length=SOURCE_LIMIT, description="Where the rate came from")
+
+
+class CostReconciliationRequest(BaseModel):
+    usd: float = Field(
+        ...,
+        ge=0,
+        le=MAX_USD,
+        strict=True,
+        allow_inf_nan=False,
+        description="Manually supplied dollar amount for this attempt (e.g. from an invoice)",
+    )
+    source: str = Field(..., min_length=1, max_length=SOURCE_LIMIT, description="Where the amount came from")
 
 
 def _not_found(what: str) -> JSONResponse:
@@ -99,8 +128,66 @@ async def review_detail(review_id: int) -> JSONResponse | dict[str, Any]:
 
 @router.get("/api/attempts/{attempt_id}", response_model=None)
 async def attempt_detail(attempt_id: int) -> JSONResponse | dict[str, Any]:
+    """One attempt with its usage, dollar status and bounded operational timeline."""
     with db_session() as session:
         attempt = session.get(RunAttempt, attempt_id)
         if attempt is None:
             return _not_found("attempt")
-        return {"attempt": attempt.to_dict()}
+        return {
+            "attempt": attempt.to_dict(),
+            "events": [e.to_dict() for e in list_events(session, [attempt_id])],
+            "event_limits": event_limits(),
+        }
+
+
+@router.get("/api/tasks/{task_id}/timeline", response_model=None)
+async def task_timeline(task_id: int) -> JSONResponse | dict[str, Any]:
+    """Every attempt's public events for a task, in attempt then event order."""
+    with db_session() as session:
+        if session.get(Task, task_id) is None:
+            return _not_found("task")
+        attempts = {a.id: a for a in list_attempts(session, PARENT_TASK, task_id)}
+        events = sorted(
+            list_events(session, list(attempts)),
+            key=lambda e: (attempts[e.attempt_id].sequence, e.sequence),
+        )
+        return {
+            "task_id": task_id,
+            "events": [
+                {
+                    **e.to_dict(),
+                    "attempt_sequence": attempts[e.attempt_id].sequence,
+                    "kind": attempts[e.attempt_id].kind,
+                }
+                for e in events
+            ],
+            "event_limits": event_limits(),
+        }
+
+
+def _update_cost(attempt_id: int, apply: Any) -> JSONResponse | dict[str, Any]:
+    with db_session() as session:
+        attempt = session.get(RunAttempt, attempt_id)
+        if attempt is None:
+            return _not_found("attempt")
+        try:
+            apply(attempt)
+        except CostInputError as exc:
+            return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+        return {"attempt_id": attempt_id, "cost": attempt.cost_dict()}
+
+
+@router.post("/api/attempts/{attempt_id}/cost-estimate", response_model=None)
+async def estimate_attempt_cost(attempt_id: int, payload: CostEstimateRequest) -> JSONResponse | dict[str, Any]:
+    """Record an explicit dollar *estimate* for a finished attempt's observed credits.
+
+    Refused (409) while the attempt runs or when no credits were observed; the
+    cost then stays unknown. An estimate is never presented as a bill.
+    """
+    return _update_cost(attempt_id, lambda a: set_estimate(a, payload.rate_usd_per_credit, payload.source))
+
+
+@router.post("/api/attempts/{attempt_id}/cost-reconciliation", response_model=None)
+async def reconcile_attempt_cost(attempt_id: int, payload: CostReconciliationRequest) -> JSONResponse | dict[str, Any]:
+    """Record a manually reconciled dollar amount for a finished attempt, kept apart from any estimate."""
+    return _update_cost(attempt_id, lambda a: set_reconciliation(a, payload.usd, payload.source))

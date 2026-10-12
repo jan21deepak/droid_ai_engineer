@@ -126,11 +126,11 @@ class RecordingDroid:
         self.started.append(kwargs)
         return {"session_id": "sess-review", "status": "running"}
 
-    async def resume_interrupted(self, session_id, *, repository, cwd, on_complete=None):
+    async def resume_interrupted(self, session_id, *, repository, cwd, on_complete=None, observer=None):
         self.resumed.append((session_id, cwd))
         return {"session_id": session_id, "status": "running"}
 
-    async def send_follow_up(self, session_id, instruction, *, repository, cwd, on_complete=None):
+    async def send_follow_up(self, session_id, instruction, *, repository, cwd, on_complete=None, observer=None):
         self.follow_ups.append((session_id, instruction, cwd))
         return {"session_id": session_id, "status": "running"}
 

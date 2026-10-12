@@ -88,6 +88,12 @@ class Settings(BaseSettings):
     # Flat estimated USD attributed per completed Droid run when real Factory
     # credit usage is unavailable (set 0 to ignore).
     droid_usd_per_agent_run: float = 0.0
+    # Optional explicit credit-to-USD *estimate* applied to attempts with observed
+    # credits. Ignored unless both a finite positive rate and a source label are
+    # set; no conversion is ever assumed, and estimates are never shown as bills.
+    # Kept as text so an empty or malformed value is ignored instead of failing startup.
+    forge_usd_per_credit_estimate: str = ""
+    forge_usd_estimate_source: str = ""
 
 
 @lru_cache

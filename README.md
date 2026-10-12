@@ -290,14 +290,28 @@ A completion callback is bound to its attempt id. Only an attempt that is still 
 
 | Route | Purpose |
 |---|---|
-| `GET /api/tasks/{id}` | Task, ordered attempts and `accounting` (attempt credits, legacy summary, coverage) |
+| `GET /api/tasks/{id}` | Task, ordered attempts and `accounting` (attempt credits, per-category totals, status/kind counts, legacy summary, coverage, dollars) |
 | `GET /api/tasks/{id}/attempts` | Ordered attempts only |
+| `GET /api/tasks/{id}/timeline` | Every attempt's operational events, in attempt then event order |
 | `GET /api/reviews/{id}` | Review, its attempt(s) and accounting |
-| `GET /api/attempts/{id}` | One attempt |
+| `GET /api/attempts/{id}` | One attempt with its usage, dollar status and operational events |
+| `POST /api/attempts/{id}/cost-estimate` | Record an explicit estimate: `{"rate_usd_per_credit": …, "source": "…"}` |
+| `POST /api/attempts/{id}/cost-reconciliation` | Record a manually reconciled amount: `{"usd": …, "source": "…"}` |
 | `POST /api/tasks/{id}/follow-up` | New `follow_up` attempt in the task's session |
 | `POST /api/tasks/{id}/recover` | New `recovery` attempt for an interrupted or failed task (refused for completed tasks) |
 
 All of them sit behind operator access. Continuations re-check repository policy before anything starts; a turn that cannot start closes its attempt as `failed` (usage unknown) and puts the task back in its previous status.
+
+#### Usage accounting
+
+- **Turn totals vs. snapshots.** Turns stream with `include_partial_messages=True`. The SDK's `TokenUsageUpdate` values are session-cumulative, so they are stored as the attempt's `usage.snapshot` (first and latest seen in the turn) and never added up as charges. A completed turn's terminal result is that turn's contribution (`usage.source: "terminal_result"`, `completeness: "complete"`) and is recorded once; replayed callbacks or snapshots change nothing. Example: terminal credits 3267 then 50 with cumulative snapshots 3267 then 3317 aggregate to 3317.
+- **No terminal result** (timeout, crash, restart). A fresh session's latest snapshot is kept as `snapshot_fresh_session`; in a resumed session only growth seen during the turn is kept, as `snapshot_delta_lower_bound`. Both are `partial`. A snapshot that cannot be attributed is not counted, and an attempt with no observation stays `unknown` (credits `null`, not `0`).
+- **Failed and retried work** stays in every total. `accounting` reports `attempt_status_counts`, `attempt_kind_counts`, `unsuccessful_attempt_factory_credits`, per-category `usage_totals` (with how many attempts observed each category), and `attribution_limits`. Token categories are never summed into a billable total.
+- **Dollars.** Factory credits are never converted implicitly, and nothing is reported as a bill (`billed_usd` is always `null`). An attempt's `cost.status` is `unknown`, `estimated` (an explicit rate and source, via the estimate route or `FORGE_USD_PER_CREDIT_ESTIMATE` + `FORGE_USD_ESTIMATE_SOURCE`) or `reconciled` (a supplied amount and source). A reconciled value supersedes, and is never added to, an estimate. `accounting.usd` gives known-only subtotals with `coverage`; `total_usd` is set only when every attempt has a dollar value. Amounts must be finite, non-negative and bounded (rate above 0 and at most 1000 USD/credit, amounts at most 1,000,000 USD); `NaN`, `Infinity`, strings and booleans are rejected with **422**, and estimates are refused (**409**) while an attempt runs or when it observed no credits.
+
+#### Operational timeline
+
+Each attempt keeps a bounded `run_events` timeline: turn start, tool names, tool error excerpts, short assistant-text excerpts, SDK errors, permission outcomes, cumulative usage snapshots, and the terminal, start-failure or restart-interruption result. Thinking text, tool inputs, raw tool output and full transcripts are never stored. Strings are redacted and cut to 280 characters, payloads to 2,000 characters, and each attempt keeps at most 200 events (progress events stop at 190 so the final event always fits; the final event reports how many were dropped). The timeline is persisted as the turn streams, so it survives a restart.
 
 ### Restart recovery
 
@@ -411,12 +425,14 @@ applies to tasks and reviews stored earlier.
 | `JUNIOR_HOURS_PER_ISSUE` | Hours a junior would spend per fix | `4.0` |
 | `JUNIOR_HOURS_PER_REVIEW` | Hours a junior would spend per review | `1.0` |
 | `DROID_USD_PER_AGENT_RUN` | Flat USD attributed per completed run when real credit usage is unavailable | `0` |
+| `FORGE_USD_PER_CREDIT_ESTIMATE` | Optional explicit USD-per-credit *estimate* rate for attempts with observed credits; ignored unless `FORGE_USD_ESTIMATE_SOURCE` is also set and the rate is finite and positive | — |
+| `FORGE_USD_ESTIMATE_SOURCE` | Provenance label stored with configured estimates | — |
 
 Time-to-Dollar Savings divides annual cost by **1,920** working hours/year. The service boots without API keys, logs warnings, and reports `degraded` on `/api/health`.
 
 > **Schema note**: v2.0 renamed the task columns (`cursor_agent_id`→`droid_session_id`, etc.). Point `DATABASE_URL` at a fresh database; existing v1 SQLite files are not migrated (the lightweight migration system adds the new columns but old data is ignored).
 >
-> **Attempt upgrade**: on startup a v2 database gains the `run_attempts` table and nullable `attempts_tracked` columns on `tasks`/`review_tasks`. The upgrade is additive and safe to run repeatedly: existing IDs, statuses, summaries, session ids and review SHAs are untouched, and no attempts are invented for old rows. Rows created before the upgrade report `accounting_basis: "legacy_summary"`; their usage columns stay a historical summary, shown once next to any new attempts and never overwritten by them. Back up the SQLite file before upgrading a database you care about.
+> **Attempt upgrade**: on startup a v2 database gains the `run_attempts` table and nullable `attempts_tracked` columns on `tasks`/`review_tasks`. The upgrade is additive and safe to run repeatedly: existing IDs, statuses, summaries, session ids and review SHAs are untouched, and no attempts are invented for old rows. Rows created before the upgrade report `accounting_basis: "legacy_summary"`; their usage columns stay a historical summary, shown once next to any new attempts and never overwritten by them. The usage-ledger upgrade adds the `run_events` table and nullable snapshot/estimate/reconciliation columns on `run_attempts`; nothing is back-filled, so existing attempts keep `cost.status: "unknown"`. Back up the SQLite file before upgrading a database you care about.
 
 ## Dashboard
 

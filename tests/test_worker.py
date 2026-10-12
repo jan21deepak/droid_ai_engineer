@@ -86,7 +86,7 @@ class StubDroid:
         self.pushed.append(branch)
         return True
 
-    async def resume_interrupted(self, session_id, *, repository, cwd, on_complete=None):
+    async def resume_interrupted(self, session_id, *, repository, cwd, on_complete=None, observer=None):
         self.resumed.append(session_id)
         return {"session_id": session_id, "status": "running"}
 

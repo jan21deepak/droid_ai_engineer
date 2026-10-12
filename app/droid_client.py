@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any
 
 from droid_sdk import Autonomy, Runtime, Session, SessionConfig, list_models
+from droid_sdk.errors import RunTimeoutError
 
 from app.agent_env import agent_environment, close_runtime, git_environment, open_agent_runtime
 from app.candidates import WorkspaceState
@@ -43,6 +44,8 @@ from app.review_policy import (
     review_base_ref,
     review_session_config,
 )
+from app.run_events import TurnObserver
+from app.run_models import USAGE_FIELDS
 from app.workspace_config import (
     IDENTITY_VARS,
     ConfigEntry,
@@ -151,21 +154,11 @@ def extract_branch_name(text: str | None) -> str | None:
     return match.group(1) if match else None
 
 
-USAGE_CATEGORIES = (
-    "input_tokens",
-    "output_tokens",
-    "cache_read_tokens",
-    "cache_creation_tokens",
-    "thinking_tokens",
-    "factory_credits",
-)
-
-
 def _usage_categories(usage: object | None) -> dict[str, Any] | None:
     """A terminal result's usage, category by category; ``None`` when the result carried none."""
     if usage is None:
         return None
-    return {name: getattr(usage, name, None) for name in USAGE_CATEGORIES}
+    return {name: getattr(usage, name, None) for name in USAGE_FIELDS}
 
 
 def _reported_model(session: Session) -> str | None:
@@ -647,14 +640,21 @@ class DroidClient:
         *,
         kind: str,
         on_complete: Callable[[dict[str, Any]], Any] | None,
+        observer: TurnObserver | None = None,
     ) -> dict[str, Any]:
         session_id = session.id
         outcome: dict[str, Any] = {"session_id": session_id, "kind": kind, "reported_model": _reported_model(session)}
         events = 0
+        if observer is not None:
+            observer.started(kind)
         try:
-            async with session.stream(prompt, timeout=self.timeout_seconds) as stream:
-                async for _message in stream:
+            # Partial messages carry the cumulative TokenUsageUpdate snapshots a
+            # timed-out or failed turn may never report in a terminal result.
+            async with session.stream(prompt, timeout=self.timeout_seconds, include_partial_messages=True) as stream:
+                async for message in stream:
                     events += 1
+                    if observer is not None:
+                        observer.observe(message)
                     if events % 25 == 0:
                         log_event(
                             logger,
@@ -682,6 +682,13 @@ class DroidClient:
         except asyncio.CancelledError:
             outcome.update(success=False, subtype="cancelled", text="", error="run cancelled")
             raise
+        except (RunTimeoutError, TimeoutError):
+            outcome.update(
+                success=False,
+                subtype="timeout",
+                text="",
+                error=f"turn exceeded its {self.timeout_seconds:g}s timeout",
+            )
         except Exception as exc:
             outcome.update(
                 success=False,
@@ -692,6 +699,8 @@ class DroidClient:
         finally:
             with contextlib.suppress(Exception):
                 await session.close()
+            if observer is not None:
+                observer.finished(outcome)
 
         log_event(
             logger,
@@ -742,9 +751,12 @@ class DroidClient:
         *,
         kind: str,
         on_complete: Callable[[dict[str, Any]], Any] | None,
+        observer: TurnObserver | None = None,
     ) -> str:
         session_id = session.id
-        task = asyncio.create_task(self._run_turn(session, prompt, kind=kind, on_complete=on_complete))
+        task = asyncio.create_task(
+            self._run_turn(session, prompt, kind=kind, on_complete=on_complete, observer=observer)
+        )
         self.track(session_id, task)
         return session_id
 
@@ -761,6 +773,7 @@ class DroidClient:
         setup_command: str = "",
         model: str | None = None,
         on_complete: Callable[[dict[str, Any]], Any] | None = None,
+        observer: TurnObserver | None = None,
     ) -> dict[str, Any]:
         """Prepare the workspace, open a Droid session and stream the fix turn.
 
@@ -781,7 +794,7 @@ class DroidClient:
         session = await self._open_session(
             cwd=ws, model=model or self.model, config=self._fix_session_config(), purpose="session"
         )
-        session_id = self._spawn_turn(session, prompt, kind="fix", on_complete=on_complete)
+        session_id = self._spawn_turn(session, prompt, kind="fix", on_complete=on_complete, observer=observer)
         log_event(
             logger,
             logging.INFO,
@@ -807,6 +820,7 @@ class DroidClient:
         model: str | None = None,
         on_complete: Callable[[dict[str, Any]], Any] | None = None,
         on_session_opened: Callable[[str], None] | None = None,
+        observer: TurnObserver | None = None,
     ) -> dict[str, Any]:
         """Open a *fresh* restricted (Read/Grep/Glob) review session over a complete review context.
 
@@ -833,7 +847,7 @@ class DroidClient:
                 with contextlib.suppress(Exception):
                     await session.close()
                 raise
-        session_id = self._spawn_turn(session, prompt, kind="review", on_complete=on_complete)
+        session_id = self._spawn_turn(session, prompt, kind="review", on_complete=on_complete, observer=observer)
         log_event(
             logger,
             logging.INFO,
@@ -855,6 +869,7 @@ class DroidClient:
         repository: str,
         cwd: Path,
         on_complete: Callable[[dict[str, Any]], Any] | None = None,
+        observer: TurnObserver | None = None,
     ) -> dict[str, Any]:
         """Resume a saved session in its task workspace and run a follow-up turn in the background.
 
@@ -869,7 +884,7 @@ class DroidClient:
         await _prepare_continuation_workspace(repository, cwd)
         base_sha = await _git_or_none(["rev-parse", "--verify", "HEAD^{commit}"], cwd=cwd)
         session = await self._open_session(cwd=cwd, resume_id=session_id, purpose=f"session {session_id}")
-        self._spawn_turn(session, prompt, kind="follow_up", on_complete=on_complete)
+        self._spawn_turn(session, prompt, kind="follow_up", on_complete=on_complete, observer=observer)
         log_event(logger, logging.INFO, "droid.follow_up_sent", session_id=session_id)
         return {"session_id": session_id, "status": "running", "base_sha": base_sha}
 
@@ -880,6 +895,7 @@ class DroidClient:
         repository: str,
         cwd: Path,
         on_complete: Callable[[dict[str, Any]], Any] | None = None,
+        observer: TurnObserver | None = None,
     ) -> dict[str, Any]:
         """Resume an interrupted implementation session on explicit operator request.
 
@@ -894,7 +910,7 @@ class DroidClient:
         await _prepare_continuation_workspace(repository, cwd)
         base_sha = await _git_or_none(["rev-parse", "--verify", "HEAD^{commit}"], cwd=cwd)
         session = await self._open_session(cwd=cwd, resume_id=session_id, purpose=f"session {session_id}")
-        self._spawn_turn(session, RECOVERY_PROMPT_TEMPLATE, kind="recovery", on_complete=on_complete)
+        self._spawn_turn(session, RECOVERY_PROMPT_TEMPLATE, kind="recovery", on_complete=on_complete, observer=observer)
         log_event(logger, logging.INFO, "droid.session_recovered", session_id=session_id)
         return {"session_id": session_id, "status": "running", "base_sha": base_sha}
 

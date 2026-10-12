@@ -27,6 +27,7 @@ from app.database import db_session
 from app.logging_conf import log_event
 from app.models import ReviewTask, Task, TaskStatus, accounting_basis
 from app.redaction import redact_text
+from app.run_events import EventType, append_event
 from app.run_models import (
     PARENT_REVIEW,
     PARENT_TASK,
@@ -35,13 +36,22 @@ from app.run_models import (
     AttemptStatus,
     RunAttempt,
     UsageCompleteness,
-    UsageSource,
+)
+from app.usage import (
+    ATTRIBUTION_LIMITS,
+    apply_configured_estimate,
+    apply_snapshot_usage,
+    finalize_usage,
+    record_terminal_usage,
+    sum_known,
+    usage_coverage,
+    usage_totals,
+    usd_summary,
 )
 
 logger = logging.getLogger("app.attempts")
 
 ParentRow = Task | ReviewTask
-_INTEGER_FIELDS = tuple(name for name in USAGE_FIELDS if name != "factory_credits")
 
 
 class AttemptConflictError(Exception):
@@ -198,6 +208,7 @@ def fail_attempt_start(attempt_id: int, error: str) -> bool:
         attempt.error = error
         attempt.outcome_subtype = "start_failed"
         attempt.completed_at = datetime.now(UTC)
+        append_event(session, attempt.id, EventType.START_FAILED, {"error": attempt.error}, lifecycle=True)
         return True
 
 
@@ -231,30 +242,6 @@ def usage_from_outcome(outcome: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
-def _number(value: Any, *, integer: bool) -> int | float | None:
-    if isinstance(value, bool) or not isinstance(value, int | float):
-        return None
-    if value < 0 or value != value:  # negative or NaN
-        return None
-    return int(value) if integer else float(value)
-
-
-def record_terminal_usage(attempt: RunAttempt, usage: dict[str, Any] | None) -> bool:
-    """Store a turn's terminal usage once; a repeat delivery changes nothing."""
-    if attempt.usage_source == UsageSource.TERMINAL_RESULT:
-        return False
-    if usage is None:
-        return False
-    for name in USAGE_FIELDS:
-        value = _number(usage.get(name), integer=name in _INTEGER_FIELDS)
-        if value is not None:
-            setattr(attempt, name, value)
-    attempt.usage_source = UsageSource.TERMINAL_RESULT
-    attempt.usage_completeness = UsageCompleteness.COMPLETE
-    attempt.usage_recorded_at = datetime.now(UTC)
-    return True
-
-
 def finish_attempt(attempt: RunAttempt, *, status: str, outcome: dict[str, Any], summary: str | None) -> None:
     """Apply a terminal outcome to an active attempt (callers claim it first)."""
     attempt.status = status
@@ -273,18 +260,26 @@ def finish_attempt(attempt: RunAttempt, *, status: str, outcome: dict[str, Any],
         attempt.summary = redact_text(summary)[:SUMMARY_LIMIT]
     if status == AttemptStatus.FAILED:
         attempt.error = outcome.get("error") or f"Droid run ended with status: {outcome.get('subtype')}"
-    record_terminal_usage(attempt, usage_from_outcome(outcome))
+    finalize_usage(attempt, usage_from_outcome(outcome))
 
 
-def interrupt_attempt(attempt: RunAttempt, reason: str) -> None:
+def interrupt_attempt(session: Session, attempt: RunAttempt, reason: str) -> None:
     """Mark an orphaned attempt interrupted, keeping any usage it had already observed."""
     attempt.status = AttemptStatus.INTERRUPTED
     attempt.error = reason
     attempt.completed_at = datetime.now(UTC)
-    if attempt.usage_completeness == UsageCompleteness.COMPLETE:
-        return
-    observed = any(getattr(attempt, name) is not None for name in USAGE_FIELDS)
-    attempt.usage_completeness = UsageCompleteness.PARTIAL if observed else UsageCompleteness.UNKNOWN
+    if attempt.usage_completeness != UsageCompleteness.COMPLETE:
+        apply_snapshot_usage(attempt)
+        observed = any(getattr(attempt, name) is not None for name in USAGE_FIELDS)
+        attempt.usage_completeness = UsageCompleteness.PARTIAL if observed else UsageCompleteness.UNKNOWN
+        apply_configured_estimate(attempt)
+    append_event(
+        session,
+        attempt.id,
+        EventType.INTERRUPTED,
+        {"reason": attempt.error, "usage_completeness": attempt.usage_completeness},
+        lifecycle=True,
+    )
 
 
 def record_attempt_candidate(attempt_id: int, head_sha: str | None) -> None:
@@ -297,20 +292,16 @@ def record_attempt_candidate(attempt_id: int, head_sha: str | None) -> None:
             attempt.head_sha = head_sha
 
 
-def _sum(values: list[Any]) -> float | None:
-    known = [float(v) for v in values if v is not None]
-    return sum(known) if known else None
-
-
 def rollup_parent_usage(session: Session, parent_type: str, parent: ParentRow) -> None:
     """Keep a tracked parent's usage columns equal to the sum of its observed attempts.
 
-    Parents that predate attempts are left alone: their columns are history.
+    Failed, interrupted and partially observed attempts are included. Parents
+    that predate attempts are left alone: their columns are history.
     """
     if not parent.attempts_tracked:
         return
     attempts = list_attempts(session, parent_type, parent.id)
-    parent.factory_credits = _sum([a.factory_credits for a in attempts])
+    parent.factory_credits = sum_known([a.factory_credits for a in attempts])
     if isinstance(parent, Task):
         tokens = [
             a.input_tokens + a.output_tokens
@@ -320,20 +311,19 @@ def rollup_parent_usage(session: Session, parent_type: str, parent: ParentRow) -
         parent.estimated_tokens = int(sum(tokens)) if tokens else None
 
 
-def _coverage(attempts: list[RunAttempt], has_history: bool) -> str:
-    states = [a.usage_completeness or UsageCompleteness.UNKNOWN for a in attempts]
-    if has_history:
-        # A legacy summary has no per-turn breakdown (older code overwrote it per turn).
-        states.append(UsageCompleteness.PARTIAL)
-    if not states or all(s == UsageCompleteness.UNKNOWN for s in states):
-        return UsageCompleteness.UNKNOWN
-    if all(s == UsageCompleteness.COMPLETE for s in states):
-        return UsageCompleteness.COMPLETE
-    return UsageCompleteness.PARTIAL
+def _counts(values: list[str]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for value in values:
+        counts[value] = counts.get(value, 0) + 1
+    return counts
 
 
 def parent_accounting(session: Session, parent_type: str, parent: ParentRow) -> dict[str, Any]:
-    """Usage known for a parent: per-attempt observations plus any legacy summary, each counted once."""
+    """Usage known for a parent: per-attempt observations plus any legacy summary, each counted once.
+
+    Failed, interrupted and retried attempts stay in every total; credits that
+    were never observed are reported as unknown rather than zero.
+    """
     attempts = list_attempts(session, parent_type, parent.id)
     basis = accounting_basis(parent.attempts_tracked)
     history: dict[str, Any] | None = None
@@ -345,19 +335,26 @@ def parent_accounting(session: Session, parent_type: str, parent: ParentRow) -> 
             "source": "legacy_summary",
             "per_turn": UsageCompleteness.UNKNOWN,
         }
-    attempt_credits = _sum([a.factory_credits for a in attempts])
+    attempt_credits = sum_known([a.factory_credits for a in attempts])
     history_credits = history["factory_credits"] if history else None
     has_history = history is not None and history_credits is not None
+    completeness = [a.usage_completeness or UsageCompleteness.UNKNOWN for a in attempts]
+    unsuccessful = [a for a in attempts if a.status != AttemptStatus.COMPLETED]
     return {
         "accounting_basis": basis,
         "attempt_count": len(attempts),
+        "attempt_status_counts": _counts([a.status for a in attempts]),
+        "attempt_kind_counts": _counts([a.kind for a in attempts]),
         "attempt_factory_credits": attempt_credits,
-        "attempts_with_unknown_usage": sum(
-            1 for a in attempts if (a.usage_completeness or UsageCompleteness.UNKNOWN) == UsageCompleteness.UNKNOWN
-        ),
+        "unsuccessful_attempt_factory_credits": sum_known([a.factory_credits for a in unsuccessful]),
+        "attempts_with_unknown_usage": completeness.count(UsageCompleteness.UNKNOWN),
+        "attempts_with_partial_usage": completeness.count(UsageCompleteness.PARTIAL),
+        "usage_totals": usage_totals(attempts),
         "historical_summary": history,
-        "observed_factory_credits": _sum([attempt_credits, history_credits]),
-        "coverage": _coverage(attempts, has_history),
+        "observed_factory_credits": sum_known([attempt_credits, history_credits]),
+        "coverage": usage_coverage(attempts, has_history),
+        "usd": usd_summary(attempts, has_history=history is not None),
+        "attribution_limits": list(ATTRIBUTION_LIMITS),
     }
 
 

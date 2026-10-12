@@ -67,6 +67,54 @@
         "title": "AssignPullsRequest",
         "type": "object"
       },
+      "CostEstimateRequest": {
+        "properties": {
+          "rate_usd_per_credit": {
+            "description": "Explicit USD per Factory credit used for this estimate (not a verified billing rate)",
+            "exclusiveMinimum": 0.0,
+            "maximum": 1000.0,
+            "title": "Rate Usd Per Credit",
+            "type": "number"
+          },
+          "source": {
+            "description": "Where the rate came from",
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Source",
+            "type": "string"
+          }
+        },
+        "required": [
+          "rate_usd_per_credit",
+          "source"
+        ],
+        "title": "CostEstimateRequest",
+        "type": "object"
+      },
+      "CostReconciliationRequest": {
+        "properties": {
+          "source": {
+            "description": "Where the amount came from",
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Source",
+            "type": "string"
+          },
+          "usd": {
+            "description": "Manually supplied dollar amount for this attempt (e.g. from an invoice)",
+            "maximum": 1000000.0,
+            "minimum": 0.0,
+            "title": "Usd",
+            "type": "number"
+          }
+        },
+        "required": [
+          "usd",
+          "source"
+        ],
+        "title": "CostReconciliationRequest",
+        "type": "object"
+      },
       "FollowUpRequest": {
         "properties": {
           "instruction": {
@@ -204,6 +252,7 @@
     },
     "/api/attempts/{attempt_id}": {
       "get": {
+        "description": "One attempt with its usage, dollar status and bounded operational timeline.",
         "operationId": "attempt_detail_api_attempts__attempt_id__get",
         "parameters": [
           {
@@ -237,6 +286,102 @@
           }
         },
         "summary": "Attempt Detail"
+      }
+    },
+    "/api/attempts/{attempt_id}/cost-estimate": {
+      "post": {
+        "description": "Record an explicit dollar *estimate* for a finished attempt's observed credits.\n\nRefused (409) while the attempt runs or when no credits were observed; the\ncost then stays unknown. An estimate is never presented as a bill.",
+        "operationId": "estimate_attempt_cost_api_attempts__attempt_id__cost_estimate_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "attempt_id",
+            "required": true,
+            "schema": {
+              "title": "Attempt Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CostEstimateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Estimate Attempt Cost"
+      }
+    },
+    "/api/attempts/{attempt_id}/cost-reconciliation": {
+      "post": {
+        "description": "Record a manually reconciled dollar amount for a finished attempt, kept apart from any estimate.",
+        "operationId": "reconcile_attempt_cost_api_attempts__attempt_id__cost_reconciliation_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "attempt_id",
+            "required": true,
+            "schema": {
+              "title": "Attempt Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CostReconciliationRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Reconcile Attempt Cost"
       }
     },
     "/api/droid/models": {
@@ -874,6 +1019,44 @@
           }
         },
         "summary": "Recover Task"
+      }
+    },
+    "/api/tasks/{task_id}/timeline": {
+      "get": {
+        "description": "Every attempt's public events for a task, in attempt then event order.",
+        "operationId": "task_timeline_api_tasks__task_id__timeline_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "task_id",
+            "required": true,
+            "schema": {
+              "title": "Task Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Task Timeline"
       }
     },
     "/api/webhooks/sync": {

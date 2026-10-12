@@ -11,6 +11,7 @@ predate attempts are never back-filled with invented attempts.
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from typing import Any
 
@@ -59,7 +60,26 @@ class UsageCompleteness:
 
 
 class UsageSource:
+    """Where an attempt's per-turn usage contribution came from."""
+
+    # The SDK's completed-turn result: the turn's own total, counted once.
     TERMINAL_RESULT = "terminal_result"
+    # No terminal result; the latest session-cumulative snapshot of a turn that
+    # opened a fresh session (nothing earlier in that session to subtract).
+    SNAPSHOT_FRESH_SESSION = "snapshot_fresh_session"
+    # No terminal result in a resumed session: latest minus first snapshot seen
+    # during this turn. A lower bound, since usage before the first snapshot is missed.
+    SNAPSHOT_DELTA_LOWER_BOUND = "snapshot_delta_lower_bound"
+
+    SNAPSHOT = (SNAPSHOT_FRESH_SESSION, SNAPSHOT_DELTA_LOWER_BOUND)
+
+
+class CostStatus:
+    """Dollar status of an attempt. Factory credits are never converted implicitly."""
+
+    UNKNOWN = "unknown"
+    ESTIMATED = "estimated"
+    RECONCILED = "reconciled"
 
 
 USAGE_FIELDS = (
@@ -119,17 +139,70 @@ class RunAttempt(RedactedOutputMixin, Base):
     usage_source: Mapped[str | None] = mapped_column(String(32), nullable=True)
     usage_completeness: Mapped[str] = mapped_column(String(16), default=UsageCompleteness.UNKNOWN)
     usage_recorded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Session-cumulative TokenUsageUpdate snapshots seen during this turn, as JSON
+    # {"first": {...}, "latest": {...}, "count": n}. Snapshots are not turn charges.
+    usage_snapshot: Mapped[str | None] = mapped_column(Text, nullable=True)
+    usage_snapshot_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Dollars are only ever an explicit estimate (rate + source) or a manually
+    # reconciled value with its source; both stay separate and None means unknown.
+    estimated_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
+    estimate_rate_usd_per_credit: Mapped[float | None] = mapped_column(Float, nullable=True)
+    estimate_source: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    estimated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    reconciled_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
+    reconciliation_source: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    reconciled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     @property
     def active(self) -> bool:
         return self.status in AttemptStatus.ACTIVE
+
+    def snapshot_dict(self) -> dict[str, Any] | None:
+        if not self.usage_snapshot:
+            return None
+        try:
+            raw = json.loads(self.usage_snapshot)
+        except ValueError:
+            return None
+        if not isinstance(raw, dict):
+            return None
+        return {
+            "semantics": "session_cumulative",
+            "first": raw.get("first"),
+            "latest": raw.get("latest"),
+            "count": raw.get("count"),
+            "updated_at": iso_sgt(self.usage_snapshot_at),
+        }
 
     def usage_dict(self) -> dict[str, Any]:
         values: dict[str, Any] = {name: getattr(self, name) for name in USAGE_FIELDS}
         values["source"] = self.usage_source
         values["completeness"] = self.usage_completeness or UsageCompleteness.UNKNOWN
         values["recorded_at"] = iso_sgt(self.usage_recorded_at)
+        values["snapshot"] = self.snapshot_dict()
         return values
+
+    @property
+    def cost_status(self) -> str:
+        if self.reconciled_usd is not None:
+            return CostStatus.RECONCILED
+        if self.estimated_usd is not None:
+            return CostStatus.ESTIMATED
+        return CostStatus.UNKNOWN
+
+    def cost_dict(self) -> dict[str, Any]:
+        return {
+            "status": self.cost_status,
+            # Forge has no billing connector, so nothing is ever an observed bill.
+            "billed_usd": None,
+            "estimated_usd": self.estimated_usd,
+            "estimate_rate_usd_per_credit": self.estimate_rate_usd_per_credit,
+            "estimate_source": self.estimate_source,
+            "estimated_at": iso_sgt(self.estimated_at),
+            "reconciled_usd": self.reconciled_usd,
+            "reconciliation_source": self.reconciliation_source,
+            "reconciled_at": iso_sgt(self.reconciled_at),
+        }
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -154,6 +227,39 @@ class RunAttempt(RedactedOutputMixin, Base):
             "summary": redact_text(self.summary) if self.summary else self.summary,
             "error": safe_error(self.error) if self.error else self.error,
             "usage": self.usage_dict(),
+            "cost": self.cost_dict(),
+        }
+
+
+class RunEvent(Base):
+    """One bounded, scrubbed public fact in an attempt's operational timeline.
+
+    Payloads are built by ``app.run_events`` from an allowlist of public fields;
+    thinking text, tool inputs and raw tool output are never stored.
+    """
+
+    __tablename__ = "run_events"
+    __table_args__ = (UniqueConstraint("attempt_id", "sequence", name="uq_run_event_sequence"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    attempt_id: Mapped[int] = mapped_column(Integer, index=True)
+    sequence: Mapped[int] = mapped_column(Integer)
+    event_type: Mapped[str] = mapped_column(String(32))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
+    payload: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    def to_dict(self) -> dict[str, Any]:
+        try:
+            payload = json.loads(self.payload) if self.payload else {}
+        except ValueError:
+            payload = {}
+        return {
+            "id": self.id,
+            "attempt_id": self.attempt_id,
+            "sequence": self.sequence,
+            "type": self.event_type,
+            "created_at": iso_sgt(self.created_at),
+            "payload": payload,
         }
 
 
@@ -164,7 +270,9 @@ __all__ = [
     "USAGE_FIELDS",
     "AttemptKind",
     "AttemptStatus",
+    "CostStatus",
     "RunAttempt",
+    "RunEvent",
     "UsageCompleteness",
     "UsageSource",
 ]

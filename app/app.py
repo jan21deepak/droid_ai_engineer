@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, Request, Response
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -94,6 +95,18 @@ app.include_router(auth_router)
 app.include_router(intake_router)
 app.include_router(repository_router)
 app.include_router(run_router)
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_error(_request: Request, exc: RequestValidationError) -> JSONResponse:
+    """422 without echoing the rejected input.
+
+    The default handler echoes each rejected value, which cannot be serialized
+    for a non-finite number (``Infinity``/``NaN`` bodies would become a 500) and
+    could reflect a pasted credential.
+    """
+    errors = [{"type": err.get("type"), "loc": list(err.get("loc", ())), "msg": err.get("msg")} for err in exc.errors()]
+    return JSONResponse(status_code=422, content={"detail": errors})
 
 
 class AssignIssuesRequest(BaseModel):
