@@ -7,12 +7,14 @@ from pathlib import Path
 import httpx
 import pytest
 
-from app import worker
+from app import recovery, worker
+from app.attempts import mark_attempt_running, start_attempt
 from app.candidates import CandidateStatus, WorkspaceState
 from app.config import get_settings
 from app.database import db_session
 from app.models import ReviewTask, Task, TaskStatus
 from app.review_policy import REVIEW_POLICY_RESTRICTED, ReviewBinding, ReviewContext, ReviewVerdict
+from app.run_models import PARENT_REVIEW, PARENT_TASK, AttemptKind, AttemptStatus, RunAttempt
 
 HEAD = "b" * 40
 BASE = "a" * 40
@@ -106,6 +108,18 @@ def github_writes(monkeypatch):
     get_settings.cache_clear()
 
 
+def running_attempt(parent_type, parent_id, kind=AttemptKind.FIX, session_id=None):
+    """The committed, running attempt a launch would have created for an active row."""
+    attempt_id = start_attempt(parent_type, parent_id, kind).attempt_id
+    mark_attempt_running(attempt_id, session_id=session_id)
+    return attempt_id
+
+
+def attempt_row(attempt_id):
+    with db_session() as session:
+        return session.get(RunAttempt, attempt_id).to_dict()
+
+
 def add_task(**overrides):
     defaults = {
         "repository": "jan21deepak/omnigent",
@@ -144,7 +158,21 @@ def add_review(**overrides):
         review = ReviewTask(**values)
         session.add(review)
         session.flush()
-        return review.id
+        review_id = review.id
+    if values["status"] == TaskStatus.RUNNING:
+        running_attempt(PARENT_REVIEW, review_id, AttemptKind.REVIEW, session_id=values["droid_session_id"])
+    return review_id
+
+
+def review_attempt(review_id):
+    with db_session() as session:
+        return (
+            session.query(RunAttempt)
+            .filter(RunAttempt.parent_type == PARENT_REVIEW, RunAttempt.parent_id == review_id)
+            .order_by(RunAttempt.sequence.desc())
+            .first()
+            .id
+        )
 
 
 def bound(review_id):
@@ -169,6 +197,15 @@ def success_outcome(text="Fixed the bug.\nBRANCH: droid/fix-branch", duration=73
         "duration_seconds": duration,
         "credits": 2.5,
         "tokens": 12345,
+        "usage": {
+            "input_tokens": 12000,
+            "output_tokens": 345,
+            "cache_read_tokens": 900,
+            "cache_creation_tokens": 40,
+            "thinking_tokens": 7,
+            "factory_credits": 2.5,
+        },
+        "reported_model": "auto",
         "error": None,
     }
 
@@ -218,13 +255,22 @@ def no_reviews(monkeypatch):
 @pytest.mark.asyncio
 async def test_finalize_success_records_candidate_and_publishes_nothing(client, monkeypatch, github_writes, no_reviews):
     task_id = add_task()
+    attempt_id = running_attempt(PARENT_TASK, task_id, session_id="sess-abc")
     github = StubGitHub()
     droid = StubDroid()
     monkeypatch.setattr(worker, "GitHubClient", lambda: github)
     monkeypatch.setattr(worker, "get_droid_client", lambda: droid)
 
-    await worker.finalize_fix_task(task_id, success_outcome())
+    await worker.finalize_fix_task(task_id, success_outcome(), attempt_id=attempt_id)
 
+    attempt = attempt_row(attempt_id)
+    assert (attempt["status"], attempt["head_sha"], attempt["reported_model"]) == (
+        AttemptStatus.COMPLETED,
+        HEAD,
+        "auto",
+    )
+    assert attempt["usage"]["factory_credits"] == 2.5
+    assert attempt["usage"]["completeness"] == "complete"
     with db_session() as session:
         task = session.get(Task, task_id)
         assert task.status == TaskStatus.COMPLETED
@@ -250,12 +296,13 @@ async def test_finalize_success_records_candidate_and_publishes_nothing(client, 
 @pytest.mark.asyncio
 async def test_follow_up_success_on_existing_pr_does_not_push_or_review(client, monkeypatch, github_writes, no_reviews):
     task_id = add_task(pull_request_url="https://github.com/jan21deepak/omnigent/pull/7", pr_state="open")
+    attempt_id = running_attempt(PARENT_TASK, task_id, AttemptKind.FOLLOW_UP)
     github = StubGitHub()
     droid = StubDroid()
     monkeypatch.setattr(worker, "GitHubClient", lambda: github)
     monkeypatch.setattr(worker, "get_droid_client", lambda: droid)
 
-    await worker.finalize_fix_task(task_id, success_outcome())
+    await worker.finalize_fix_task(task_id, success_outcome(), attempt_id=attempt_id)
 
     assert droid.pushed == []
     assert github.created_prs == []
@@ -273,17 +320,22 @@ async def test_new_candidate_replaces_old_sha_and_classifies_state(client, monke
 
     first = StubDroid(head_sha="c" * 40)
     monkeypatch.setattr(worker, "get_droid_client", lambda: first)
-    await worker.finalize_fix_task(task_id, success_outcome())
+    first_attempt = running_attempt(PARENT_TASK, task_id)
+    await worker.finalize_fix_task(task_id, success_outcome(), attempt_id=first_attempt)
     second = StubDroid(head_sha="d" * 40, dirty=True)
     monkeypatch.setattr(worker, "get_droid_client", lambda: second)
-    await worker.finalize_fix_task(task_id, success_outcome())
+    second_attempt = running_attempt(PARENT_TASK, task_id, AttemptKind.FOLLOW_UP)
+    await worker.finalize_fix_task(task_id, success_outcome(), attempt_id=second_attempt)
     with db_session() as session:
         task = session.get(Task, task_id)
         assert (task.candidate_sha, task.candidate_status) == ("d" * 40, CandidateStatus.DIRTY)
+    # The earlier attempt keeps the candidate it produced.
+    assert (attempt_row(first_attempt)["head_sha"], attempt_row(second_attempt)["head_sha"]) == ("c" * 40, "d" * 40)
 
     unchanged = StubDroid(head_sha=BASE)
     monkeypatch.setattr(worker, "get_droid_client", lambda: unchanged)
-    await worker.finalize_fix_task(task_id, success_outcome())
+    third_attempt = running_attempt(PARENT_TASK, task_id, AttemptKind.FOLLOW_UP)
+    await worker.finalize_fix_task(task_id, success_outcome(), attempt_id=third_attempt)
     with db_session() as session:
         assert session.get(Task, task_id).candidate_status == CandidateStatus.NO_CHANGES
 
@@ -291,12 +343,19 @@ async def test_new_candidate_replaces_old_sha_and_classifies_state(client, monke
 @pytest.mark.asyncio
 async def test_finalize_fix_task_failure_marks_failed(client, monkeypatch):
     task_id = add_task()
+    attempt_id = running_attempt(PARENT_TASK, task_id)
     github = StubGitHub()
     droid = StubDroid()
     monkeypatch.setattr(worker, "GitHubClient", lambda: github)
     monkeypatch.setattr(worker, "get_droid_client", lambda: droid)
 
-    await worker.finalize_fix_task(task_id, failure_outcome())
+    await worker.finalize_fix_task(task_id, failure_outcome(), attempt_id=attempt_id)
+
+    failed = attempt_row(attempt_id)
+    assert failed["status"] == AttemptStatus.FAILED and "droid crashed" in failed["error"]
+    # No usage was reported, so it stays unknown rather than zero.
+    assert failed["usage"]["factory_credits"] is None
+    assert failed["usage"]["completeness"] == "unknown"
 
     with db_session() as session:
         task = session.get(Task, task_id)
@@ -333,6 +392,7 @@ async def test_restricted_complete_review_posts_approval_pinned_to_reviewed_sha(
         review_id,
         bound(review_id),
         review_outcome(findings=[{"severity": "nit", "title": "Rename x", "file": "x.py", "line": 3}]),
+        attempt_id=review_attempt(review_id),
     )
 
     [(repo, pr, body, event, commit_id)] = github.review_posts
@@ -365,7 +425,9 @@ async def test_approval_without_complete_restricted_context_is_not_an_approval(
     github = StubGitHub()
     monkeypatch.setattr(worker, "GitHubClient", lambda: github)
 
-    await worker.finalize_review_task(review_id, bound(review_id), review_outcome())
+    await worker.finalize_review_task(
+        review_id, bound(review_id), review_outcome(), attempt_id=review_attempt(review_id)
+    )
 
     assert [post[3] for post in github.review_posts] == ["COMMENT"]
     with db_session() as session:
@@ -378,7 +440,9 @@ async def test_approval_is_downgraded_when_pr_head_moved(client, monkeypatch, gi
     github = StubGitHub({("jan21deepak/omnigent", 9): {"state": "open", "head": {"sha": "e" * 40}}})
     monkeypatch.setattr(worker, "GitHubClient", lambda: github)
 
-    await worker.finalize_review_task(review_id, bound(review_id), review_outcome())
+    await worker.finalize_review_task(
+        review_id, bound(review_id), review_outcome(), attempt_id=review_attempt(review_id)
+    )
 
     assert [post[3] for post in github.review_posts] == ["COMMENT"]
     with db_session() as session:
@@ -409,7 +473,10 @@ async def test_finalize_review_task_falls_back_to_comment_event(client, monkeypa
     monkeypatch.setattr(worker, "GitHubClient", lambda: github)
 
     await worker.finalize_review_task(
-        review_id, bound(review_id), review_outcome("REQUEST_CHANGES", [{"severity": "major", "title": "Bug"}])
+        review_id,
+        bound(review_id),
+        review_outcome("REQUEST_CHANGES", [{"severity": "major", "title": "Bug"}]),
+        attempt_id=review_attempt(review_id),
     )
 
     assert [(post[3], post[4]) for post in github.review_posts] == [("COMMENT", HEAD)]
@@ -475,20 +542,23 @@ async def test_launch_review_starts_fresh_restricted_session_with_exact_context(
 
 
 @pytest.mark.asyncio
-async def test_recovery_resumes_fix_sessions_but_never_reviews(client, monkeypatch):
+async def test_recovery_interrupts_orphans_and_resumes_nothing(client):
     running_id = add_task(droid_session_id="sess-orphan")
+    running_attempt_id = running_attempt(PARENT_TASK, running_id, session_id="sess-orphan")
     queued_id = add_task(issue_number=3, droid_session_id=None, status=TaskStatus.QUEUED)
     orphan_review = add_review(droid_session_id="sess-old-review")
     queued_review = add_review(pr_number=6, droid_session_id=None, status=TaskStatus.QUEUED)
 
     droid = StubDroid()
-    recovered = await worker.recover_interrupted_tasks(droid)
-    assert recovered == 1
-    assert droid.resumed == ["sess-orphan"]
+    interrupted = await recovery.recover_interrupted_tasks(droid)
+    assert interrupted == 4
+    assert droid.resumed == []
     assert droid.review_runs == []
 
     with db_session() as session:
-        assert session.get(Task, running_id).status == TaskStatus.RUNNING
+        orphan = session.get(Task, running_id)
+        assert (orphan.status, orphan.droid_session_id) == (TaskStatus.INTERRUPTED, "sess-orphan")
+        assert "explicit recovery" in orphan.error
         assert session.get(Task, queued_id).status == TaskStatus.FAILED
         assert "restart" in session.get(Task, queued_id).error
         old = session.get(ReviewTask, orphan_review)
@@ -496,6 +566,8 @@ async def test_recovery_resumes_fix_sessions_but_never_reviews(client, monkeypat
         assert "never resumed" in old.error
         assert old.completed_at is not None
         assert session.get(ReviewTask, queued_review).status == TaskStatus.FAILED
+    assert attempt_row(running_attempt_id)["status"] == AttemptStatus.INTERRUPTED
+    assert attempt_row(review_attempt(orphan_review))["status"] == AttemptStatus.INTERRUPTED
 
 
 @pytest.mark.asyncio
@@ -503,7 +575,7 @@ async def test_recovery_closes_orphaned_reviews_even_without_droid(client):
     review_id = add_review(droid_session_id="sess-old-review")
     droid = StubDroid()
     droid.configured = False
-    assert await worker.recover_interrupted_tasks(droid) == 0
+    assert await recovery.recover_interrupted_tasks(droid) == 1
     assert droid.resumed == []
     with db_session() as session:
         assert session.get(ReviewTask, review_id).status == TaskStatus.FAILED
@@ -512,13 +584,15 @@ async def test_recovery_closes_orphaned_reviews_even_without_droid(client):
 @pytest.mark.asyncio
 async def test_recovery_skips_live_sessions(client):
     task_id = add_task(droid_session_id="sess-live")
+    attempt_id = running_attempt(PARENT_TASK, task_id, session_id="sess-live")
     review_id = add_review(droid_session_id="sess-live-review")
 
-    recovered = await worker.recover_interrupted_tasks(StubDroid(live={"sess-live", "sess-live-review"}))
-    assert recovered == 0
+    interrupted = await recovery.recover_interrupted_tasks(StubDroid(live={"sess-live", "sess-live-review"}))
+    assert interrupted == 0
     with db_session() as session:
         assert session.get(Task, task_id).status == TaskStatus.RUNNING
         assert session.get(ReviewTask, review_id).status == TaskStatus.RUNNING
+    assert attempt_row(attempt_id)["status"] == AttemptStatus.RUNNING
 
 
 @pytest.mark.asyncio

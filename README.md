@@ -183,7 +183,7 @@ In another terminal (with the venv activated):
 pytest -q
 ```
 
-> Sessions run where the app runs. Your machine (or the container) must stay up for the duration of an agent run; Droid sessions persist on disk, so a service restart resumes interrupted runs automatically (see "Restart recovery").
+> Sessions run where the app runs. Your machine (or the container) must stay up for the duration of an agent run; a service restart marks in-flight runs `interrupted` and never resumes them on its own (see "Restart recovery").
 
 ### 4. Verify the app is healthy
 
@@ -242,7 +242,8 @@ gh issue create --repo <owner>/<repo> \
 - **Dashboard** tab: fix + review stats, engineering KPIs, daily activity chart (times in **SGT**).
 - Original GitHub issue: ✅ completion comment with session id, PR URL, runtime, summary.
 - Droid commits on a branch and forge records it as a local candidate; nothing is pushed and no PR is opened automatically. A review session on an assigned PR posts a **PR review**; merge state is observed from GitHub but never changed.
-- Follow-ups: `POST /api/tasks/{id}/follow-up` resumes the same Droid session (blocked with 409 while a turn is streaming).
+- Follow-ups: `POST /api/tasks/{id}/follow-up` resumes the same Droid session as a new attempt (409 while the task has an active attempt or the session is streaming).
+- Attempts: `GET /api/tasks/{id}` and `GET /api/reviews/{id}` return the row, its ordered attempts and usage coverage; see "Run attempts".
 
 ---
 
@@ -281,9 +282,26 @@ Each review is a fresh SDK session (never a resumed one) built from an exact, ap
 - **Verdict.** The prompt embeds the diff and asks for a JSON findings block plus a `VERDICT: APPROVE | REQUEST_CHANGES` line. Malformed or conflicting output is `INCONCLUSIVE`. An approval counts only for a restricted review of a complete diff with a recorded head SHA, and only if GitHub still reports that head; otherwise forge posts a plain comment. Reviews are posted with `commit_id` pinned to the reviewed SHA. If GitHub rejects the verdict event (e.g. the token owner opened the PR), forge falls back to a comment. Repository and write policy are rechecked before the head lookup as well as before posting, so a review outside the current policy keeps its sanitized local verdict and makes no GitHub call. Every posted body (verdict or comment fallback) is redacted before it is cut to the length limit.
 - **No merging.** Forge has no merge or auto-merge code path. The poller only records that a PR was merged by someone else (`review.pr_merged_observed`); legacy `REVIEW_AUTO_MERGE` and `DROID_REVIEW_AUTONOMY` settings are ignored.
 
+### Run attempts
+
+Every Droid turn Forge starts is a `run_attempts` row linked to its parent task or review: `fix`, `follow_up`, `recovery` or `review`, numbered by `sequence`. The attempt is committed as `starting` before the SDK turn is spawned, and a parent can have only one active (`starting`/`running`) attempt, enforced by a partial unique index as well as the code, so a repeated start or follow-up gets **409** instead of a second turn. Each attempt records its own lifecycle timestamps, status (`completed`, `failed`, `interrupted`, `stopped`, `blocked`), session id, requested and SDK-reported model, base/head SHA, summary, error and usage categories (`input_tokens`, `output_tokens`, `cache_read_tokens`, `cache_creation_tokens`, `thinking_tokens`, `factory_credits`). Facts that were never observed are `null`, never zero.
+
+A completion callback is bound to its attempt id. Only an attempt that is still active can be finalized, so a duplicate or late callback creates no attempt, overwrites nothing and counts no usage twice. Follow-ups and recoveries append a new attempt in the same session; earlier attempts keep their outcome, head SHA and usage, and a tracked task's usage columns are the sum of its attempts. Evidence recorded for an earlier candidate SHA does not cover a newer candidate (`evidence_applies_to_candidate` in `app/candidates.py`). An attempt's agent success is not acceptance, publication, passing CI or a merge.
+
+| Route | Purpose |
+|---|---|
+| `GET /api/tasks/{id}` | Task, ordered attempts and `accounting` (attempt credits, legacy summary, coverage) |
+| `GET /api/tasks/{id}/attempts` | Ordered attempts only |
+| `GET /api/reviews/{id}` | Review, its attempt(s) and accounting |
+| `GET /api/attempts/{id}` | One attempt |
+| `POST /api/tasks/{id}/follow-up` | New `follow_up` attempt in the task's session |
+| `POST /api/tasks/{id}/recover` | New `recovery` attempt for an interrupted or failed task (refused for completed tasks) |
+
+All of them sit behind operator access. Continuations re-check repository policy before anything starts; a turn that cannot start closes its attempt as `failed` (usage unknown) and puts the task back in its previous status.
+
 ### Restart recovery
 
-Droid sessions persist on disk (`~/.factory`). On startup, forge finds RUNNING fix rows whose session is no longer streaming and resumes them in their own workspace with a continuation prompt ("continue where you left off, commit your work, do not push, report `BRANCH:`"), after re-checking repository policy. Before a recovery or follow-up session opens, the workspace's local `.git/config` is cleaned of credentials left by older versions: `origin` is reset to the canonical URL for the task's stored repository, userinfo is stripped from other remote URLs, and auth headers, credential-bearing URL rewrites and local credential helpers are removed. Branches, commits, uncommitted and untracked files are left as they are; no setup, clone, fetch or cleanup runs, and a missing workspace or missing Git identity refuses the continuation. The resumed turn finishes like any fix run: it records a local candidate and publishes nothing. Rows that never got a session (dispatch interrupted) are marked failed. Interrupted reviews are never resumed: they are marked failed and must be reassigned, which starts a fresh restricted review.
+Droid sessions persist on disk (`~/.factory`), but startup never resumes them. On startup, forge finds active fix and review rows whose session is no longer streaming and marks each orphaned attempt `interrupted`, keeping any usage it had observed (`partial`, or `unknown` when nothing was observed). A fix row with a saved session becomes `interrupted` and waits for an operator to call `POST /api/tasks/{id}/recover`, which re-checks policy and appends a `recovery` attempt with a continuation prompt ("continue where you left off, commit your work, do not push, report `BRANCH:`"); the interrupted attempt keeps its status and usage. Stopped, blocked and finished attempts are left exactly as they are. Before a recovery or follow-up session opens, the workspace's local `.git/config` is cleaned of credentials left by older versions: `origin` is reset to the canonical URL for the task's stored repository, userinfo is stripped from other remote URLs, and auth headers, credential-bearing URL rewrites and local credential helpers are removed. Branches, commits, uncommitted and untracked files are left as they are; no setup, clone, fetch or cleanup runs, and a missing workspace or missing Git identity refuses the continuation. The resumed turn finishes like any fix run: it records a local candidate and publishes nothing. Rows that never got a session (dispatch interrupted) are marked failed. Interrupted reviews are never resumed: they are marked failed and must be reassigned, which starts a fresh restricted review.
 
 ## Operator access
 
@@ -397,6 +415,8 @@ applies to tasks and reviews stored earlier.
 Time-to-Dollar Savings divides annual cost by **1,920** working hours/year. The service boots without API keys, logs warnings, and reports `degraded` on `/api/health`.
 
 > **Schema note**: v2.0 renamed the task columns (`cursor_agent_id`→`droid_session_id`, etc.). Point `DATABASE_URL` at a fresh database; existing v1 SQLite files are not migrated (the lightweight migration system adds the new columns but old data is ignored).
+>
+> **Attempt upgrade**: on startup a v2 database gains the `run_attempts` table and nullable `attempts_tracked` columns on `tasks`/`review_tasks`. The upgrade is additive and safe to run repeatedly: existing IDs, statuses, summaries, session ids and review SHAs are untouched, and no attempts are invented for old rows. Rows created before the upgrade report `accounting_basis: "legacy_summary"`; their usage columns stay a historical summary, shown once next to any new attempts and never overwritten by them. Back up the SQLite file before upgrading a database you care about.
 
 ## Dashboard
 
@@ -456,8 +476,8 @@ Operational docs:
 | Session | `Session(cwd=<workspace>, model=…, config=SessionConfig(autonomy=HIGH))` per task |
 | Turn | `session.stream(prompt)` streamed in a background asyncio task |
 | Result | `RunResult.success/text/duration/usage.factory_credits` → task summary, runtime, cost |
-| Follow-up | `Session.resume(session_id)` + stream (`POST /api/tasks/{id}/follow-up`) |
-| Restart recovery | `Session.resume` + a continuation prompt for orphaned RUNNING rows |
+| Follow-up | `Session.resume(session_id)` + stream as a new attempt (`POST /api/tasks/{id}/follow-up`) |
+| Recovery | `Session.resume` + a continuation prompt, only on explicit request (`POST /api/tasks/{id}/recover`) |
 | PR review | Read-only review session on the PR head branch → GitHub PR review |
 | Model catalog | `list_models()` → `/api/droid/models` dropdown |
 | Trigger label | `Droid-complete` |

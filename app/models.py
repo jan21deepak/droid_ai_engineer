@@ -32,9 +32,20 @@ class TaskStatus:
     RUNNING = "running"
     COMPLETED = "completed"
     FAILED = "failed"
+    # Work orphaned by a service restart; it waits for an explicit operator continuation.
+    INTERRUPTED = "interrupted"
 
     ACTIVE = (QUEUED, RUNNING)
-    ALL = (QUEUED, RUNNING, COMPLETED, FAILED)
+    ALL = (QUEUED, RUNNING, COMPLETED, FAILED, INTERRUPTED)
+
+
+ACCOUNTING_ATTEMPTS = "attempts"
+ACCOUNTING_LEGACY_SUMMARY = "legacy_summary"
+
+
+def accounting_basis(attempts_tracked: bool | None) -> str:
+    """Rows created before per-turn attempts keep their usage columns as a historical summary."""
+    return ACCOUNTING_ATTEMPTS if attempts_tracked else ACCOUNTING_LEGACY_SUMMARY
 
 
 class Repository(Base):
@@ -135,6 +146,10 @@ class Task(RedactedOutputMixin, Base):
     candidate_branch: Mapped[str | None] = mapped_column(String(255), nullable=True)
     candidate_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
     candidate_recorded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # True for rows whose usage columns are a roll-up of their RunAttempt rows. The
+    # additive migration leaves it NULL on older rows, whose usage columns are then a
+    # historical summary that new attempts never overwrite or re-count.
+    attempts_tracked: Mapped[bool | None] = mapped_column(Boolean, nullable=True, default=True)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -167,6 +182,7 @@ class Task(RedactedOutputMixin, Base):
                 "status": self.candidate_status,
                 "recorded_at": iso_sgt(self.candidate_recorded_at),
             },
+            "accounting_basis": accounting_basis(self.attempts_tracked),
             "kind": "fix",
         }
 
@@ -256,6 +272,8 @@ class ReviewTask(RedactedOutputMixin, Base):
     review_policy: Mapped[str | None] = mapped_column(String(64), nullable=True)
     verdict: Mapped[str | None] = mapped_column(String(32), nullable=True)
     findings: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # See Task.attempts_tracked.
+    attempts_tracked: Mapped[bool | None] = mapped_column(Boolean, nullable=True, default=True)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -285,6 +303,7 @@ class ReviewTask(RedactedOutputMixin, Base):
             "review_policy": self.review_policy,
             "verdict": self.verdict,
             "findings": _load_findings(self.findings),
+            "accounting_basis": accounting_basis(self.attempts_tracked),
             "kind": "review",
         }
 

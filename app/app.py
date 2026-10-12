@@ -5,7 +5,6 @@ import json
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -21,11 +20,7 @@ from app.auth import AccessControlMiddleware, operator_context, operator_credent
 from app.auth_routes import router as auth_router
 from app.config import ACCESS_MODE_PROTECTED, effective_access_mode, get_settings
 from app.database import check_db_connectivity, db_session, init_db
-from app.droid_client import (
-    DroidSessionBusyError,
-    get_droid_client,
-    task_workspace_dir,
-)
+from app.droid_client import get_droid_client
 from app.error_tracking import init_error_tracking
 from app.github import GitHubClient
 from app.intake import router as intake_router
@@ -33,12 +28,14 @@ from app.logging_conf import log_event, setup_logging
 from app.metrics import compute_metrics, recent_activity
 from app.models import Repository, ReviewTask, SyncedIssue, SyncedPullRequest, Task, TaskStatus
 from app.policy import OutwardAction, outward_decision, repository_decision
+from app.recovery import recover_interrupted_tasks
 from app.redaction import safe_error
 from app.repository_routes import ensure_repo_automation, sync_repository_pulls
 from app.repository_routes import router as repository_router
+from app.run_routes import router as run_router
 from app.tasks import TaskCreateError, create_and_dispatch_task
 from app.tracing import RequestIDMiddleware
-from app.worker import recover_interrupted_tasks, start_pr_review, worker_loop
+from app.worker import start_pr_review, worker_loop
 
 logger = logging.getLogger("app.api")
 
@@ -96,6 +93,7 @@ app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="stat
 app.include_router(auth_router)
 app.include_router(intake_router)
 app.include_router(repository_router)
+app.include_router(run_router)
 
 
 class AssignIssuesRequest(BaseModel):
@@ -104,14 +102,6 @@ class AssignIssuesRequest(BaseModel):
 
 class AssignPullsRequest(BaseModel):
     pull_ids: list[int] = Field(..., min_length=1)
-
-
-class FollowUpRequest(BaseModel):
-    instruction: str = Field(
-        ...,
-        min_length=1,
-        description="Follow-up prompt for the existing Droid session",
-    )
 
 
 @app.get("/")
@@ -466,76 +456,6 @@ async def assign_pulls_to_droid(payload: AssignPullsRequest) -> JSONResponse | d
 async def list_tasks(page: int = 1, page_size: int = 10) -> dict[str, Any]:
     with db_session() as session:
         return recent_activity(session, page=page, page_size=page_size)
-
-
-@app.post("/api/tasks/{task_id}/follow-up", response_model=None)
-async def follow_up_task(task_id: int, payload: FollowUpRequest) -> JSONResponse | dict[str, Any]:
-    """Send a follow-up prompt to the task's Droid session (SDK resume + send).
-
-    Live-extend hook for interview demos — e.g. \"fix failing CI\" or
-    \"add a regression test\".
-    """
-    from app.worker import finalize_fix_task
-
-    with db_session() as session:
-        task = session.get(Task, task_id)
-        if not task:
-            return JSONResponse(status_code=404, content={"detail": "task not found"})
-        session_id = task.droid_session_id
-        repository = task.repository
-
-    access = repository_decision(repository)
-    if not access.allowed:
-        return JSONResponse(
-            status_code=403,
-            content={"detail": "repository is not approved by policy", "reason": access.reason},
-        )
-
-    droid = get_droid_client()
-    if not droid.configured:
-        return JSONResponse(
-            status_code=503,
-            content={"detail": "Droid is not configured (FACTORY_API_KEY missing)"},
-        )
-    if not session_id:
-        return JSONResponse(
-            status_code=409,
-            content={"detail": "task has no Droid session to follow up on"},
-        )
-
-    try:
-        result = await droid.send_follow_up(
-            session_id,
-            payload.instruction,
-            repository=repository,
-            cwd=task_workspace_dir(repository, task_id),
-            on_complete=partial(finalize_fix_task, task_id),
-        )
-    except DroidSessionBusyError:
-        return JSONResponse(
-            status_code=409,
-            content={"detail": "the Droid session is still running a turn; retry when it finishes"},
-        )
-    except Exception as exc:
-        return JSONResponse(
-            status_code=502,
-            content={"detail": f"follow-up failed: {safe_error(exc)}"},
-        )
-
-    with db_session() as session:
-        db_task = session.get(Task, task_id)
-        if db_task is not None:
-            db_task.status = TaskStatus.RUNNING
-            db_task.error = None
-
-    log_event(
-        logger,
-        logging.INFO,
-        "task.follow_up",
-        task_id=task_id,
-        session_id=session_id,
-    )
-    return {"detail": "accepted", "task_id": task_id, **result}
 
 
 @app.get("/dashboard", response_class=HTMLResponse)

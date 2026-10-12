@@ -202,6 +202,43 @@
         "summary": "Root"
       }
     },
+    "/api/attempts/{attempt_id}": {
+      "get": {
+        "operationId": "attempt_detail_api_attempts__attempt_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "attempt_id",
+            "required": true,
+            "schema": {
+              "title": "Attempt Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Attempt Detail"
+      }
+    },
     "/api/droid/models": {
       "get": {
         "description": "Model catalog for the dashboard dropdown (Factory Router = \"auto\").",
@@ -567,6 +604,44 @@
         "summary": "Sync Repository Issues"
       }
     },
+    "/api/reviews/{review_id}": {
+      "get": {
+        "description": "One restricted review with its attempt(s) and usage coverage.",
+        "operationId": "review_detail_api_reviews__review_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "review_id",
+            "required": true,
+            "schema": {
+              "title": "Review Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Review Detail"
+      }
+    },
     "/api/session": {
       "get": {
         "description": "Describe the caller's access mode and session expiry (never returns credentials).",
@@ -640,9 +715,84 @@
         "summary": "List Tasks"
       }
     },
+    "/api/tasks/{task_id}": {
+      "get": {
+        "description": "One implementation task with its ordered attempts and usage coverage.",
+        "operationId": "task_detail_api_tasks__task_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "task_id",
+            "required": true,
+            "schema": {
+              "title": "Task Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Task Detail"
+      }
+    },
+    "/api/tasks/{task_id}/attempts": {
+      "get": {
+        "operationId": "task_attempts_api_tasks__task_id__attempts_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "task_id",
+            "required": true,
+            "schema": {
+              "title": "Task Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Task Attempts"
+      }
+    },
     "/api/tasks/{task_id}/follow-up": {
       "post": {
-        "description": "Send a follow-up prompt to the task's Droid session (SDK resume + send).\n\nLive-extend hook for interview demos \u2014 e.g. \"fix failing CI\" or\n\"add a regression test\".",
+        "description": "Send a follow-up prompt to the task's Droid session as a new attempt.\n\nRefused while the task has an active attempt; earlier attempts keep their\noutcome and usage.",
         "operationId": "follow_up_task_api_tasks__task_id__follow_up_post",
         "parameters": [
           {
@@ -686,6 +836,44 @@
           }
         },
         "summary": "Follow Up Task"
+      }
+    },
+    "/api/tasks/{task_id}/recover": {
+      "post": {
+        "description": "Explicitly resume an interrupted or failed task session as a new recovery attempt.\n\nStartup never does this on its own. The interrupted/failed attempt keeps\nits status and usage; the recovery is appended after it.",
+        "operationId": "recover_task_api_tasks__task_id__recover_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "task_id",
+            "required": true,
+            "schema": {
+              "title": "Task Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Recover Task"
       }
     },
     "/api/webhooks/sync": {

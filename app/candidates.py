@@ -78,6 +78,15 @@ def record_candidate(task_id: int, state: WorkspaceState) -> str | None:
     return status
 
 
+def evidence_applies_to_candidate(task: Task, evidence_sha: str | None) -> bool:
+    """Whether checks, a review or an approval bound to ``evidence_sha`` cover the task's current candidate.
+
+    Evidence for an earlier candidate stays recorded (on its attempt) but never
+    authorizes a newer one, and nothing authorizes a candidate that is not ready.
+    """
+    return bool(evidence_sha and evidence_sha == task.candidate_sha and task.candidate_status == CandidateStatus.READY)
+
+
 def format_runtime(seconds: float | None) -> str:
     if seconds is None:
         return "unknown"
@@ -110,6 +119,7 @@ __all__ = [
     "WorkspaceState",
     "build_candidate_comment",
     "classify_candidate",
+    "evidence_applies_to_candidate",
     "format_runtime",
     "record_candidate",
 ]

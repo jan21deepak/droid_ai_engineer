@@ -24,15 +24,21 @@ operator-only `GET /api/health` (bearer or signed-in session), which reports
    never installs or edits webhooks itself (`POST /api/webhooks/sync` is refused
    by policy).
 
-### Tasks stuck in RUNNING after a restart
+### Tasks INTERRUPTED after a restart
 
-Sessions persist on disk (`~/.factory`); startup recovery resumes orphaned fix rows
-automatically (reviews are never resumed). If rows stay RUNNING for more than `DROID_TURN_TIMEOUT_SECONDS`
-(default 3600):
+Startup never resumes a Droid session. A fix row that was running with a saved
+session becomes `interrupted` (log event `recovery.task_interrupted`); one that never
+got a session fails with "dispatch interrupted". Orphaned reviews fail and are never
+resumed. Each orphaned attempt keeps the usage it had observed.
 
-1. Check the logs for `recovery.dispatch_lost` / `recovery.session_lost`.
+1. Inspect the task: `GET /api/tasks/{id}` shows its attempts and usage coverage.
 2. Verify the droid CLI is authenticated on the host: `droid --version`.
-3. Restart the service to re-trigger recovery.
+3. To continue the session, call `POST /api/tasks/{id}/recover`. It re-checks policy
+   and appends a new `recovery` attempt; the interrupted attempt stays as it was.
+   For a review, reassign the PR to start a fresh restricted review.
+
+A follow-up or recovery that returns **409** means the task already has an active
+attempt or its session is still streaming; wait for it to finish.
 
 ### Completed fixes have no PR
 

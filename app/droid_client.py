@@ -101,8 +101,8 @@ Requirements:
 - End your final response with a line of the exact form `BRANCH: <your-branch-name>` and summarize what you changed.
 """
 
-RECOVERY_PROMPT_TEMPLATE = """The automation service restarted while you were working, so this session is
-being resumed. Continue the task from where you left off.
+RECOVERY_PROMPT_TEMPLATE = """Your previous turn in this session was interrupted, and the operator asked
+for it to be resumed. Continue the task from where you left off.
 
 - If the work is already complete, restate your final summary.
 - Make sure all of your work is committed on your local branch. Do NOT push or open a pull request.
@@ -149,6 +149,32 @@ def extract_branch_name(text: str | None) -> str | None:
         return None
     match = _BRANCH_RE.search(text)
     return match.group(1) if match else None
+
+
+USAGE_CATEGORIES = (
+    "input_tokens",
+    "output_tokens",
+    "cache_read_tokens",
+    "cache_creation_tokens",
+    "thinking_tokens",
+    "factory_credits",
+)
+
+
+def _usage_categories(usage: object | None) -> dict[str, Any] | None:
+    """A terminal result's usage, category by category; ``None`` when the result carried none."""
+    if usage is None:
+        return None
+    return {name: getattr(usage, name, None) for name in USAGE_CATEGORIES}
+
+
+def _reported_model(session: Session) -> str | None:
+    """The model the opened session reports for itself (may be a router alias such as ``auto``)."""
+    try:
+        model = session.settings.model
+    except Exception:
+        return None
+    return model if isinstance(model, str) and model else None
 
 
 def map_outcome_status(outcome: dict[str, Any]) -> str:
@@ -623,7 +649,7 @@ class DroidClient:
         on_complete: Callable[[dict[str, Any]], Any] | None,
     ) -> dict[str, Any]:
         session_id = session.id
-        outcome: dict[str, Any] = {"session_id": session_id, "kind": kind}
+        outcome: dict[str, Any] = {"session_id": session_id, "kind": kind, "reported_model": _reported_model(session)}
         events = 0
         try:
             async with session.stream(prompt, timeout=self.timeout_seconds) as stream:
@@ -650,6 +676,7 @@ class DroidClient:
                 duration_seconds=duration.total_seconds() if duration else None,
                 credits=getattr(usage, "factory_credits", None) if usage else None,
                 tokens=tokens or None,
+                usage=_usage_categories(usage),
                 error=None,
             )
         except asyncio.CancelledError:
@@ -840,10 +867,11 @@ class DroidClient:
             raise DroidSessionBusyError("session already has a turn in flight")
         prompt = build_follow_up_prompt(instruction)
         await _prepare_continuation_workspace(repository, cwd)
+        base_sha = await _git_or_none(["rev-parse", "--verify", "HEAD^{commit}"], cwd=cwd)
         session = await self._open_session(cwd=cwd, resume_id=session_id, purpose=f"session {session_id}")
         self._spawn_turn(session, prompt, kind="follow_up", on_complete=on_complete)
         log_event(logger, logging.INFO, "droid.follow_up_sent", session_id=session_id)
-        return {"session_id": session_id, "status": "running"}
+        return {"session_id": session_id, "status": "running", "base_sha": base_sha}
 
     async def resume_interrupted(
         self,
@@ -853,20 +881,22 @@ class DroidClient:
         cwd: Path,
         on_complete: Callable[[dict[str, Any]], Any] | None = None,
     ) -> dict[str, Any]:
-        """Resume an implementation session orphaned by a service restart and nudge it forward.
+        """Resume an interrupted implementation session on explicit operator request.
 
         Only for fix/follow-up sessions; review sessions are never resumed. As
         with follow-ups, the workspace is cleaned of legacy credentials first.
+        Startup never calls this: restart recovery only marks work interrupted.
         """
         if not self.configured:
             raise DroidRunError("Droid is not configured (FACTORY_API_KEY missing)")
         if self.session_busy(session_id):
-            return {"session_id": session_id, "status": "running"}
+            raise DroidSessionBusyError("session already has a turn in flight")
         await _prepare_continuation_workspace(repository, cwd)
+        base_sha = await _git_or_none(["rev-parse", "--verify", "HEAD^{commit}"], cwd=cwd)
         session = await self._open_session(cwd=cwd, resume_id=session_id, purpose=f"session {session_id}")
         self._spawn_turn(session, RECOVERY_PROMPT_TEMPLATE, kind="recovery", on_complete=on_complete)
         log_event(logger, logging.INFO, "droid.session_recovered", session_id=session_id)
-        return {"session_id": session_id, "status": "running"}
+        return {"session_id": session_id, "status": "running", "base_sha": base_sha}
 
 
 _client: DroidClient | None = None

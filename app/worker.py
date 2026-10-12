@@ -11,6 +11,10 @@ A successful implementation, follow-up or recovery turn records a local
 publication or grants approval. Reviews are fresh restricted (Read/Grep/Glob)
 sessions over an exact base..head diff and are never resumed. Nothing merges.
 
+Every turn is a ``RunAttempt`` (``app.attempts``) committed before the SDK
+turn is spawned; completion callbacks are bound to their attempt. Restart
+recovery and explicit continuations live in ``app.recovery``.
+
 Every launch, finalization, review and recovery step re-checks repository and
 outward-action policy (``app.policy``) before any Git or GitHub call, so stored
 work cannot bypass the current configuration.
@@ -19,24 +23,33 @@ work cannot bypass the current configuration.
 import asyncio
 import json
 import logging
-from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import partial
 from typing import Any
 
 import httpx
+from sqlalchemy.orm import Session
 
+from app.attempts import (
+    AttemptConflictError,
+    claim_active_attempt,
+    fail_attempt_start,
+    finish_attempt,
+    mark_attempt_running,
+    record_attempt_candidate,
+    rollup_parent_usage,
+    set_attempt_running,
+    start_attempt,
+)
 from app.candidates import build_candidate_comment, record_candidate
 from app.config import get_settings
 from app.database import db_session
 from app.droid_client import (
-    DroidClient,
     DroidRunError,
     extract_branch_name,
     get_droid_client,
     map_outcome_status,
-    task_workspace_dir,
 )
 from app.github import GitHubClient
 from app.logging_conf import log_event
@@ -60,6 +73,7 @@ from app.review_policy import (
     parse_review_output,
     review_base_ref,
 )
+from app.run_models import PARENT_REVIEW, PARENT_TASK, AttemptKind, RunAttempt
 
 __all__ = [
     "finalize_merged_running_tasks",
@@ -74,13 +88,9 @@ logger = logging.getLogger("app.worker")
 REVIEW_BODY_LIMIT = 60_000
 # Pseudo-action for read/work access to a repository (no GitHub write).
 REPOSITORY_ACCESS = "repository_access"
-REVIEW_INTERRUPTED_ERROR = (
-    "review interrupted by service restart; review sessions are never resumed "
-    "(reassign the pull request to start a fresh restricted review)"
-)
 
 
-def _policy_denied(action: str, repository: str, *, ref: str | None = None, **ctx: Any) -> PolicyDecision | None:
+def policy_denied(action: str, repository: str, *, ref: str | None = None, **ctx: Any) -> PolicyDecision | None:
     """Check an outward action (or plain repository access) and log a denial."""
     if action == REPOSITORY_ACCESS:
         decision = repository_decision(repository)
@@ -116,7 +126,7 @@ async def launch_fix_task(
     issue_body: str,
 ) -> None:
     """Background launcher: prepare the workspace and start the Droid fix session."""
-    denied = _policy_denied(REPOSITORY_ACCESS, repository, task_id=task_id)
+    denied = policy_denied(REPOSITORY_ACCESS, repository, task_id=task_id)
     if denied is not None:
         with db_session() as session:
             db_task = session.get(Task, task_id)
@@ -126,6 +136,9 @@ async def launch_fix_task(
         return
     droid = get_droid_client()
     launch = resolve_agent_launch_config(repository=repository, repository_url=repository_url)
+    attempt_id = _start_fix_attempt(task_id, launch.get("model") or getattr(droid, "model", None))
+    if attempt_id is None:
+        return
     try:
         result = await droid.start_fix_run(
             repository=repository,
@@ -137,14 +150,16 @@ async def launch_fix_task(
             starting_ref=launch.get("starting_ref"),
             setup_command=launch.get("setup_command") or "",
             model=launch.get("model"),
-            on_complete=partial(finalize_fix_task, task_id),
+            on_complete=partial(finalize_fix_task, task_id, attempt_id=attempt_id),
         )
     except Exception as exc:
+        error = f"Droid session failed to start: {safe_error(exc)}"
+        fail_attempt_start(attempt_id, error)
         with db_session() as session:
             db_task = session.get(Task, task_id)
             if db_task is not None:
                 db_task.status = TaskStatus.FAILED
-                db_task.error = f"Droid session failed to start: {safe_error(exc)}"
+                db_task.error = error
         log_event(
             logger,
             logging.ERROR,
@@ -156,12 +171,15 @@ async def launch_fix_task(
         )
         return
 
+    # Conditional: a turn that already finished must not be turned back into "running".
+    still_active = mark_attempt_running(attempt_id, session_id=result["session_id"], base_sha=result.get("base_sha"))
     with db_session() as session:
         db_task = session.get(Task, task_id)
         if db_task is not None:
             db_task.droid_session_id = result["session_id"]
-            db_task.status = TaskStatus.RUNNING
-            db_task.error = None
+            if still_active and db_task.status in TaskStatus.ACTIVE:
+                db_task.status = TaskStatus.RUNNING
+                db_task.error = None
             if result.get("base_sha") and not db_task.base_sha:
                 db_task.base_sha = result["base_sha"]
     log_event(
@@ -169,12 +187,34 @@ async def launch_fix_task(
         logging.INFO,
         "droid.agent_linked",
         task_id=task_id,
+        attempt_id=attempt_id,
         session_id=result["session_id"],
         repository=repository,
         issue=issue_number,
         model=launch.get("model") or get_settings().droid_model,
         setup=result.get("setup"),
     )
+
+
+def _start_fix_attempt(task_id: int, requested_model: str | None) -> int | None:
+    """Commit the implementation attempt for a queued task; ``None`` if it must not start."""
+    with db_session() as session:
+        task = session.get(Task, task_id)
+        queued = task is not None and task.status == TaskStatus.QUEUED
+    if not queued:
+        log_event(logger, logging.WARNING, "attempt.start_rejected", task_id=task_id, reason="task is not queued")
+        return None
+    try:
+        return start_attempt(
+            PARENT_TASK,
+            task_id,
+            AttemptKind.FIX,
+            requested_model=requested_model or get_settings().droid_model,
+            parent_status=TaskStatus.RUNNING,
+        ).attempt_id
+    except (AttemptConflictError, LookupError) as exc:
+        log_event(logger, logging.WARNING, "attempt.start_rejected", task_id=task_id, reason=str(exc))
+        return None
 
 
 def spawn_fix_launch(task_id: int, **launch_kwargs: Any) -> asyncio.Task[None]:
@@ -185,21 +225,29 @@ def spawn_fix_launch(task_id: int, **launch_kwargs: Any) -> asyncio.Task[None]:
     return task
 
 
-def _apply_outcome_to_task(task: Task | ReviewTask, outcome: dict[str, Any], status: str, summary: str | None) -> None:
-    """Persist turn outcome fields (status, summary, runtime, tokens, cost) onto a task row."""
+def _apply_outcome_to_task(
+    session: Session,
+    task: Task | ReviewTask,
+    attempt: RunAttempt,
+    outcome: dict[str, Any],
+    status: str,
+    summary: str | None,
+) -> None:
+    """Finish ``attempt`` and project its outcome onto the parent row.
+
+    Usage lives on the attempt; a tracked parent's usage columns are the sum of
+    its attempts, and a pre-attempt parent's usage columns are left as history.
+    """
     settings = get_settings()
+    finish_attempt(attempt, status=status, outcome=outcome, summary=summary)
     task.status = status
     if summary:
         task.summary = summary
     if outcome.get("duration_seconds") is not None:
         task.duration_seconds = outcome["duration_seconds"]
-    if outcome.get("credits") is not None:
-        task.factory_credits = outcome["credits"]
-    if outcome.get("tokens") is not None and isinstance(task, Task):
-        # Only fix tasks track estimated_tokens; ReviewTask has no such column.
-        task.estimated_tokens = outcome["tokens"]
+    rollup_parent_usage(session, attempt.parent_type, task)
     cost = settings.droid_usd_per_agent_run or None
-    if status == TaskStatus.COMPLETED and cost is not None:
+    if status == TaskStatus.COMPLETED and cost is not None and task.attempts_tracked:
         task.cost_usd = cost
     if status == TaskStatus.FAILED:
         task.error = outcome.get("error") or (f"Droid run ended with status: {outcome.get('subtype')}")
@@ -207,8 +255,11 @@ def _apply_outcome_to_task(task: Task | ReviewTask, outcome: dict[str, Any], sta
         task.completed_at = datetime.now(UTC)
 
 
-async def finalize_fix_task(task_id: int, outcome: dict[str, Any]) -> None:
+async def finalize_fix_task(task_id: int, outcome: dict[str, Any], *, attempt_id: int) -> None:
     """Turn-completion handler for issue-fix / follow-up / recovery runs.
+
+    Only the still-active attempt ``attempt_id`` is finalized; a duplicate or
+    stale callback changes nothing, counts no usage and makes no call.
 
     Success records the local candidate the agent left in the workspace. It
     does not push, open a pull request or start publication: those are
@@ -224,8 +275,19 @@ async def finalize_fix_task(task_id: int, outcome: dict[str, Any]) -> None:
         if task is None:
             log_event(logger, logging.WARNING, "droid.task_missing", task_id=task_id)
             return
+        attempt = claim_active_attempt(session, attempt_id, PARENT_TASK, task_id)
+        if attempt is None:
+            log_event(
+                logger,
+                logging.WARNING,
+                "attempt.callback_rejected",
+                task_id=task_id,
+                attempt_id=attempt_id,
+                reason="attempt is not active for this task",
+            )
+            return
         old_status = task.status
-        _apply_outcome_to_task(task, outcome, status, summary)
+        _apply_outcome_to_task(session, task, attempt, outcome, status, summary)
         repository = task.repository
         session_id = task.droid_session_id
 
@@ -234,6 +296,7 @@ async def finalize_fix_task(task_id: int, outcome: dict[str, Any]) -> None:
         logging.INFO,
         "task.status_changed",
         task_id=task_id,
+        attempt_id=attempt_id,
         session_id=session_id,
         old=old_status,
         new=status,
@@ -243,7 +306,7 @@ async def finalize_fix_task(task_id: int, outcome: dict[str, Any]) -> None:
         log_event(logger, logging.WARNING, "task.failed", task_id=task_id, session_id=session_id)
         return
 
-    if _policy_denied(REPOSITORY_ACCESS, repository, task_id=task_id):
+    if policy_denied(REPOSITORY_ACCESS, repository, task_id=task_id):
         return
     try:
         state = await droid.inspect_workspace(repository, task_id, extract_branch_name(summary))
@@ -251,6 +314,7 @@ async def finalize_fix_task(task_id: int, outcome: dict[str, Any]) -> None:
         log_event(logger, logging.WARNING, "task.candidate_inspect_failed", task_id=task_id, error=str(exc))
         return
     candidate_status = record_candidate(task_id, state)
+    record_attempt_candidate(attempt_id, state.head_sha)
     log_event(
         logger,
         logging.INFO,
@@ -263,7 +327,7 @@ async def finalize_fix_task(task_id: int, outcome: dict[str, Any]) -> None:
 
     with db_session() as session:
         refreshed = session.get(Task, task_id)
-    if refreshed is not None and not _policy_denied(OutwardAction.ISSUE_COMMENT, repository, task_id=task_id):
+    if refreshed is not None and not policy_denied(OutwardAction.ISSUE_COMMENT, repository, task_id=task_id):
         await github.post_issue_comment(repository, refreshed.issue_number, build_candidate_comment(refreshed))
 
 
@@ -334,7 +398,7 @@ async def start_pr_review(
     review session (or one being prepared), so reassignment is refused rather
     than replacing that row's context; a terminal row gets a fresh row.
     """
-    if _policy_denied(REPOSITORY_ACCESS, repository, pr=pr_number):
+    if policy_denied(REPOSITORY_ACCESS, repository, pr=pr_number):
         return {"review_id": None, "started": False, "detail": "repository_not_allowed"}
     review_id, created = ensure_review_task_row(
         repository=repository,
@@ -413,17 +477,24 @@ def _bound_to(review: ReviewTask, binding: ReviewBinding) -> bool:
     )
 
 
-def _bind_review_session(review_id: int, binding: ReviewBinding, session_id: str) -> None:
-    """Record the session reviewing ``binding`` on its row, unless the row moved on."""
+def _bind_review_session(review_id: int, binding: ReviewBinding, session_id: str, *, attempt_id: int) -> None:
+    """Record the session reviewing ``binding`` on its row and attempt, unless the row moved on."""
     with db_session() as session:
         review = session.get(ReviewTask, review_id)
         if review is None or review.status not in TaskStatus.ACTIVE:
             return
-        if review.droid_session_id not in (None, session_id) or not _bound_to(review, binding):
+        attempt = claim_active_attempt(session, attempt_id, PARENT_REVIEW, review_id)
+        if (
+            attempt is None
+            or review.droid_session_id not in (None, session_id)
+            or attempt.session_id not in (None, session_id)
+            or not _bound_to(review, binding)
+        ):
             log_event(
                 logger, logging.WARNING, "review.session_bind_rejected", review_id=review_id, session_id=session_id
             )
             return
+        set_attempt_running(attempt, session_id=session_id)
         review.droid_session_id = session_id
         review.status = TaskStatus.RUNNING
         review.error = None
@@ -454,7 +525,7 @@ async def launch_review_task(
     pull request's actual target branch; when GitHub does not report a valid
     one the review fails before any workspace or session work.
     """
-    denied = _policy_denied(REPOSITORY_ACCESS, repository, review_id=review_id)
+    denied = policy_denied(REPOSITORY_ACCESS, repository, review_id=review_id)
     if denied is not None:
         _fail_review(review_id, f"blocked by repository policy: {denied.reason}")
         return
@@ -494,17 +565,31 @@ async def launch_review_task(
 
     binding = ReviewBinding.from_context(context)
     try:
+        attempt_id = start_attempt(
+            PARENT_REVIEW,
+            review_id,
+            AttemptKind.REVIEW,
+            requested_model=launch.get("model") or getattr(droid, "model", None) or get_settings().droid_model,
+            base_sha=context.base_sha,
+            head_sha=context.head_sha,
+        ).attempt_id
+    except (AttemptConflictError, LookupError) as exc:
+        log_event(logger, logging.WARNING, "review.launch_rejected", review_id=review_id, reason=str(exc))
+        return
+    try:
         result = await droid.start_review_run(
             context=context,
             repository_url=repository_url or f"https://github.com/{repository}",
             review_id=review_id,
             pr_url=pr_url or f"https://github.com/{repository}/pull/{pr_number}",
             model=launch.get("model"),
-            on_complete=partial(finalize_review_task, review_id, binding),
-            on_session_opened=partial(_bind_review_session, review_id, binding),
+            on_complete=partial(finalize_review_task, review_id, binding, attempt_id=attempt_id),
+            on_session_opened=partial(_bind_review_session, review_id, binding, attempt_id=attempt_id),
         )
     except Exception as exc:
-        _fail_review(review_id, f"Droid review session failed to start: {safe_error(exc)}")
+        error = f"Droid review session failed to start: {safe_error(exc)}"
+        fail_attempt_start(attempt_id, error)
+        _fail_review(review_id, error)
         log_event(
             logger,
             logging.ERROR,
@@ -516,12 +601,13 @@ async def launch_review_task(
         )
         return
 
-    _bind_review_session(review_id, binding, result["session_id"])
+    _bind_review_session(review_id, binding, result["session_id"], attempt_id=attempt_id)
     log_event(
         logger,
         logging.INFO,
         "droid.review_running",
         review_id=review_id,
+        attempt_id=attempt_id,
         session_id=result["session_id"],
         repo=repository,
         pr=pr_number,
@@ -550,7 +636,7 @@ async def _post_review_verdict(github: GitHubClient, target: _ReviewTarget, text
 
     Returns ``(posted, event)``.
     """
-    if _policy_denied(OutwardAction.PULL_REQUEST_REVIEW, target.repository, review_id=target.review_id):
+    if policy_denied(OutwardAction.PULL_REQUEST_REVIEW, target.repository, review_id=target.review_id):
         return False, event
     body = review_display_body(text)
     try:
@@ -625,12 +711,15 @@ def _callback_rejection(review: ReviewTask, binding: ReviewBinding, session_id: 
     return None
 
 
-async def finalize_review_task(review_id: int, binding: ReviewBinding, outcome: dict[str, Any]) -> None:
+async def finalize_review_task(
+    review_id: int, binding: ReviewBinding, outcome: dict[str, Any], *, attempt_id: int
+) -> None:
     """Turn-completion handler for one restricted Droid PR review session.
 
     ``binding`` is the context the completing session was started over. A
-    callback from any other session, for another context, or for a row that
-    is already terminal changes nothing and makes no GitHub call.
+    callback from any other session, for another context, for an attempt that
+    is no longer active, or for a row that is already terminal changes
+    nothing, counts no usage and makes no GitHub call.
 
     The structured verdict is persisted with the reviewed SHA. Policy is then
     rechecked before any GitHub read or write; only a restricted review of a
@@ -647,13 +736,19 @@ async def finalize_review_task(review_id: int, binding: ReviewBinding, outcome: 
         if review is None:
             log_event(logger, logging.WARNING, "droid.review_missing", review_id=review_id)
             return
-        rejection = _callback_rejection(review, binding, session_id)
-        if rejection is not None:
+        attempt = claim_active_attempt(session, attempt_id, PARENT_REVIEW, review_id)
+        rejection = (
+            "attempt is not active for this review"
+            if attempt is None
+            else _callback_rejection(review, binding, session_id)
+        )
+        if rejection is not None or attempt is None:
             log_event(
                 logger,
                 logging.WARNING,
                 "review.callback_rejected",
                 review_id=review_id,
+                attempt_id=attempt_id,
                 session_id=session_id,
                 bound_session_id=review.droid_session_id,
                 reason=rejection,
@@ -661,7 +756,7 @@ async def finalize_review_task(review_id: int, binding: ReviewBinding, outcome: 
             )
             return
         old_status = review.status
-        _apply_outcome_to_task(review, outcome, status, summary)
+        _apply_outcome_to_task(session, review, attempt, outcome, status, summary)
         if status == TaskStatus.COMPLETED and summary:
             parsed = effective_verdict(
                 parse_review_output(summary),
@@ -694,7 +789,7 @@ async def finalize_review_task(review_id: int, binding: ReviewBinding, outcome: 
         verdict or "", "COMMENT"
     )
     # Checked before the head read too: stored work outside current policy gets no GitHub call at all.
-    if not _policy_denied(OutwardAction.PULL_REQUEST_REVIEW, target.repository, review_id=review_id):
+    if not policy_denied(OutwardAction.PULL_REQUEST_REVIEW, target.repository, review_id=review_id):
         if event == "APPROVE" and not await _pull_request_head_matches(github, target):
             event = "COMMENT"
         posted, event = await _post_review_verdict(github, target, summary, event)
@@ -714,7 +809,7 @@ async def finalize_review_task(review_id: int, binding: ReviewBinding, outcome: 
 
 
 # ---------------------------------------------------------------------------
-# Restart recovery
+# Shared row helpers
 # ---------------------------------------------------------------------------
 
 
@@ -729,107 +824,3 @@ def _mark_row_failed[TaskOrReviewRow: Task | ReviewTask](
             row.error = error
             if stamp_completed:
                 row.completed_at = datetime.now(UTC)
-
-
-def _fail_rows_outside_policy(snapshots: list[tuple[int, str | None, str]]) -> None:
-    for row_id, _session_id, repository in snapshots:
-        denied = _policy_denied(REPOSITORY_ACCESS, repository, row=f"task_id={row_id}")
-        if denied is not None:
-            _mark_row_failed(Task, row_id, f"blocked by repository policy: {denied.reason}")
-
-
-async def _resume_orphaned_fix(
-    task_id: int,
-    session_id: str | None,
-    repository: str,
-    droid: DroidClient,
-    finalize: Callable[[int, dict[str, Any]], Awaitable[None]],
-) -> int:
-    """Resume one orphaned implementation session; fail the row if the session is lost.
-
-    Returns 1 when the row was resumed, 0 when it was marked failed.
-    """
-    denied = _policy_denied(REPOSITORY_ACCESS, repository, row=f"task_id={task_id}")
-    if denied is not None:
-        _mark_row_failed(Task, task_id, f"blocked by repository policy: {denied.reason}")
-        return 0
-    if not session_id:
-        _mark_row_failed(Task, task_id, "dispatch interrupted by service restart")
-        log_event(logger, logging.WARNING, "recovery.dispatch_lost", task_id=task_id)
-        return 0
-    try:
-        await droid.resume_interrupted(
-            session_id,
-            repository=repository,
-            cwd=task_workspace_dir(repository, task_id),
-            on_complete=partial(finalize, task_id),
-        )
-    except Exception as exc:
-        _mark_row_failed(Task, task_id, f"session lost after service restart: {safe_error(exc)}")
-        log_event(
-            logger,
-            logging.WARNING,
-            "recovery.session_lost",
-            session_id=session_id,
-            error=str(exc),
-            task_id=task_id,
-        )
-        return 0
-    with db_session() as session:
-        row = session.get(Task, task_id)
-        if row is not None:
-            row.status = TaskStatus.RUNNING
-    return 1
-
-
-def _fail_orphaned_reviews(review_snapshots: list[tuple[int, str | None, str]], live: set[str]) -> None:
-    """Orphaned reviews are closed, never resumed: a resumed session would not keep the tool restriction."""
-    for review_id, session_id, _repository in review_snapshots:
-        if session_id and session_id in live:
-            continue
-        error = REVIEW_INTERRUPTED_ERROR if session_id else "review dispatch interrupted by service restart"
-        _fail_review(review_id, error)
-        log_event(logger, logging.WARNING, "recovery.review_not_resumed", review_id=review_id)
-
-
-async def recover_interrupted_tasks(droid: DroidClient | None = None) -> int:
-    """Resume implementation sessions orphaned by a restart; close orphaned reviews.
-
-    Droid sessions persist on disk, so a RUNNING fix row whose session is no
-    longer streaming is resumed with a candidate-only continuation prompt. Rows
-    that never got a session (dispatch interrupted) are marked failed. Review
-    rows are never resumed; the operator can reassign a fresh restricted review.
-    """
-    droid = droid or get_droid_client()
-
-    with db_session() as session:
-        fix_rows = session.query(Task).filter(Task.status.in_(TaskStatus.ACTIVE)).all()
-        fix_snapshots = [(t.id, t.droid_session_id, t.repository) for t in fix_rows]
-        review_rows = session.query(ReviewTask).filter(ReviewTask.status.in_(TaskStatus.ACTIVE)).all()
-        review_snapshots = [(r.id, r.droid_session_id, r.repository) for r in review_rows]
-
-    live = droid.active_sessions
-    _fail_orphaned_reviews(review_snapshots, live)
-
-    if not droid.configured:
-        # Nothing can be resumed, but stored work outside current policy is
-        # still refused visibly rather than left looking active.
-        _fail_rows_outside_policy(fix_snapshots)
-        return 0
-
-    recovered = 0
-    for task_id, session_id, repository in fix_snapshots:
-        if session_id and session_id in live:
-            continue
-        recovered += await _resume_orphaned_fix(task_id, session_id, repository, droid, finalize_fix_task)
-
-    if recovered or fix_snapshots or review_snapshots:
-        log_event(
-            logger,
-            logging.INFO,
-            "recovery.completed",
-            recovered=recovered,
-            fixes=len(fix_snapshots),
-            reviews=len(review_snapshots),
-        )
-    return recovered

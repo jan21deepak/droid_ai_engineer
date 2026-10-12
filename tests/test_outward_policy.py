@@ -10,7 +10,8 @@ from datetime import UTC, datetime
 import httpx
 import pytest
 
-from app import droid_client, worker
+from app import droid_client, recovery, worker
+from app.attempts import mark_attempt_running, start_attempt
 from app.candidates import WorkspaceState
 from app.config import get_settings
 from app.database import db_session
@@ -25,6 +26,7 @@ from app.policy import (
     repository_decision,
 )
 from app.review_policy import REVIEW_POLICY_RESTRICTED, ReviewBinding
+from app.run_models import PARENT_REVIEW, PARENT_TASK, AttemptKind, AttemptStatus, RunAttempt
 from app.tasks import TaskCreateError, create_and_dispatch_task
 
 ALLOWED = "jan21deepak/allowed"
@@ -106,6 +108,9 @@ class RecordingDroid:
     def track(self, key, task):
         return task
 
+    def session_busy(self, session_id):
+        return False
+
     async def inspect_workspace(self, repository, task_id, reported_branch):
         return WorkspaceState(head_sha="c" * 40, branch=self.branch, dirty=False)
 
@@ -146,6 +151,12 @@ def add_task(repository=ALLOWED, **overrides):
         session.add(task)
         session.flush()
         return task.id
+
+
+def running_attempt(parent_type, parent_id, kind=AttemptKind.FIX, session_id=None):
+    attempt_id = start_attempt(parent_type, parent_id, kind).attempt_id
+    mark_attempt_running(attempt_id, session_id=session_id)
+    return attempt_id
 
 
 def outcome(text="Done.\nBRANCH: droid/fix-branch"):
@@ -312,9 +323,11 @@ class TestRegistrationAndRoutes:
 
     def test_follow_up_on_unapproved_repository_is_refused(self, client, monkeypatch, outbound, allowlist):
         droid = RecordingDroid()
-        monkeypatch.setattr("app.app.get_droid_client", lambda: droid)
-        denied_id = add_task(repository=OTHER)
-        allowed_id = add_task(repository=ALLOWED, issue_number=4, droid_session_id="sess-2")
+        monkeypatch.setattr("app.recovery.get_droid_client", lambda: droid)
+        denied_id = add_task(repository=OTHER, status=TaskStatus.COMPLETED)
+        allowed_id = add_task(
+            repository=ALLOWED, issue_number=4, droid_session_id="sess-2", status=TaskStatus.COMPLETED
+        )
 
         resp = client.post(f"/api/tasks/{denied_id}/follow-up", json={"instruction": "more"})
         assert resp.status_code == 403
@@ -352,7 +365,7 @@ class TestBackgroundPaths:
             assert "repository policy" in task.error
 
     @pytest.mark.asyncio
-    async def test_recovery_skips_unapproved_and_resumes_approved_in_workspace(self, monkeypatch, allowlist):
+    async def test_restart_resumes_nothing_and_fails_unapproved_rows(self, monkeypatch, allowlist):
         droid = RecordingDroid()
         denied_id = add_task(repository=OTHER, droid_session_id="sess-denied")
         allowed_id = add_task(repository=ALLOWED, issue_number=9, droid_session_id="sess-ok")
@@ -362,29 +375,35 @@ class TestBackgroundPaths:
             session.flush()
             review_id = review.id
 
-        recovered = await worker.recover_interrupted_tasks(droid)
+        assert await recovery.recover_interrupted_tasks(droid) == 3
 
-        assert recovered == 1
-        assert droid.resumed == [("sess-ok", task_workspace_dir(ALLOWED, allowed_id))]
-        with db_session() as session:
-            assert session.get(Task, denied_id).status == TaskStatus.FAILED
-            assert session.get(ReviewTask, review_id).status == TaskStatus.FAILED
-
-    @pytest.mark.asyncio
-    async def test_recovery_without_droid_still_refuses_unapproved_rows(self, allowlist):
-        droid = RecordingDroid()
-        droid.configured = False
-        denied_id = add_task(repository=OTHER, droid_session_id="sess-denied")
-        allowed_id = add_task(repository=ALLOWED, issue_number=9, droid_session_id="sess-ok")
-
-        assert await worker.recover_interrupted_tasks(droid) == 0
-
-        assert droid.resumed == []
+        assert droid.resumed == [] and droid.started == []
         with db_session() as session:
             denied = session.get(Task, denied_id)
             assert denied.status == TaskStatus.FAILED
             assert "repository policy" in denied.error
-            assert session.get(Task, allowed_id).status == TaskStatus.RUNNING
+            assert session.get(Task, allowed_id).status == TaskStatus.INTERRUPTED
+            assert session.get(ReviewTask, review_id).status == TaskStatus.FAILED
+
+    @pytest.mark.asyncio
+    async def test_explicit_recovery_rechecks_policy_and_resumes_in_task_workspace(self, monkeypatch, allowlist):
+        droid = RecordingDroid()
+        monkeypatch.setattr("app.recovery.get_droid_client", lambda: droid)
+        denied_id = add_task(repository=OTHER, droid_session_id="sess-denied", status=TaskStatus.INTERRUPTED)
+        allowed_id = add_task(
+            repository=ALLOWED, issue_number=9, droid_session_id="sess-ok", status=TaskStatus.INTERRUPTED
+        )
+
+        with pytest.raises(recovery.ContinuationRefusedError) as refused:
+            await recovery.continue_task(denied_id, AttemptKind.RECOVERY)
+        assert refused.value.status_code == 403
+        result = await recovery.continue_task(allowed_id, AttemptKind.RECOVERY)
+
+        assert droid.resumed == [("sess-ok", task_workspace_dir(ALLOWED, allowed_id))]
+        with db_session() as session:
+            attempt = session.get(RunAttempt, result["attempt_id"])
+            assert (attempt.kind, attempt.status) == (AttemptKind.RECOVERY, AttemptStatus.RUNNING)
+            assert session.query(RunAttempt).filter(RunAttempt.parent_id == denied_id).count() == 0
 
     @pytest.mark.asyncio
     async def test_polling_never_reads_unapproved_repositories(self, allowlist):
@@ -413,7 +432,7 @@ class TestBackgroundPaths:
         monkeypatch.setattr(worker, "get_droid_client", lambda: droid)
         task_id = add_task()
 
-        await worker.finalize_fix_task(task_id, outcome())
+        await worker.finalize_fix_task(task_id, outcome(), attempt_id=running_attempt(PARENT_TASK, task_id))
 
         assert droid.pushed == []
         assert github.calls == []
@@ -433,7 +452,7 @@ class TestBackgroundPaths:
         follow_up = add_task(issue_number=4, pull_request_url=f"https://github.com/{ALLOWED}/pull/7")
 
         for task_id in (fresh, follow_up):
-            await worker.finalize_fix_task(task_id, outcome())
+            await worker.finalize_fix_task(task_id, outcome(), attempt_id=running_attempt(PARENT_TASK, task_id))
 
         assert droid.pushed == []
         # The only GitHub write is the policy-permitted progress comment on each issue.
@@ -465,7 +484,10 @@ class TestBackgroundPaths:
             review_id = review.id
 
         await worker.finalize_review_task(
-            review_id, bound, {**outcome("Looks fine.\nVERDICT: APPROVE"), "session_id": "s"}
+            review_id,
+            bound,
+            {**outcome("Looks fine.\nVERDICT: APPROVE"), "session_id": "s"},
+            attempt_id=running_attempt(PARENT_REVIEW, review_id, AttemptKind.REVIEW, session_id="s"),
         )
 
         # Writes are disabled, so not even the approval head check reads GitHub.

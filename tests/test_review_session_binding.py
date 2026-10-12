@@ -8,10 +8,12 @@ import httpx
 import pytest
 
 from app import worker
+from app.attempts import mark_attempt_running, start_attempt
 from app.config import get_settings
 from app.database import db_session
 from app.models import Repository, ReviewTask, TaskStatus
 from app.review_policy import REVIEW_POLICY_RESTRICTED, ReviewBinding, ReviewContext, ReviewVerdict, review_base_ref
+from app.run_models import PARENT_REVIEW, AttemptKind, RunAttempt
 
 REPO = "jan21deepak/omnigent"
 HEAD_A = "a" * 40
@@ -140,7 +142,23 @@ def add_review(**overrides):
         review = ReviewTask(**values)
         session.add(review)
         session.flush()
-        return review.id
+        review_id = review.id
+    if values["status"] == TaskStatus.RUNNING:
+        # A running row always has the running attempt its launch committed.
+        attempt_id = start_attempt(PARENT_REVIEW, review_id, AttemptKind.REVIEW).attempt_id
+        mark_attempt_running(attempt_id, session_id=values["droid_session_id"])
+    return review_id
+
+
+def attempt_of(review_id):
+    with db_session() as session:
+        return (
+            session.query(RunAttempt)
+            .filter(RunAttempt.parent_type == PARENT_REVIEW, RunAttempt.parent_id == review_id)
+            .order_by(RunAttempt.sequence.desc())
+            .first()
+            .id
+        )
 
 
 def binding(head=HEAD_A):
@@ -181,7 +199,9 @@ class TestOutboundRedaction:
         install(monkeypatch, github)
 
         text = review_text(verdict, summary=f"leaked {SENTINEL}", extra=f"token {SENTINEL}\n")
-        await worker.finalize_review_task(review_id, binding(), outcome("sess-1", text))
+        await worker.finalize_review_task(
+            review_id, binding(), outcome("sess-1", text), attempt_id=attempt_of(review_id)
+        )
 
         [(_repo, _pr, body, event, commit_id)] = github.review_posts
         assert (event, commit_id) == (expected_event, HEAD_A)
@@ -195,7 +215,9 @@ class TestOutboundRedaction:
         github = RecordingGitHub()
         install(monkeypatch, github)
 
-        await worker.finalize_review_task(review_id, binding(), outcome("sess-1", f"No verdict here {SENTINEL}"))
+        await worker.finalize_review_task(
+            review_id, binding(), outcome("sess-1", f"No verdict here {SENTINEL}"), attempt_id=attempt_of(review_id)
+        )
 
         [(_repo, _pr, body, event, _commit)] = github.review_posts
         assert event == "COMMENT"
@@ -211,7 +233,9 @@ class TestOutboundRedaction:
         install(monkeypatch, github)
 
         text = "x" * 180 + SENTINEL + "\n" + review_text("REQUEST_CHANGES")
-        await worker.finalize_review_task(review_id, binding(), outcome("sess-1", text))
+        await worker.finalize_review_task(
+            review_id, binding(), outcome("sess-1", text), attempt_id=attempt_of(review_id)
+        )
 
         [(_repo, _pr, body, event, _commit)] = github.review_posts
         assert event == "COMMENT"
@@ -228,7 +252,9 @@ class TestFinalizationPolicy:
         monkeypatch.setenv("FORGE_ALLOWED_REPOSITORIES", "someone/else")
         get_settings.cache_clear()
 
-        await worker.finalize_review_task(review_id, binding(), outcome("sess-1", review_text(summary=SENTINEL)))
+        await worker.finalize_review_task(
+            review_id, binding(), outcome("sess-1", review_text(summary=SENTINEL)), attempt_id=attempt_of(review_id)
+        )
 
         assert github.calls == []
         stored = row(review_id)
@@ -244,7 +270,7 @@ class TestFinalizationPolicy:
         monkeypatch.setenv("FORGE_ALLOW_GITHUB_WRITES", "false")
         get_settings.cache_clear()
 
-        await worker.finalize_review_task(review_id, binding(), outcome("sess-1"))
+        await worker.finalize_review_task(review_id, binding(), outcome("sess-1"), attempt_id=attempt_of(review_id))
 
         assert github.calls == []
         assert row(review_id)["verdict"] == ReviewVerdict.APPROVE
@@ -427,8 +453,10 @@ class TestSessionBinding:
         install(monkeypatch, github)
         before = row(review_id)
 
-        await worker.finalize_review_task(review_id, binding(), outcome("sess-stale"))
-        await worker.finalize_review_task(review_id, binding(), {**outcome("sess-x"), "session_id": None})
+        await worker.finalize_review_task(review_id, binding(), outcome("sess-stale"), attempt_id=attempt_of(review_id))
+        await worker.finalize_review_task(
+            review_id, binding(), {**outcome("sess-x"), "session_id": None}, attempt_id=attempt_of(review_id)
+        )
 
         assert row(review_id) == before
         assert github.calls == []
@@ -439,10 +467,13 @@ class TestSessionBinding:
         github = RecordingGitHub()
         install(monkeypatch, github)
 
-        await worker.finalize_review_task(review_id, binding(), outcome("sess-1"))
+        await worker.finalize_review_task(review_id, binding(), outcome("sess-1"), attempt_id=attempt_of(review_id))
         after_first = row(review_id)
         await worker.finalize_review_task(
-            review_id, binding(), outcome("sess-1", review_text("REQUEST_CHANGES", summary="changed"))
+            review_id,
+            binding(),
+            outcome("sess-1", review_text("REQUEST_CHANGES", summary="changed")),
+            attempt_id=attempt_of(review_id),
         )
 
         assert row(review_id) == after_first

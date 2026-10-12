@@ -66,10 +66,11 @@ Before declaring any change done: run `ruff check`, `ruff format --check`,
 
 ## Project layout
 
-- `app/app.py` — FastAPI app: dashboard, repositories, issues, follow-up APIs
+- `app/app.py` — FastAPI app: dashboard, repositories, issues APIs
+- `app/run_models.py` / `app/attempts.py` — `RunAttempt` per-turn rows, lifecycle and usage storage; `app/run_routes.py` — task/review/attempt detail, follow-up and recovery APIs; `app/recovery.py` — restart recovery (marks orphans interrupted, never resumes) and explicit continuation
 - `app/auth.py` / `app/auth_routes.py` — default-deny operator access middleware, sessions, CSRF/Origin/Host checks, login/logout
 - `app/intake.py` — HMAC-signed `/webhook` intake; `app/policy.py` — repository approval policy
-- `app/worker.py` — background finalization (fix/review), restart recovery
+- `app/worker.py` — fix/review launch and attempt-bound finalization
 - `app/candidates.py` — local candidate recording; `app/review_policy.py` — restricted review config, diff checks, verdict parsing; `app/publishing.py` — policy-gated PR creation (not called automatically)
 - `app/droid_client.py` — Droid SDK wrapper: workspaces, fix/review sessions, resume
 - `app/github.py` — GitHub REST client: comments, PRs, reviews, webhook signature

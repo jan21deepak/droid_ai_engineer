@@ -26,6 +26,7 @@ from app.candidates import CandidateStatus, WorkspaceState
 from app.config import get_settings
 from app.database import db_session
 from app.models import Repository, Task, TaskStatus
+from app.run_models import PARENT_TASK, AttemptKind, AttemptStatus, RunAttempt
 
 SECRET = "test-secret"
 TRIGGER_LABEL = "Droid-complete"
@@ -62,6 +63,7 @@ class IntegrationDroid:
     def __init__(self) -> None:
         self.fix_runs: list[dict[str, Any]] = []
         self.pushed_branches: list[str] = []
+        self.attempts_at_entry: list[list[tuple[str, str]]] = []
 
     def track(self, key: str, task: asyncio.Task[Any]) -> asyncio.Task[Any]:
         return task
@@ -80,6 +82,15 @@ class IntegrationDroid:
         self.fix_runs.append(kwargs)
         task_id = kwargs["task_id"]
         with db_session() as session:
+            # SDK entry probe: the attempt for this turn is already committed.
+            self.attempts_at_entry.append(
+                [
+                    (a.kind, a.status)
+                    for a in session.query(RunAttempt).filter(
+                        RunAttempt.parent_type == PARENT_TASK, RunAttempt.parent_id == task_id
+                    )
+                ]
+            )
             task = session.get(Task, task_id)
             assert task is not None
             task.status = TaskStatus.RUNNING
@@ -95,6 +106,7 @@ class IntegrationDroid:
                     "duration_seconds": 42.0,
                     "credits": 3,
                     "tokens": 1234,
+                    "usage": {"input_tokens": 1200, "output_tokens": 34, "factory_credits": 3},
                 }
             )
 
@@ -191,6 +203,15 @@ class TestIssueToPullRequestFlow:
 
         # The fix turn ran with the issue context and reported the branch.
         assert len(flow["droid"].fix_runs) == 1
+        assert flow["droid"].attempts_at_entry == [[(AttemptKind.FIX, AttemptStatus.STARTING)]]
+        with db_session() as session:
+            [attempt] = session.query(RunAttempt).filter(RunAttempt.parent_id == task_id).all()
+            assert (attempt.status, attempt.session_id, attempt.base_sha, attempt.head_sha) == (
+                AttemptStatus.COMPLETED,
+                "sess-integration-1",
+                BASE_SHA,
+                CANDIDATE_SHA,
+            )
         assert flow["droid"].fix_runs[0]["issue_number"] == 7
 
         # Forge persisted the Droid result and the local candidate it produced.

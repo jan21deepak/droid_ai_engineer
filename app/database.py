@@ -8,6 +8,7 @@ from contextlib import contextmanager
 from sqlalchemy import Engine, create_engine, inspect, text
 from sqlalchemy.orm import Session, sessionmaker
 
+import app.run_models  # noqa: F401  (registers run_attempts on Base.metadata)
 from app.config import get_settings
 from app.logging_conf import log_event
 from app.models import Base
@@ -53,7 +54,12 @@ def db_session() -> Iterator[Session]:
 
 
 def _run_lightweight_migrations(engine: Engine) -> None:
-    """Add any columns present in models but missing from existing tables."""
+    """Add any columns present in models but missing from existing tables.
+
+    Additive and idempotent: existing rows and columns are never rewritten, and
+    added columns get no value on old rows (ORM defaults apply to new inserts
+    only), so unknown history stays unknown. New tables come from ``create_all``.
+    """
     inspector = inspect(engine)
     for table_name, table in Base.metadata.tables.items():
         if table_name not in inspector.get_table_names():
