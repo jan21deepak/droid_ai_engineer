@@ -71,6 +71,9 @@ from app.review_outcomes import (
     REVIEW_TARGET_PULL_REQUEST,
     GitHubReviewOutcome,
     classify_github_outcome,
+    interrupt_pending,
+    mark_unposted,
+    set_github_outcome,
 )
 from app.review_policy import (
     REVIEW_POLICY_RESTRICTED,
@@ -467,7 +470,13 @@ async def start_pr_review(
 
 
 def _fail_review(review_id: int, error: str) -> None:
-    _mark_row_failed(ReviewTask, review_id, error, stamp_completed=True)
+    with db_session() as session:
+        review = session.get(ReviewTask, review_id)
+        if review is not None and review.status in TaskStatus.ACTIVE:
+            review.status = TaskStatus.FAILED
+            review.error = error
+            review.completed_at = datetime.now(UTC)
+            mark_unposted(review)
 
 
 def _review_refusal(review_id: int) -> RunRefusedError | None:
@@ -837,6 +846,12 @@ async def finalize_review_task(
             verdict = review.verdict
             error = review.error
             local_only = review.review_target == REVIEW_TARGET_CANDIDATE
+            will_post = not local_only and status == TaskStatus.COMPLETED and bool(summary)
+            # Committed with the AI result, before any GitHub await below.
+            if will_post:
+                set_github_outcome(review, GitHubReviewOutcome.PENDING)
+            else:
+                mark_unposted(review)
             target = _ReviewTarget(review_id, review.repository, review.pr_number, binding.head_sha)
     if rejection is not None or attempt is None:
         # A stopped review keeps its outcome; only usage it reports late is retained, once.
@@ -855,29 +870,17 @@ async def finalize_review_task(
 
     if local_only:
         # A candidate review has no pull request yet; its verdict is local evidence only.
-        _record_github_outcome(review_id, GitHubReviewOutcome.LOCAL_ONLY, None)
         log_event(logger, logging.INFO, "review.candidate_completed", review_id=review_id, verdict=verdict)
         return
-    if status != TaskStatus.COMPLETED or not summary:
-        _record_github_outcome(review_id, GitHubReviewOutcome.NOT_POSTED, None)
+    if not will_post or summary is None:
         log_event(logger, logging.WARNING, "review.failed", review_id=review_id, error=error)
         return
-
-    posted = False
-    intended = {ReviewVerdict.APPROVE: "APPROVE", ReviewVerdict.REQUEST_CHANGES: "REQUEST_CHANGES"}.get(
-        verdict or "", "COMMENT"
-    )
-    event = intended
-    # Checked before the head read too: stored work outside current policy gets no GitHub call at all.
-    if policy_denied(OutwardAction.PULL_REQUEST_REVIEW, target.repository, review_id=review_id):
-        _record_github_outcome(review_id, GitHubReviewOutcome.POLICY_DENIED, None)
-    else:
-        if event == "APPROVE" and not await _pull_request_head_matches(github, target):
-            event = "COMMENT"
-        attempted = event
-        posted, event = await _post_review_verdict(github, target, summary, event)
-        kind = classify_github_outcome(intended=intended, attempted=attempted, posted_event=event, posted=posted)
-        _record_github_outcome(review_id, kind, event if posted else None)
+    try:
+        posted, event = await _post_pending_review(github, target, verdict, summary)
+    except BaseException:
+        # Cancelled or broken mid-post: GitHub may or may not have the review. Never re-posted.
+        _interrupt_pending_outcome(review_id)
+        raise
 
     log_event(
         logger,
@@ -893,14 +896,44 @@ async def finalize_review_task(
     )
 
 
+async def _post_pending_review(
+    github: GitHubClient, target: _ReviewTarget, verdict: str | None, summary: str
+) -> tuple[bool, str]:
+    """Post a completed review whose outcome is pending and record what reached GitHub; ``(posted, event)``."""
+    intended = {ReviewVerdict.APPROVE: "APPROVE", ReviewVerdict.REQUEST_CHANGES: "REQUEST_CHANGES"}.get(
+        verdict or "", "COMMENT"
+    )
+    event = intended
+    # Checked before the head read too: stored work outside current policy gets no GitHub call at all.
+    if policy_denied(OutwardAction.PULL_REQUEST_REVIEW, target.repository, review_id=target.review_id):
+        _record_github_outcome(target.review_id, GitHubReviewOutcome.POLICY_DENIED, None)
+        return False, event
+    if event == "APPROVE" and not await _pull_request_head_matches(github, target):
+        event = "COMMENT"
+    attempted = event
+    posted, event = await _post_review_verdict(github, target, summary, event)
+    kind = classify_github_outcome(intended=intended, attempted=attempted, posted_event=event, posted=posted)
+    _record_github_outcome(target.review_id, kind, event if posted else None)
+    return posted, event
+
+
 def _record_github_outcome(review_id: int, outcome: str, event: str | None) -> None:
     """Persist what reached GitHub, separately from the AI verdict."""
     with db_session() as session:
         review = session.get(ReviewTask, review_id)
         if review is not None:
-            review.github_review_outcome = outcome
-            review.github_review_event = event
-            review.github_review_at = datetime.now(UTC)
+            set_github_outcome(review, outcome, event)
+
+
+def _interrupt_pending_outcome(review_id: int) -> None:
+    try:
+        with db_session() as session:
+            review = session.get(ReviewTask, review_id)
+            if review is not None and interrupt_pending(review):
+                log_event(logger, logging.WARNING, "review.github_outcome_unconfirmed", review_id=review_id)
+    except Exception as exc:
+        # Restart recovery bounds a pending outcome that could not be settled here.
+        log_event(logger, logging.ERROR, "review.github_outcome_settle_failed", review_id=review_id, error=str(exc))
 
 
 # ---------------------------------------------------------------------------

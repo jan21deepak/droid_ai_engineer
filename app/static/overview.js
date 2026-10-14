@@ -7,6 +7,7 @@
     escapeHtml,
     hideAlert,
     humanize,
+    reviewOutcomeLabel,
     reviewReadinessBadge,
     runBusy,
     safeUrl,
@@ -175,7 +176,7 @@
         <td>${badge(humanize(review.status), REVIEW_STATUS_TONES[review.status] || "secondary")}</td>
         <td>${shaHtml(review.commit_sha, "not bound yet")}</td>
         <td>${verdictBadge(review.ai_verdict)}</td>
-        <td class="small text-wrap outcome-cell">${escapeHtml(outcome.label || "Not recorded")}</td>
+        <td class="small text-wrap outcome-cell">${escapeHtml(reviewOutcomeLabel(review))}</td>
       </tr>`;
   }
 

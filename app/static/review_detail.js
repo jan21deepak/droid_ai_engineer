@@ -70,12 +70,21 @@
           : `Not the restricted policy: ${escapeHtml(review.review_policy)}`],
     ]);
     const outcome = review.github_outcome || {};
+    const outcomeBadge = outcome.pending
+      ? `${badge("GitHub post pending", "info")} `
+      : outcome.kind === "interrupted"
+        ? `${badge("unconfirmed", "warning")} `
+        : "";
+    let formal = outcome.formal_github_approval ? badge("yes", "success") : badge("no", "secondary");
+    if ((!outcome.kind || outcome.kind === "unknown") && ACTIVE.includes(review.status)) formal = `<span class="text-muted">not known yet</span>`;
+    else if (outcome.pending) formal = `<span class="text-muted">not known yet (GitHub post pending)</span>`;
+    else if (outcome.kind === "interrupted") formal = `<span class="text-muted">unconfirmed (check the pull request on GitHub)</span>`;
     $("#review-result").innerHTML = `
       <p class="mb-2">${badge(label, tone)}</p>
       ${dl([
         ["AI verdict", verdictBadge(review.ai_verdict)],
-        ["GitHub outcome", `${escapeHtml(outcome.label || "Not recorded")}${outcome.event ? ` <code>${escapeHtml(outcome.event)}</code>` : ""}`],
-        ["Formal GitHub approval", outcome.formal_github_approval ? badge("yes", "success") : badge("no", "secondary")],
+        ["GitHub outcome", `${outcomeBadge}${escapeHtml(F.reviewOutcomeLabel(review))}${outcome.event ? ` <code>${escapeHtml(outcome.event)}</code>` : ""}`],
+        ["Formal GitHub approval", formal],
         outcome.recorded_at ? ["Recorded", escapeHtml(formatSgt(outcome.recorded_at))] : null,
         ["Merged", review.merged ? `${badge("merged (observed on GitHub)", "info")}` : "no"],
         review.error ? ["Error", `<span class="text-danger">${escapeHtml(review.error)}</span>`] : null,
@@ -102,7 +111,14 @@
       : `<tr><td colspan="6" class="text-center text-muted py-3">No attempts recorded yet.</td></tr>`;
     const stopBtn = $("#review-stop-btn");
     if (stopBtn.dataset.busy !== "1") stopBtn.disabled = !ACTIVE.includes(review.status);
-    $("#review-status").textContent = `Review status: ${humanize(review.status)}.`;
+    $("#review-status").textContent = `Review status: ${humanize(review.status)}.${
+      outcome.pending ? " GitHub outcome pending." : ""
+    }`;
+  }
+
+  // The AI result lands before its GitHub post is recorded, so keep polling through both.
+  function needsPolling(review) {
+    return ACTIVE.includes(review.status) || Boolean(review.github_outcome && review.github_outcome.pending);
   }
 
   async function load() {
@@ -115,7 +131,7 @@
     }
     state = result.data;
     render();
-    if (ACTIVE.includes(state.review.status)) pollTimer = setTimeout(load, POLL_MS);
+    if (needsPolling(state.review)) pollTimer = setTimeout(load, POLL_MS);
   }
 
   $("#review-stop-btn").addEventListener("click", async (event) => {

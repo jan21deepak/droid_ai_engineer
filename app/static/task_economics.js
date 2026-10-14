@@ -20,6 +20,13 @@
     return `unknown (coverage ${usd.coverage}; ${counts}${subtotal}). No dollar amount is inferred from credits.`;
   }
 
+  function creditsText(econ) {
+    const coverage = `credit coverage ${econ.credit_coverage}${F.creditGaps(econ.credit_attempts)}`;
+    if (!known(econ.observed_factory_credits)) return `unknown · ${coverage}`;
+    const subtotal = econ.credit_coverage === "complete" ? "" : " (known subtotal)";
+    return `${formatNumber(econ.observed_factory_credits)}${subtotal} · ${coverage}`;
+  }
+
   function statusCounts(counts) {
     const parts = Object.entries(counts || {}).map(([status, n]) => `${Number(n)} ${F.humanize(status)}`);
     return parts.length ? parts.join(", ") : "none";
@@ -40,13 +47,24 @@
       <p class="small mb-2">${accepted} <span class="text-muted">${escapeHtml(econ.accepted_definition)}</span></p>
       <dl class="detail-dl mb-2">
         <dt>Factory credits (observed)</dt>
-        <dd>${escapeHtml(formatNumber(econ.observed_factory_credits))} · coverage ${escapeHtml(econ.credit_coverage)}</dd>
+        <dd>${escapeHtml(creditsText(econ))}</dd>
+        ${
+          econ.accepted
+            ? `<dt>Credits per accepted change</dt><dd>${
+                known(econ.credits_per_accepted_change)
+                  ? escapeHtml(formatNumber(econ.credits_per_accepted_change))
+                  : `<span class="text-muted">unknown. ${escapeHtml(econ.credits_per_accepted_detail)}</span>`
+              }</dd>`
+            : ""
+        }
         <dt>Attempts included</dt>
         <dd>${Number(econ.attempt_count)} (${escapeHtml(statusCounts(econ.attempt_status_counts))}); ${escapeHtml(
           unsuccessfulText(econ.unsuccessful_attempt_count, econ.unsuccessful_attempt_factory_credits)
         )}</dd>
         <dt>Candidate reviews</dt>
-        <dd>${Number(reviews.count || 0)} review(s), ${escapeHtml(formatNumber(reviews.observed_factory_credits))} credits</dd>
+        <dd>${Number(reviews.count || 0)} review(s), ${escapeHtml(formatNumber(reviews.observed_factory_credits))} credits${
+          Number(reviews.count || 0) ? ` (credit coverage ${escapeHtml(reviews.credit_coverage)})` : ""
+        }</dd>
         <dt>Dollars</dt>
         <dd>${escapeHtml(usdText(econ.usd))}</dd>
         <dt>Created to approval</dt>

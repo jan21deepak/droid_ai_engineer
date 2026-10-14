@@ -38,6 +38,8 @@ MAX_USD_PER_CREDIT = 1_000.0
 SOURCE_LIMIT = 200
 
 INTEGER_FIELDS = tuple(name for name in USAGE_FIELDS if name != "factory_credits")
+# Snapshot key listing the categories a terminal result omitted and snapshots filled in.
+FILLED_KEY = "terminal_filled"
 # Kinds whose turn opens a brand-new SDK session, so its cumulative snapshot is all this turn's.
 FRESH_SESSION_KINDS = (AttemptKind.FIX, AttemptKind.REVIEW)
 
@@ -112,6 +114,9 @@ def record_terminal_usage(attempt: RunAttempt, usage: Mapping[str, Any] | None) 
             source=UsageSource.TERMINAL_WITH_SNAPSHOT,
             completeness=UsageCompleteness.PARTIAL,
         )
+        stored = _load_snapshot(attempt)
+        stored[FILLED_KEY] = sorted(filled)
+        attempt.usage_snapshot = json.dumps(stored, sort_keys=True)
     else:
         _set_usage(attempt, values, source=UsageSource.TERMINAL_RESULT, completeness=UsageCompleteness.COMPLETE)
     return True
@@ -158,7 +163,7 @@ def record_snapshot(
     previous = stored.get("count")
     count = (previous if isinstance(previous, int) else 0) + max(1, observations)
     attempt.usage_snapshot = json.dumps(
-        {"first": merged_first, "latest": merged_latest, "count": count}, sort_keys=True
+        {**stored, "first": merged_first, "latest": merged_latest, "count": count}, sort_keys=True
     )
     attempt.usage_snapshot_at = datetime.now(UTC)
     return True
@@ -330,6 +335,78 @@ def usage_coverage(attempts: list[RunAttempt], history: str | None) -> str:
     return coverage_of(states)
 
 
+def _terminal_reported_credits(attempt: RunAttempt) -> bool:
+    """For a terminal result completed from snapshots: whether the credits came from the terminal result."""
+    stored = _load_snapshot(attempt)
+    filled = stored.get(FILLED_KEY)
+    if isinstance(filled, list):
+        return "factory_credits" not in filled
+    # Rows recorded before the filled categories were kept: the credits can only
+    # have come from the terminal result when no attributable snapshot had any.
+    attributable = attributable_snapshot_usage(attempt)
+    return attributable is None or "factory_credits" not in attributable[0]
+
+
+def attempt_credit_state(attempt: RunAttempt) -> str | None:
+    """Coverage of this attempt's Factory credits alone, or ``None`` when it provably never started.
+
+    Generic usage completeness says nothing about credits: a terminal result
+    may report tokens but no credits. Only a terminal credit observation
+    (including zero) is complete; snapshot-derived credits are partial; a
+    started attempt without observed credits is unknown.
+    """
+    if attempt.usage_source == UsageSource.NOT_STARTED:
+        return None
+    if attempt.factory_credits is None:
+        return UsageCompleteness.UNKNOWN
+    if attempt.usage_source == UsageSource.TERMINAL_RESULT:
+        return UsageCompleteness.COMPLETE
+    if attempt.usage_source == UsageSource.TERMINAL_WITH_SNAPSHOT:
+        return UsageCompleteness.COMPLETE if _terminal_reported_credits(attempt) else UsageCompleteness.PARTIAL
+    if attempt.usage_source in UsageSource.SNAPSHOT:
+        return UsageCompleteness.PARTIAL
+    return (
+        UsageCompleteness.COMPLETE
+        if attempt.usage_completeness == UsageCompleteness.COMPLETE
+        else UsageCompleteness.PARTIAL
+    )
+
+
+def legacy_credit_state(credits: float | None) -> str:
+    """A legacy per-task summary was overwritten per turn: known credits are at best partial."""
+    return UsageCompleteness.PARTIAL if credits is not None else UsageCompleteness.UNKNOWN
+
+
+def credit_coverage(attempts: list[RunAttempt], history_credits: list[float | None]) -> dict[str, Any]:
+    """Credit coverage across attempts and legacy summaries, with how many entries fell in each state.
+
+    A known subtotal next to any unknown entry is ``partial``; only unknown
+    entries, or nothing at all, is ``unknown`` (never an observed zero).
+    """
+    states: list[str] = []
+    exempt = 0
+    for attempt in attempts:
+        state = attempt_credit_state(attempt)
+        if state is None:
+            exempt += 1
+        else:
+            states.append(state)
+    attempt_states = list(states)
+    legacy = [legacy_credit_state(credits) for credits in history_credits]
+    states += legacy
+    return {
+        "coverage": coverage_of(states),
+        "counts": {
+            "observed": attempt_states.count(UsageCompleteness.COMPLETE),
+            "partial": attempt_states.count(UsageCompleteness.PARTIAL),
+            "unknown": attempt_states.count(UsageCompleteness.UNKNOWN),
+            "exempt_not_started": exempt,
+            "legacy_known": legacy.count(UsageCompleteness.PARTIAL),
+            "legacy_unknown": legacy.count(UsageCompleteness.UNKNOWN),
+        },
+    }
+
+
 def usd_summary(attempts: list[RunAttempt], *, has_history: bool = False) -> dict[str, Any]:
     """Dollar facts across attempts. A known-only subtotal is never presented as the complete cost."""
     # Blocked-before-spawn attempts used nothing, so they have no cost to know.
@@ -371,11 +448,13 @@ __all__ = [
     "CostInputError",
     "apply_configured_estimate",
     "apply_snapshot_usage",
+    "attempt_credit_state",
     "attributable_snapshot_usage",
     "clean_source",
     "clean_usage",
     "configured_estimate_rate",
     "coverage_of",
+    "credit_coverage",
     "finalize_usage",
     "finite_number",
     "record_snapshot",

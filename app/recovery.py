@@ -36,6 +36,7 @@ from app.logging_conf import log_event
 from app.models import ReviewTask, Task, TaskStatus
 from app.policy import repository_decision
 from app.redaction import safe_error
+from app.review_outcomes import GitHubReviewOutcome, interrupt_pending, mark_unposted
 from app.run_events import TurnRecorder
 from app.run_limits import RunRefusedError
 from app.run_models import PARENT_REVIEW, PARENT_TASK, AttemptKind, AttemptStatus, RunAttempt
@@ -128,6 +129,7 @@ def _interrupt_orphaned_review(review_id: int, live: set[str]) -> bool:
         review.error = reason
         if review.completed_at is None:
             review.completed_at = datetime.now(UTC)
+        mark_unposted(review)
         rollup_parent_usage(session, PARENT_REVIEW, review)
     log_event(logger, logging.WARNING, "recovery.review_not_resumed", review_id=review_id)
     return True
@@ -156,8 +158,9 @@ async def recover_interrupted_tasks(droid: DroidClient | None = None) -> int:
     with db_session() as session:
         # Attempts whose parent was no longer active (e.g. finished by PR reconciliation).
         stray = _interrupt_orphaned_attempts(session, live, RESTART_INTERRUPTED_ERROR)
+    unconfirmed = _settle_pending_review_posts()
 
-    if task_ids or review_ids or stray:
+    if task_ids or review_ids or stray or unconfirmed:
         log_event(
             logger,
             logging.INFO,
@@ -166,9 +169,24 @@ async def recover_interrupted_tasks(droid: DroidClient | None = None) -> int:
             fixes=len(task_ids),
             reviews=len(review_ids),
             stray_attempts=stray,
+            unconfirmed_review_posts=unconfirmed,
             resumed=0,
         )
     return interrupted
+
+
+def _settle_pending_review_posts() -> int:
+    """A GitHub post still pending at startup died with the previous process; it is never replayed."""
+    with db_session() as session:
+        pending = (
+            session.query(ReviewTask).filter(ReviewTask.github_review_outcome == GitHubReviewOutcome.PENDING).all()
+        )
+        for review in pending:
+            interrupt_pending(review)
+        settled = [review.id for review in pending]
+    for review_id in settled:
+        log_event(logger, logging.WARNING, "recovery.review_post_unconfirmed", review_id=review_id)
+    return len(settled)
 
 
 # ---------------------------------------------------------------------------

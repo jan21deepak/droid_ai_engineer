@@ -8,7 +8,11 @@ candidate review runs before anything is published and is never posted.
 
 from __future__ import annotations
 
-from typing import Any
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from app.models import ReviewTask
 
 REVIEW_TARGET_CANDIDATE = "candidate"
 REVIEW_TARGET_PULL_REQUEST = "pull_request"
@@ -17,6 +21,14 @@ FORMAL_EVENTS = frozenset({"APPROVE", "REQUEST_CHANGES"})
 
 
 class GitHubReviewOutcome:
+    # The AI review finished and its GitHub post is in flight. Persisted together
+    # with the AI result, before any GitHub request, so a reader never mistakes
+    # an unfinished post for a review that predates outcome tracking (``None``).
+    PENDING = "pending"
+    # A pending post was cut short (cancellation, unexpected error or restart)
+    # before its result was recorded. Whether it reached GitHub is unconfirmed,
+    # and it is never retried automatically.
+    INTERRUPTED = "interrupted"
     # The review covered a local candidate; there was no pull request to post to.
     LOCAL_ONLY = "local_only"
     # GitHub recorded a formal APPROVE / REQUEST_CHANGES review.
@@ -36,6 +48,11 @@ class GitHubReviewOutcome:
 
 
 _LABELS = {
+    GitHubReviewOutcome.PENDING: "Pending: the AI review finished and the GitHub post has not been recorded yet",
+    GitHubReviewOutcome.INTERRUPTED: (
+        "Unconfirmed: posting to GitHub was interrupted before its result was recorded. It may or may not "
+        "have reached GitHub and is not retried automatically; check the pull request on GitHub"
+    ),
     GitHubReviewOutcome.LOCAL_ONLY: "Local candidate review; not posted to GitHub",
     GitHubReviewOutcome.FORMAL_REVIEW: "Formal GitHub review",
     GitHubReviewOutcome.COMMENT: "Posted as a GitHub comment (no formal verdict)",
@@ -73,8 +90,31 @@ def github_outcome_dict(outcome: str | None, event: str | None, recorded_at: str
         "label": _LABELS.get(kind, "Not recorded (review predates outcome tracking)"),
         "formal_github_review": kind == GitHubReviewOutcome.FORMAL_REVIEW,
         "formal_github_approval": kind == GitHubReviewOutcome.FORMAL_REVIEW and event == "APPROVE",
+        "pending": kind == GitHubReviewOutcome.PENDING,
         "recorded_at": recorded_at,
     }
+
+
+def set_github_outcome(review: ReviewTask, outcome: str, event: str | None = None) -> None:
+    review.github_review_outcome = outcome
+    review.github_review_event = event
+    review.github_review_at = datetime.now(UTC)
+
+
+def mark_unposted(review: ReviewTask) -> None:
+    """Record that a review ending without a post reached nothing on GitHub; a recorded outcome is kept."""
+    if review.github_review_outcome is not None:
+        return
+    local = review.review_target == REVIEW_TARGET_CANDIDATE
+    set_github_outcome(review, GitHubReviewOutcome.LOCAL_ONLY if local else GitHubReviewOutcome.NOT_POSTED)
+
+
+def interrupt_pending(review: ReviewTask) -> bool:
+    """Bound a pending post that will not finish in this process; ``True`` when it was pending."""
+    if review.github_review_outcome != GitHubReviewOutcome.PENDING:
+        return False
+    set_github_outcome(review, GitHubReviewOutcome.INTERRUPTED)
+    return True
 
 
 __all__ = [
@@ -84,4 +124,7 @@ __all__ = [
     "GitHubReviewOutcome",
     "classify_github_outcome",
     "github_outcome_dict",
+    "interrupt_pending",
+    "mark_unposted",
+    "set_github_outcome",
 ]

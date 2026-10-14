@@ -3,7 +3,10 @@
 - The population is every implementation task. Failed, retried, stopped and
   not-yet-accepted work stays in every total; a task's restricted candidate
   reviews count toward it. Reviews of existing pull requests are reported apart.
-- Factory credits are observations. Dollars are known only from explicit
+- Factory credits are observations, and their coverage is judged from credit
+  observations alone: a turn that reported tokens but no credits leaves the
+  credit total a known subtotal, however complete its token usage. Credits per
+  accepted change appear only with complete credit coverage. Dollars are known only from explicit
   per-attempt estimates or reconciliations, and a total is reported only when
   every attempt has one. Cost per accepted change needs that complete total
   and at least one accepted change; otherwise it is ``None`` with the reason.
@@ -35,7 +38,7 @@ from app.overview import ACCEPTED_STAGES, DEFINITIONS, StagedTask, staged_tasks,
 from app.review_outcomes import REVIEW_TARGET_CANDIDATE
 from app.run_models import PARENT_REVIEW, PARENT_TASK, AttemptStatus, RunAttempt, UsageCompleteness
 from app.timeutil import iso_sgt
-from app.usage import coverage_of, sum_known, usd_summary
+from app.usage import coverage_of, credit_coverage, sum_known, usd_summary
 
 MAX_EFFORT_MINUTES = 100_000.0
 MAX_BASELINE_MINUTES = 100_000.0
@@ -53,6 +56,8 @@ POPULATION_DEFINITION = (
 SCENARIO_LABEL = "Estimated engineering capacity from user-entered assumptions. It is not realized cash savings and not a measurement."
 NOTES = (
     "Factory credits are as reported by the Droid SDK; no dollar amount is inferred from them.",
+    "Credit coverage is complete only when every attempt that could have used credits reported them; "
+    "otherwise the credit figure is a known subtotal.",
     "Dollar totals appear only when every attempt has an explicit estimate or reconciled amount.",
     "Human minutes and baseline assumptions are user-entered, not measured.",
     "Agent run failures are not production change failures, and agent runtime is not pull request cycle time.",
@@ -87,14 +92,35 @@ class Ledger:
         self.history_credits.extend(other.history_credits)
 
     @property
-    def coverage(self) -> str:
+    def usage_coverage(self) -> str:
+        """Generic usage completeness (any category). Not credit coverage."""
         return coverage_of(
             [a.usage_completeness or UsageCompleteness.UNKNOWN for a in self.attempts] + self.history_states
         )
 
+    def credit_facts(self) -> dict[str, Any]:
+        return credit_coverage(self.attempts, self.history_credits)
+
+    @property
+    def credit_coverage(self) -> str:
+        coverage: str = self.credit_facts()["coverage"]
+        return coverage
+
     @property
     def credits(self) -> float | None:
         return sum_known([a.factory_credits for a in self.attempts] + self.history_credits)
+
+    def credits_per_accepted(self, accepted: int) -> tuple[float | None, str]:
+        """Credits per accepted change, withheld unless credit coverage is complete over a positive denominator."""
+        coverage = self.credit_coverage
+        credits = self.credits
+        if accepted <= 0:
+            return None, "No accepted changes, so there is no denominator."
+        if coverage != UsageCompleteness.COMPLETE or credits is None:
+            return None, (
+                f"Withheld: Factory credit coverage is {coverage}, so the observed credits are only a known subtotal."
+            )
+        return credits / accepted, "Every attempt that could have used credits has an observed credit total."
 
     def usd(self) -> dict[str, Any]:
         return usd_summary(self.attempts, has_history=bool(self.history_states))
@@ -104,9 +130,12 @@ class Ledger:
         for attempt in self.attempts:
             counts[attempt.status] = counts.get(attempt.status, 0) + 1
         unsuccessful = [a.factory_credits for a in self.attempts if a.status != AttemptStatus.COMPLETED]
+        facts = self.credit_facts()
         return {
             "observed_factory_credits": self.credits,
-            "credit_coverage": self.coverage,
+            "credit_coverage": facts["coverage"],
+            "credit_attempts": facts["counts"],
+            "usage_coverage": self.usage_coverage,
             "attempt_count": len(self.attempts),
             "attempt_status_counts": counts,
             "unsuccessful_attempt_count": len(unsuccessful),
@@ -155,12 +184,15 @@ def task_economics(session: Session, task: Task, stage: str | None = None) -> di
     combined.extend(implementation)
     combined.extend(reviews)
     effort = _effort(session, task.id)
+    per_accepted, per_accepted_detail = combined.credits_per_accepted(1 if accepted else 0)
     return {
         "task_id": task.id,
         "stage": stage,
         "accepted": accepted,
         "accepted_definition": DEFINITIONS["accepted"],
         **combined.summary(),
+        "credits_per_accepted_change": per_accepted,
+        "credits_per_accepted_detail": per_accepted_detail if accepted else "This task is not an accepted change.",
         "implementation": implementation.summary(),
         "candidate_reviews": {"count": review_count, **reviews.summary()},
         "elapsed": task_elapsed(session, task, accepted),
@@ -194,15 +226,21 @@ def _cost_per_accepted(ledger: Ledger, tasks: int, accepted: int) -> dict[str, A
         f"stopped and not-yet-accepted work, divided by {accepted} accepted change(s). "
         "Reviews of existing pull requests are excluded."
     )
-    result: dict[str, Any] = {"denominator": accepted, "population": population, "usd": None, "credits": None}
+    credits, credits_detail = ledger.credits_per_accepted(accepted)
+    result: dict[str, Any] = {
+        "denominator": accepted,
+        "population": population,
+        "usd": None,
+        "credits": credits,
+        "credit_coverage": ledger.credit_coverage,
+        "credits_detail": credits_detail,
+    }
     if accepted == 0:
         return {
             **result,
             "state": "no_accepted_changes",
             "detail": "No accepted changes yet, so there is no denominator.",
         }
-    if ledger.coverage == UsageCompleteness.COMPLETE and ledger.credits is not None:
-        result["credits"] = ledger.credits / accepted
     if usd["total_usd"] is None:
         missing = usd["attempts_unknown"] + (1 if ledger.history_states else 0)
         detail = (
@@ -275,7 +313,8 @@ def _pr_reviews(session: Session) -> dict[str, Any]:
     return {
         "count": len(reviews),
         "observed_factory_credits": ledger.credits,
-        "credit_coverage": ledger.coverage,
+        "credit_coverage": ledger.credit_coverage,
+        "credit_attempts": ledger.credit_facts()["counts"],
         "usd": ledger.usd(),
         "included_in_cost_per_accepted_change": False,
     }
@@ -315,6 +354,10 @@ def portfolio_economics(session: Session, staged: list[StagedTask] | None = None
         "credits": {
             "observed": summary["observed_factory_credits"],
             "coverage": summary["credit_coverage"],
+            "attempt_coverage": summary["credit_attempts"],
+            "attempts_without_observed_credits": summary["credit_attempts"]["unknown"],
+            "attempts_exempt_not_started": summary["credit_attempts"]["exempt_not_started"],
+            "usage_coverage": summary["usage_coverage"],
             "accepted_tasks": accepted_ledger.credits,
             "not_accepted_tasks": other_ledger.credits,
             "unsuccessful_attempts": summary["unsuccessful_attempt_factory_credits"],

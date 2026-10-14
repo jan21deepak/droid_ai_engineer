@@ -32,6 +32,7 @@ from app.database import db_session
 from app.droid_client import get_droid_client
 from app.logging_conf import log_event
 from app.models import ReviewTask, TaskStatus
+from app.review_outcomes import mark_unposted
 from app.run_events import EventType, append_event
 from app.run_limits import runtime_limit_seconds
 from app.run_models import AttemptStatus, RunAttempt
@@ -96,8 +97,10 @@ async def stop_parent(
             stop_attempt(session, attempt, reason, message)
         parent.status = TaskStatus.STOPPED
         parent.error = message
-        if isinstance(parent, ReviewTask) and parent.completed_at is None:
-            parent.completed_at = datetime.now(UTC)
+        if isinstance(parent, ReviewTask):
+            if parent.completed_at is None:
+                parent.completed_at = datetime.now(UTC)
+            mark_unposted(parent)
         rollup_parent_usage(session, parent_type, parent)
 
     interrupt = await get_droid_client().interrupt_run(session_id)

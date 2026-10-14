@@ -210,6 +210,27 @@
     return `${(s / 86400).toFixed(1)} days`;
   }
 
+  // Why a credit figure is only a known subtotal, from economics `credit_attempts` counts ("" when nothing is missing).
+  function creditGaps(counts) {
+    if (!counts) return "";
+    const parts = [];
+    if (Number(counts.unknown)) parts.push(`${Number(counts.unknown)} attempt(s) without observed credits`);
+    if (Number(counts.partial)) parts.push(`${Number(counts.partial)} attempt(s) with snapshot lower-bound credits`);
+    if (Number(counts.legacy_known)) parts.push(`${Number(counts.legacy_known)} legacy summary(ies) with partial credits`);
+    if (Number(counts.legacy_unknown)) parts.push(`${Number(counts.legacy_unknown)} legacy summary(ies) without credits`);
+    return parts.length ? ` (${parts.join(", ")})` : "";
+  }
+
+  // A null outcome on a queued/running review is "not decided yet", not the legacy "predates tracking" case.
+  function reviewOutcomeLabel(review) {
+    const outcome = (review && review.github_outcome) || {};
+    const undecided = !outcome.kind || outcome.kind === "unknown";
+    if (undecided && ["queued", "running"].includes(review && review.status)) {
+      return "Not known yet (the AI review is still running)";
+    }
+    return outcome.label || "Not recorded";
+  }
+
   // Parses a form value as a finite, bounded, non-negative number; returns null when it is not one.
   function parseAmount(raw, { max, allowZero = true }) {
     const text = String(raw ?? "").trim();
@@ -223,6 +244,7 @@
     apiFetch,
     apiJson,
     badge,
+    creditGaps,
     errorMessage,
     escapeHtml,
     formatElapsed,
@@ -233,6 +255,7 @@
     parseAmount,
     hideAlert,
     humanize,
+    reviewOutcomeLabel,
     reviewReadinessBadge,
     runBusy,
     safeUrl,

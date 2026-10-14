@@ -213,6 +213,10 @@ def task_evidence(task_id: int) -> dict[str, Any] | None:
             "usage": {
                 "observed_factory_credits": economics["observed_factory_credits"],
                 "credit_coverage": economics["credit_coverage"],
+                "credit_attempts": economics["credit_attempts"],
+                "usage_coverage": economics["usage_coverage"],
+                "credits_per_accepted_change": economics["credits_per_accepted_change"],
+                "credits_per_accepted_detail": economics["credits_per_accepted_detail"],
                 "unsuccessful_attempt_factory_credits": economics["unsuccessful_attempt_factory_credits"],
                 "attempt_status_counts": economics["attempt_status_counts"],
                 "candidate_review_factory_credits": economics["candidate_reviews"]["observed_factory_credits"],

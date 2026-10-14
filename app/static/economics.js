@@ -29,6 +29,17 @@
     return `Dollars: unknown (coverage ${usd.coverage}; ${counts}).${subtotal} No dollar amount is inferred from credits.`;
   }
 
+  function prReviewCredits(reviews) {
+    if (!reviews || !Number(reviews.count)) return "";
+    const coverage = `credit coverage ${reviews.credit_coverage}${F.creditGaps(reviews.credit_attempts)}`;
+    let value = "unknown";
+    if (known(reviews.observed_factory_credits)) {
+      const subtotal = reviews.credit_coverage === "complete" ? "" : " (known subtotal)";
+      value = `${formatNumber(reviews.observed_factory_credits)}${subtotal}`;
+    }
+    return ` PR reviews, counted separately and not in cost per accepted change: ${Number(reviews.count)} review(s), ${value} credits, ${coverage}.`;
+  }
+
   function renderCards(econ) {
     const pop = econ.population;
     setCard(
@@ -45,18 +56,25 @@
         : "Measured from task creation to operator approval once a change is accepted."
     );
     const credits = econ.credits;
+    let creditsValue = "unknown";
+    if (known(credits.observed)) {
+      creditsValue = credits.coverage === "complete" ? formatNumber(credits.observed) : `${formatNumber(credits.observed)} (known subtotal)`;
+    }
     setCard(
       "credits",
-      known(credits.observed) ? formatNumber(credits.observed) : "unknown",
-      `Coverage ${credits.coverage} over ${Number(credits.attempts)} attempt(s), failed and retried included. ` +
+      creditsValue,
+      `Credit coverage ${credits.coverage}${F.creditGaps(credits.attempt_coverage)} over ${Number(credits.attempts)} attempt(s), failed and retried included. ` +
         `Accepted tasks ${formatNumber(credits.accepted_tasks)}, other tasks ${formatNumber(credits.not_accepted_tasks)}, ` +
-        `${Number(credits.unsuccessful_attempt_count)} unsuccessful attempt(s) used ${formatNumber(credits.unsuccessful_attempts)} of them.`
+        `${Number(credits.unsuccessful_attempt_count)} unsuccessful attempt(s) used ${formatNumber(credits.unsuccessful_attempts)} of them.` +
+        prReviewCredits(econ.pr_reviews)
     );
     const cpa = econ.cost_per_accepted_change;
     let cost = "Unknown";
     if (cpa.state === "available") cost = formatUsd(cpa.usd);
     else if (cpa.state === "no_accepted_changes") cost = "No accepted changes";
-    const creditsPer = known(cpa.credits) ? ` About ${formatNumber(cpa.credits)} credits per accepted change.` : "";
+    let creditsPer = "";
+    if (known(cpa.credits)) creditsPer = ` About ${formatNumber(cpa.credits)} credits per accepted change.`;
+    else if (Number(cpa.denominator) > 0) creditsPer = ` Credits per accepted change: ${cpa.credits_detail}`;
     setCard("cost", cost, `${cpa.detail}${creditsPer} ${cpa.population}`);
     const effort = econ.human_effort;
     const minutes = known(effort.review_minutes) ? Number(effort.review_minutes) + Number(effort.rework_minutes) : null;
