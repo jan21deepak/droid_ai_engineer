@@ -15,6 +15,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import app.database as database
+from app import task_reservations
 from app.auth import reset_sessions_for_tests
 from app.config import get_settings
 from app.droid_client import reset_droid_client_for_tests
@@ -59,6 +60,7 @@ def clean_db(tmp_path):
     get_settings.cache_clear()
     reset_droid_client_for_tests()
     reset_sessions_for_tests()
+    task_reservations.reset_for_tests()
     os.environ["DATABASE_URL"] = f"sqlite:///{tmp_path}/tasks.db"
     os.environ["GITHUB_WEBHOOK_SECRET"] = "test-secret"
     os.environ["TRIGGER_LABEL"] = "Droid-complete"

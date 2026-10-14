@@ -84,6 +84,7 @@ from app.review_policy import (
 from app.run_events import TurnRecorder
 from app.run_limits import RunRefusedError
 from app.run_models import PARENT_REVIEW, PARENT_TASK, AttemptKind, RunAttempt
+from app.task_reservations import Purpose, claim
 
 __all__ = [
     "finalize_merged_running_tasks",
@@ -268,8 +269,24 @@ async def finalize_fix_task(task_id: int, outcome: dict[str, Any], *, attempt_id
     Success records the local candidate the agent left in the workspace. It
     does not push, open a pull request or start publication: those are
     separate app-owned steps gated on checks, review and operator approval.
+
+    From the terminal status until the candidate is recorded the task holds a
+    finalization reservation: the task already looks finished but still shows
+    the previous candidate, so publication must not start in between.
     """
     github = GitHubClient()
+    with claim(task_id, Purpose.FINALIZATION):
+        repository = await _finalize_fix_turn(task_id, outcome, attempt_id)
+    if repository is None:
+        return
+    with db_session() as session:
+        refreshed = session.get(Task, task_id)
+    if refreshed is not None and not policy_denied(OutwardAction.ISSUE_COMMENT, repository, task_id=task_id):
+        await github.post_issue_comment(repository, refreshed.issue_number, build_candidate_comment(refreshed))
+
+
+async def _finalize_fix_turn(task_id: int, outcome: dict[str, Any], attempt_id: int) -> str | None:
+    """Apply the turn's outcome and record its candidate; returns the repository when a candidate was recorded."""
     droid = get_droid_client()
     status = map_outcome_status(outcome)
     summary = (outcome.get("text") or "").strip() or None
@@ -278,7 +295,7 @@ async def finalize_fix_task(task_id: int, outcome: dict[str, Any], *, attempt_id
         task = session.get(Task, task_id)
         if task is None:
             log_event(logger, logging.WARNING, "droid.task_missing", task_id=task_id)
-            return
+            return None
         attempt = claim_active_attempt(session, attempt_id, PARENT_TASK, task_id)
         if attempt is not None:
             old_status = task.status
@@ -296,7 +313,7 @@ async def finalize_fix_task(task_id: int, outcome: dict[str, Any], *, attempt_id
         )
         # A stopped attempt keeps its outcome; only usage it reports late is retained, once.
         retain_late_usage(attempt_id, outcome)
-        return
+        return None
 
     log_event(
         logger,
@@ -311,15 +328,15 @@ async def finalize_fix_task(task_id: int, outcome: dict[str, Any], *, attempt_id
 
     if status != TaskStatus.COMPLETED:
         log_event(logger, logging.WARNING, "task.failed", task_id=task_id, session_id=session_id)
-        return
+        return None
 
     if policy_denied(REPOSITORY_ACCESS, repository, task_id=task_id):
-        return
+        return None
     try:
         state = await droid.inspect_workspace(repository, task_id, extract_branch_name(summary))
     except Exception as exc:
         log_event(logger, logging.WARNING, "task.candidate_inspect_failed", task_id=task_id, error=str(exc))
-        return
+        return None
     candidate_status = record_candidate(task_id, state)
     record_attempt_candidate(attempt_id, state.head_sha)
     log_event(
@@ -331,11 +348,7 @@ async def finalize_fix_task(task_id: int, outcome: dict[str, Any], *, attempt_id
         candidate=candidate_status,
         published=False,
     )
-
-    with db_session() as session:
-        refreshed = session.get(Task, task_id)
-    if refreshed is not None and not policy_denied(OutwardAction.ISSUE_COMMENT, repository, task_id=task_id):
-        await github.post_issue_comment(repository, refreshed.issue_number, build_candidate_comment(refreshed))
+    return repository
 
 
 # ---------------------------------------------------------------------------

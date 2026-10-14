@@ -10,6 +10,7 @@ pushed branch. Nothing here reaches GitHub.
 
 from __future__ import annotations
 
+import json
 import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
@@ -18,6 +19,7 @@ import httpx
 
 from app import droid_client
 from app.candidates import WorkspaceState, record_candidate
+from app.check_config import configured_checks
 from app.config import get_settings
 from app.database import db_session
 from app.delivery_models import CheckResult, CheckRun, CheckStatus
@@ -115,22 +117,41 @@ def recandidate(task_id: int, ws: Path, name: str = "more.txt") -> str:
     return sha
 
 
-def add_check_run(task_id: int, sha: str, status: str = CheckStatus.PASSED, *, evaluated: str | None = None) -> int:
-    """Labeled fixture: an app check run already finished on ``sha``."""
+def add_check_run(
+    task_id: int,
+    sha: str,
+    status: str = CheckStatus.PASSED,
+    *,
+    evaluated: str | None = None,
+    legacy: bool = False,
+) -> int:
+    """Labeled fixture: an app check run of the currently configured checks already finished on ``sha``.
+
+    ``legacy`` stores the names-only configuration written before results were
+    bound to each check's effective specification.
+    """
+    specs = configured_checks().checks
     with db_session() as session:
         run = CheckRun(
             task_id=task_id,
             candidate_sha=sha,
             evaluated_sha=evaluated if evaluated is not None else sha,
             status=status,
-            configuration='["unit"]',
+            configuration=json.dumps([s.name for s in specs] if legacy else [s.identity() for s in specs]),
         )
         session.add(run)
         session.flush()
         result_status = CheckStatus.PASSED if status == CheckStatus.PASSED else CheckStatus.FAILED
-        session.add(
-            CheckResult(run_id=run.id, position=0, name="unit", command="python3 -c 'print(1)'", status=result_status)
-        )
+        for position, spec in enumerate(specs):
+            session.add(
+                CheckResult(
+                    run_id=run.id,
+                    position=position,
+                    name=spec.name,
+                    command=spec.display_command,
+                    status=result_status,
+                )
+            )
         return run.id
 
 

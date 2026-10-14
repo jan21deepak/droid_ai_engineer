@@ -8,6 +8,7 @@ reported as such and blocks approval: no checks is not the same as passing.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import shlex
@@ -32,6 +33,24 @@ class CheckSpec:
     @property
     def display_command(self) -> str:
         return redact_text(shlex.join(self.argv))
+
+    def identity(self) -> dict[str, Any]:
+        """What a recorded result is bound to: the normalized name, ordered argv and effective timeout.
+
+        The argv is stored only as a digest, because it may carry a credential
+        that the redacted display hides; two argvs with the same display still
+        get different digests.
+        """
+        canonical = json.dumps(
+            {"name": self.name, "argv": list(self.argv), "timeout_seconds": self.timeout_seconds},
+            separators=(",", ":"),
+            ensure_ascii=False,
+        )
+        return {
+            "name": self.name,
+            "timeout_seconds": self.timeout_seconds,
+            "spec_sha256": hashlib.sha256(canonical.encode()).hexdigest(),
+        }
 
 
 @dataclass(frozen=True)

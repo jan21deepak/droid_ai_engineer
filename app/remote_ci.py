@@ -17,7 +17,7 @@ from typing import Any
 import httpx
 
 from app.database import db_session
-from app.delivery_models import CIState, Publication
+from app.delivery_models import CIState, Publication, pull_request_state
 from app.github import GitHubClient
 from app.logging_conf import log_event
 from app.policy import repository_decision
@@ -95,8 +95,8 @@ async def _observe(pub: Publication, github: GitHubClient) -> dict[str, Any]:
             raw_head = pr.get("head")
             head: dict[str, Any] = raw_head if isinstance(raw_head, dict) else {}
             fields["pr_head_sha"] = head.get("sha") or pub.pr_head_sha
-            fields["pr_draft"] = bool(pr.get("draft"))
-            fields["pr_state"] = "merged" if pr.get("merged") or pr.get("merged_at") else (pr.get("state") or "open")
+            fields["pr_draft"] = pr.get("draft") is True
+            fields["pr_state"] = pull_request_state(pr) or pub.pr_state
         runs = await github.list_commit_check_runs(pub.repository, pub.candidate_sha)
         combined = await github.get_commit_status(pub.repository, pub.candidate_sha)
     except (httpx.HTTPStatusError, RetryError) as exc:

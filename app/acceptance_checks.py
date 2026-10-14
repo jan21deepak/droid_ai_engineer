@@ -25,13 +25,14 @@ from typing import Any
 from app.agent_env import agent_environment
 from app.check_config import CheckSpec, configured_checks
 from app.database import db_session
-from app.delivery import DeliveryRefusedError, candidate_refusal
+from app.delivery import DeliveryRefusedError, candidate_refusal, delivery_reservation
 from app.delivery_git import checkout_candidate, delivery_dir, remove_checkout
 from app.delivery_models import CheckResult, CheckRun, CheckStatus, bounded_output
 from app.droid_client import task_workspace_dir
 from app.logging_conf import log_event
 from app.models import Task
 from app.redaction import safe_error
+from app.task_reservations import Purpose
 
 logger = logging.getLogger("app.checks")
 
@@ -54,7 +55,7 @@ async def start_check_run(task_id: int) -> dict[str, Any]:
         raise DeliveryRefusedError(
             409, "acceptance_checks_not_configured", reason="FORGE_ACCEPTANCE_CHECKS lists no checks"
         )
-    with db_session() as session:
+    with delivery_reservation(task_id, Purpose.CHECKS), db_session() as session:
         task = session.get(Task, task_id)
         if task is None:
             raise DeliveryRefusedError(404, "task not found")
@@ -70,7 +71,8 @@ async def start_check_run(task_id: int) -> dict[str, Any]:
             task_id=task_id,
             candidate_sha=task.candidate_sha,
             status=CheckStatus.QUEUED,
-            configuration=json.dumps(config.names),
+            # The specs below are exactly what execute_check_run runs, so results bind to them.
+            configuration=json.dumps([spec.identity() for spec in config.checks]),
         )
         session.add(run)
         session.flush()

@@ -39,6 +39,7 @@ from app.redaction import safe_error
 from app.run_events import TurnRecorder
 from app.run_limits import RunRefusedError
 from app.run_models import PARENT_REVIEW, PARENT_TASK, AttemptKind, AttemptStatus, RunAttempt
+from app.task_reservations import Purpose, TaskReservedError, claim
 from app.worker import REPOSITORY_ACCESS, policy_denied
 
 logger = logging.getLogger("app.recovery")
@@ -197,27 +198,13 @@ async def continue_task(task_id: int, kind: str, instruction: str = "") -> dict[
     """
     if kind not in _CONTINUATION_KINDS:
         raise ValueError(f"not a continuation kind: {kind}")
-    with db_session() as session:
-        task = session.get(Task, task_id)
-        if task is None:
-            raise ContinuationRefusedError(404, "task not found")
-        session_id, repository, status = task.droid_session_id, task.repository, task.status
-        previous = latest_attempt(session, PARENT_TASK, task_id)
-        previous_id = previous.id if previous is not None else None
-
-    access = repository_decision(repository)
-    if not access.allowed:
-        raise ContinuationRefusedError(403, "repository is not approved by policy", reason=access.reason)
-    droid = get_droid_client()
-    if not droid.configured:
-        raise ContinuationRefusedError(503, "Droid is not configured (FACTORY_API_KEY missing)")
-    if not session_id:
-        raise ContinuationRefusedError(409, "task has no Droid session to continue")
-    if kind == AttemptKind.RECOVERY and status == TaskStatus.COMPLETED:
-        raise ContinuationRefusedError(409, "task completed; send a follow-up instead of a recovery")
-    if droid.session_busy(session_id):
-        raise ContinuationRefusedError(409, "the Droid session is still running a turn; retry when it finishes")
-    start = _start_continuation_attempt(task_id, kind, previous_id)
+    try:
+        admission = claim(task_id, Purpose.ADMISSION)
+    except TaskReservedError as exc:
+        raise ContinuationRefusedError(exc.status_code, exc.detail, **exc.extra) from None
+    # Held only until the attempt is committed and the task marked active, never through the SDK turn.
+    with admission:
+        start, session_id, repository, droid = _admit_continuation(task_id, kind)
 
     on_complete = partial(worker.finalize_fix_task, task_id, attempt_id=start.attempt_id)
     cwd = task_workspace_dir(repository, task_id)
@@ -264,6 +251,31 @@ async def continue_task(task_id: int, kind: str, instruction: str = "") -> dict[
         "session_id": result.get("session_id") or session_id,
         "status": AttemptStatus.RUNNING if still_active else AttemptStatus.STOPPED,
     }
+
+
+def _admit_continuation(task_id: int, kind: str) -> tuple[AttemptStart, str, str, DroidClient]:
+    """Every admission check, then the committed attempt. Synchronous, so no publication can interleave."""
+    with db_session() as session:
+        task = session.get(Task, task_id)
+        if task is None:
+            raise ContinuationRefusedError(404, "task not found")
+        session_id, repository, status = task.droid_session_id, task.repository, task.status
+        previous = latest_attempt(session, PARENT_TASK, task_id)
+        previous_id = previous.id if previous is not None else None
+
+    access = repository_decision(repository)
+    if not access.allowed:
+        raise ContinuationRefusedError(403, "repository is not approved by policy", reason=access.reason)
+    droid = get_droid_client()
+    if not droid.configured:
+        raise ContinuationRefusedError(503, "Droid is not configured (FACTORY_API_KEY missing)")
+    if not session_id:
+        raise ContinuationRefusedError(409, "task has no Droid session to continue")
+    if kind == AttemptKind.RECOVERY and status == TaskStatus.COMPLETED:
+        raise ContinuationRefusedError(409, "task completed; send a follow-up instead of a recovery")
+    if droid.session_busy(session_id):
+        raise ContinuationRefusedError(409, "the Droid session is still running a turn; retry when it finishes")
+    return _start_continuation_attempt(task_id, kind, previous_id), session_id, repository, droid
 
 
 def _start_continuation_attempt(task_id: int, kind: str, previous_id: int | None) -> AttemptStart:

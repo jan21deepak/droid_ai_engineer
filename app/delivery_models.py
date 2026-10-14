@@ -64,19 +64,31 @@ class CheckRun(Base):
     # What the clean check checkout actually had at HEAD; results only count when it equals candidate_sha.
     evaluated_sha: Mapped[str | None] = mapped_column(String(64), nullable=True)
     status: Mapped[str] = mapped_column(String(32), default=CheckStatus.QUEUED)
-    # JSON list of the configured check names at the time of the run.
+    # JSON list, in run order, of each check's ``CheckSpec.identity()`` (name, timeout, spec digest).
+    # Runs recorded before that binding hold a list of bare names, which no longer count as evidence.
     configuration: Mapped[str] = mapped_column(Text, default="[]")
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
-    def configured_names(self) -> list[str]:
+    def _configuration(self) -> list[Any]:
         try:
-            names = json.loads(self.configuration or "[]")
+            entries = json.loads(self.configuration or "[]")
         except ValueError:
             return []
-        return [str(n) for n in names] if isinstance(names, list) else []
+        return entries if isinstance(entries, list) else []
+
+    def configured_names(self) -> list[str]:
+        return [str(e.get("name") if isinstance(e, dict) else e) for e in self._configuration()]
+
+    def configured_specs(self) -> list[str] | None:
+        """Per-position spec digests, or ``None`` for a names-only (legacy) run."""
+        entries = self._configuration()
+        digests = [e.get("spec_sha256") for e in entries if isinstance(e, dict)]
+        if not entries or len(digests) != len(entries) or not all(isinstance(d, str) and d for d in digests):
+            return None
+        return [str(d) for d in digests]
 
     def to_dict(self, results: list[CheckResult] | None = None) -> dict[str, Any]:
         return {
@@ -86,6 +98,8 @@ class CheckRun(Base):
             "evaluated_sha": self.evaluated_sha,
             "status": self.status,
             "configured_checks": self.configured_names(),
+            # "specification": results are bound to each check's name, argv and timeout; "names_only": legacy.
+            "configuration_binding": "names_only" if self.configured_specs() is None else "specification",
             "error": safe_error(self.error) if self.error else None,
             "created_at": iso_sgt(self.created_at),
             "started_at": iso_sgt(self.started_at),
@@ -166,12 +180,18 @@ class DeliveryApproval(Base):
 
 
 class PublicationStatus:
+    """Outcome of the latest publish attempt. Facts an earlier attempt established
+    (``pushed``, ``pushed_at``, remote head, PR identity) are kept whatever this says."""
+
     PUBLISHING = "publishing"
-    # Pushed, remote head verified, and the draft PR's head is the approved SHA.
+    # Pushed, remote head verified, and the PR is an open, unmerged draft whose head is the approved SHA.
     PUBLISHED = "published"
-    # Failed before any push (e.g. the PR base could not be determined). Nothing changed remotely.
+    # This attempt stopped before pushing (e.g. the PR base could not be determined).
     FAILED = "failed"
-    # The push was rejected or errored; the remote branch was not updated by Forge.
+    # Stopped at the push boundary: the candidate, its activity, evidence, approval, policy or
+    # workspace no longer matched the approval. This attempt made no outward change.
+    REFUSED = "refused"
+    # This attempt's push was rejected or the remote could not be read; Forge did not update the branch.
     PUSH_FAILED = "push_failed"
     # After the push the remote branch head is not the approved SHA.
     REMOTE_MISMATCH = "remote_mismatch"
@@ -179,10 +199,20 @@ class PublicationStatus:
     PR_FAILED = "pr_failed"
     # A PR exists but its head is not the approved SHA.
     PR_HEAD_MISMATCH = "pr_head_mismatch"
+    # The PR at the approved head is not an open, unmerged draft. Forge never converts, reopens or merges it.
+    PR_NONCOMPLIANT = "pr_noncompliant"
     # The service restarted mid-publication; known facts are kept and a retry is allowed.
     INTERRUPTED = "interrupted"
 
-    PARTIAL = (PUSH_FAILED, REMOTE_MISMATCH, PR_FAILED, PR_HEAD_MISMATCH, INTERRUPTED, FAILED)
+    PARTIAL = (PUSH_FAILED, REMOTE_MISMATCH, PR_FAILED, PR_HEAD_MISMATCH, PR_NONCOMPLIANT, INTERRUPTED, FAILED, REFUSED)
+
+
+def pull_request_state(pr: dict[str, Any]) -> str | None:
+    """``merged``, or GitHub's own ``open``/``closed``; ``None`` when the response does not say."""
+    if pr.get("merged") or pr.get("merged_at"):
+        return "merged"
+    state = pr.get("state")
+    return state if isinstance(state, str) and state else None
 
 
 class CIState:
@@ -297,4 +327,5 @@ __all__ = [
     "Publication",
     "PublicationStatus",
     "bounded_output",
+    "pull_request_state",
 ]

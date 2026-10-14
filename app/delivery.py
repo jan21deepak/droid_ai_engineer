@@ -17,14 +17,16 @@ Agent completion alone is none of these.
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any
 
 from sqlalchemy.orm import Session
 
 from app.candidates import CandidateStatus
-from app.check_config import configured_checks
+from app.check_config import CheckConfiguration, configured_checks
 from app.database import db_session
-from app.delivery_git import recheck_candidate_workspace
+from app.delivery_git import WorkspaceRecheck, recheck_candidate_workspace
 from app.delivery_models import (
     CheckResult,
     CheckRun,
@@ -39,6 +41,7 @@ from app.models import ReviewTask, Task, TaskStatus
 from app.policy import OutwardAction, configured_publication_branch, outward_decision, repository_decision
 from app.review_outcomes import REVIEW_TARGET_CANDIDATE
 from app.review_policy import REVIEW_POLICY_RESTRICTED, ReviewVerdict
+from app.task_reservations import Purpose, Reservation, TaskReservedError, claim
 
 logger = logging.getLogger("app.delivery")
 
@@ -94,7 +97,7 @@ def check_results(session: Session, run_id: int) -> list[CheckResult]:
     return session.query(CheckResult).filter(CheckResult.run_id == run_id).order_by(CheckResult.position).all()
 
 
-def _check_status(run: CheckRun | None, results: list[CheckResult], configured: list[str]) -> str:
+def _check_status(run: CheckRun | None, results: list[CheckResult], config: CheckConfiguration) -> str:
     if run is None:
         return "missing"
     if run.status in CheckStatus.ACTIVE:
@@ -103,9 +106,13 @@ def _check_status(run: CheckRun | None, results: list[CheckResult], configured: 
         return "failed"
     if run.status != CheckStatus.PASSED or run.evaluated_sha != run.candidate_sha:
         return "incomplete"
-    passed = {r.name for r in results if r.status == CheckStatus.PASSED}
-    if not set(configured) <= passed or any(r.required and r.status != CheckStatus.PASSED for r in results):
-        # A check added to the configuration since this run has not been run on this SHA.
+    specs = run.configured_specs()
+    if specs is None or any(r.required and r.status != CheckStatus.PASSED for r in results):
+        # Names-only evidence cannot show which command ran, so it needs a rerun.
+        return "outdated_configuration"
+    passed = {specs[r.position] for r in results if r.status == CheckStatus.PASSED and r.position < len(specs)}
+    if not {spec.identity()["spec_sha256"] for spec in config.checks} <= passed:
+        # A check was added, or a check's argv or timeout changed, since this run.
         return "outdated_configuration"
     return "passed"
 
@@ -119,7 +126,7 @@ def checks_summary(session: Session, task: Task) -> dict[str, Any]:
     elif not config.checks:
         status = "not_configured"
     else:
-        status = _check_status(run, results, config.names)
+        status = _check_status(run, results, config)
     history = session.query(CheckRun).filter(CheckRun.task_id == task.id).order_by(CheckRun.id.desc())
     return {
         "status": status,
@@ -148,7 +155,8 @@ _CHECK_BLOCKERS = {
     "running": "acceptance checks are still running",
     "failed": "a required acceptance check failed on this candidate",
     "incomplete": "the latest acceptance check run did not complete",
-    "outdated_configuration": "the configured checks changed since the last run; run them again",
+    "outdated_configuration": "the configured checks (names, commands or timeouts) changed since the last run, "
+    "or the run predates command-bound evidence; run them again",
 }
 
 
@@ -408,53 +416,93 @@ def task_snapshot(task: Task) -> Task:
     )
 
 
+@contextmanager
+def delivery_reservation(task_id: int, purpose: str) -> Iterator[Reservation]:
+    """Hold a task reservation (``app.task_reservations``), refusing with ``DeliveryRefusedError`` on conflict."""
+    try:
+        reservation = claim(task_id, purpose)
+    except TaskReservedError as exc:
+        raise DeliveryRefusedError(exc.status_code, exc.detail, **exc.extra) from None
+    with reservation:
+        yield reservation
+
+
+def workspace_refusal(recheck: WorkspaceRecheck) -> DeliveryRefusedError | None:
+    if recheck.ok:
+        return None
+    return DeliveryRefusedError(
+        409, recheck.code or "stale_candidate", reason=recheck.problem, workspace_sha=recheck.head_sha
+    )
+
+
+def publication_gate(session: Session, task: Task, sha: str) -> DeliveryApproval:
+    """Every recorded precondition for publishing ``sha`` now; returns the approval it rests on or raises."""
+    refusal = stale_refusal(task, sha) or candidate_refusal(task)
+    if refusal is not None:
+        raise refusal
+    dest = destination(task)
+    if not dest["allowed"]:
+        raise DeliveryRefusedError(403, "policy_denied", reason=dest["reason"], destination=dest)
+    blockers = publish_blockers(session, task)
+    approval = current_approval(session, task)
+    if blockers or approval is None:
+        raise DeliveryRefusedError(409, "not_ready_to_publish", blockers=blockers)
+    return approval
+
+
+def _approvable(session: Session, task_id: int, sha: str) -> Task:
+    task = session.get(Task, task_id)
+    if task is None:
+        raise DeliveryRefusedError(404, "task not found")
+    refusal = stale_refusal(task, sha) or candidate_refusal(task)
+    if refusal is not None:
+        raise refusal
+    blockers = approval_blockers(session, task)
+    if blockers:
+        raise DeliveryRefusedError(409, "not_ready_for_approval", blockers=blockers)
+    return task
+
+
 async def approve_candidate(task_id: int, sha: str, *, approved_via: str) -> dict[str, Any]:
-    """Record the operator's approval of exactly ``sha``, after rechecking evidence and the workspace."""
-    with db_session() as session:
-        task = session.get(Task, task_id)
-        if task is None:
-            raise DeliveryRefusedError(404, "task not found")
-        refusal = stale_refusal(task, sha) or candidate_refusal(task)
+    """Record the operator's approval of exactly ``sha``, after rechecking evidence and the workspace.
+
+    A repeat for an already approved candidate returns that approval only after
+    the same workspace recheck, so a dirty or moved workspace is refused either way.
+    """
+    with delivery_reservation(task_id, Purpose.APPROVAL):
+        with db_session() as session:
+            snapshot = task_snapshot(_approvable(session, task_id, sha))
+
+        refusal = workspace_refusal(await recheck_candidate_workspace(snapshot))
         if refusal is not None:
             raise refusal
-        blockers = approval_blockers(session, task)
-        if blockers:
-            raise DeliveryRefusedError(409, "not_ready_for_approval", blockers=blockers)
-        existing = current_approval(session, task)
-        if existing is not None:
-            return {"approval": existing.to_dict(current=True), "already_approved": True}
-        snapshot = task_snapshot(task)
 
-    recheck = await recheck_candidate_workspace(snapshot)
-    if not recheck.ok:
-        raise DeliveryRefusedError(
-            409, recheck.code or "stale_candidate", reason=recheck.problem, workspace_sha=recheck.head_sha
-        )
-
-    with db_session() as session:
-        task = session.get(Task, task_id)
-        if task is None:
-            raise DeliveryRefusedError(404, "task not found")
-        if task.candidate_sha != sha or task.candidate_generation != snapshot.candidate_generation:
-            raise DeliveryRefusedError(409, "stale_candidate", reason="the candidate changed during approval")
-        blockers = approval_blockers(session, task)
-        if blockers:
-            raise DeliveryRefusedError(409, "not_ready_for_approval", blockers=blockers)
-        run = latest_check_run(session, task.id, sha)
-        review = review_summary(session, task)["latest"]
-        approval = DeliveryApproval(
-            task_id=task.id,
-            candidate_sha=sha,
-            candidate_generation=task.candidate_generation or 0,
-            approved_via=approved_via,
-            check_run_id=run.id if run else None,
-            review_id=review["id"] if review else None,
-        )
-        session.add(approval)
-        session.flush()
-        result = approval.to_dict(current=True)
+        with db_session() as session:
+            task = _approvable(session, task_id, sha)
+            if task.candidate_generation != snapshot.candidate_generation:
+                raise DeliveryRefusedError(409, "stale_candidate", reason="the candidate changed during approval")
+            existing = current_approval(session, task)
+            if existing is not None:
+                return {"approval": existing.to_dict(current=True), "already_approved": True}
+            result = _record_approval(session, task, sha, approved_via)
     log_event(logger, logging.INFO, "delivery.approved", task_id=task_id, sha=sha, approval_id=result["id"])
     return {"approval": result, "already_approved": False}
+
+
+def _record_approval(session: Session, task: Task, sha: str, approved_via: str) -> dict[str, Any]:
+    run = latest_check_run(session, task.id, sha)
+    review = review_summary(session, task)["latest"]
+    approval = DeliveryApproval(
+        task_id=task.id,
+        candidate_sha=sha,
+        candidate_generation=task.candidate_generation or 0,
+        approved_via=approved_via,
+        check_run_id=run.id if run else None,
+        review_id=review["id"] if review else None,
+    )
+    session.add(approval)
+    session.flush()
+    return approval.to_dict(current=True)
 
 
 __all__ = [
@@ -464,12 +512,15 @@ __all__ = [
     "candidate_refusal",
     "candidate_reviews",
     "current_approval",
+    "delivery_reservation",
     "delivery_state",
     "destination",
     "latest_check_run",
     "publication_for",
+    "publication_gate",
     "publish_blockers",
     "stale_refusal",
     "task_delivery",
     "task_snapshot",
+    "workspace_refusal",
 ]

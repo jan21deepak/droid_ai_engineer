@@ -15,7 +15,7 @@ import logging
 from typing import Any
 
 from app.database import db_session
-from app.delivery import DeliveryRefusedError, candidate_refusal
+from app.delivery import DeliveryRefusedError, candidate_refusal, delivery_reservation
 from app.delivery_git import prepare_candidate_review_context
 from app.droid_client import DroidRunError, get_droid_client
 from app.logging_conf import log_event
@@ -23,6 +23,7 @@ from app.models import ReviewTask, Task, TaskStatus
 from app.redaction import safe_error
 from app.repos import resolve_agent_launch_config
 from app.review_outcomes import REVIEW_TARGET_CANDIDATE
+from app.task_reservations import Purpose
 from app.worker import (
     REPOSITORY_ACCESS,
     _fail_review,
@@ -37,7 +38,7 @@ logger = logging.getLogger("app.candidate_review")
 
 async def start_candidate_review(task_id: int) -> dict[str, Any]:
     """Create a candidate review row for the task's current candidate and launch it in the background."""
-    with db_session() as session:
+    with delivery_reservation(task_id, Purpose.CANDIDATE_REVIEW), db_session() as session:
         task = session.get(Task, task_id)
         if task is None:
             raise DeliveryRefusedError(404, "task not found")

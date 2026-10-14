@@ -5,12 +5,10 @@ Pushes go to a labeled local bare repository standing in for GitHub
 reaches the real remote.
 """
 
-import asyncio
-
 import pytest
 from sqlalchemy import create_engine, inspect, text
 
-from app import database, publishing
+from app import database, publishing, task_reservations
 from app.config import get_settings
 from app.database import db_session
 from app.delivery import DeliveryRefusedError, approve_candidate, task_delivery
@@ -277,8 +275,7 @@ class TestRefusedBeforeAnyOutwardEffect:
     @pytest.mark.asyncio
     async def test_concurrent_publish_is_refused(self, remote, github):
         task_id, sha = await approved_candidate(remote)
-        lock = publishing._locks.setdefault(task_id, asyncio.Lock())
-        async with lock:
+        with task_reservations.claim(task_id, task_reservations.Purpose.PUBLICATION):
             error = await refused(task_id, sha, github)
         assert (error.status_code, error.detail) == (409, "publication_in_progress")
         assert github.calls == []

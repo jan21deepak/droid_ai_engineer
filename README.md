@@ -413,7 +413,11 @@ blocker):
    list of `{"name", "argv", "timeout_seconds"}`; argv runs without a shell) in a fresh
    clone checked out at the candidate SHA, with the clean agent environment. The
    evaluated SHA is recorded; no configuration, an invalid one, or any failed, timed-out
-   or interrupted check blocks approval.
+   or interrupted check blocks approval. Each result is bound to its check's name,
+   ordered argv and effective timeout (the argv is stored only as a digest), so changing
+   a check's command or timeout under the same name, including across a restart, needs a
+   rerun (`checks_outdated_configuration`). Runs recorded before this binding (names
+   only) need a rerun too.
 2. `POST /api/tasks/{id}/candidate-review` starts a restricted Read/Grep/Glob review of
    the exact `base..candidate` diff. Its verdict is local evidence; nothing is posted.
 3. `POST /api/tasks/{id}/approve` with `{"candidate_sha": "<full sha>"}` records the
@@ -424,8 +428,18 @@ blocker):
    dirty is refused), pushes that SHA without force to the candidate's branch (which
    must be listed in `FORGE_ALLOWED_BRANCHES` and must not be the default branch),
    reads the remote head back, then creates or reuses a draft PR and checks its head.
+   Publication is complete only when that PR is open, unmerged and a draft; anything else
+   is `pr_noncompliant` and Forge never converts, reopens or merges it. After the GitHub
+   and remote lookups, the candidate, its activity, evidence, approval, policy and a clean
+   workspace are all rechecked immediately before the push (`refused` if any changed).
    A partial failure returns **502** with what is known (pushed or not, remote head,
-   PR); retrying continues without a second push or PR.
+   PR); a later attempt's error never erases an earlier attempt's push or PR, and
+   retrying continues without a second push or PR. Repeating approve or publish for an
+   already approved or published candidate still rechecks the workspace first.
+   While a publication runs, follow-up, recovery, new checks, a new candidate review and
+   approval for that task are refused with **409** `publication_in_progress`; a publish
+   request while one of those is being admitted, or while a finished turn is still
+   recording its candidate, is refused with **409** `task_busy`.
 5. `POST /api/tasks/{id}/ci/refresh` (and the poller) read GitHub check runs and
    commit statuses for the published SHA: `pending`, `failing`, `passing`,
    `none_reported` or `unavailable` (never treated as passing). Remote CI is observed

@@ -77,8 +77,10 @@ async def approve(task_id: int, payload: CandidateRequest, request: Request) -> 
 async def publish(task_id: int, payload: CandidateRequest) -> JSONResponse | dict[str, Any]:
     """Push the approved candidate to its allowed branch and create or reuse a draft PR.
 
+    Complete only when the PR is an open, unmerged draft at the approved SHA.
     502 reports a partial publication with every known fact (pushed or not,
     remote head, PR); retrying continues without duplicating the push or PR.
+    409 ``publication_in_progress`` or ``task_busy`` means another task change holds the task.
     """
     try:
         result = await publish_candidate(task_id, payload.candidate_sha)
