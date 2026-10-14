@@ -22,7 +22,9 @@ from app.config import ACCESS_MODE_PROTECTED, effective_access_mode, get_setting
 from app.database import check_db_connectivity, db_session, init_db
 from app.delivery_routes import router as delivery_router
 from app.droid_client import get_droid_client
+from app.economics_routes import router as economics_router
 from app.error_tracking import init_error_tracking
+from app.evidence_export import router as evidence_router
 from app.github import GitHubClient
 from app.intake import router as intake_router
 from app.logging_conf import log_event, setup_logging
@@ -89,6 +91,8 @@ app.include_router(intake_router)
 app.include_router(repository_router)
 app.include_router(run_router)
 app.include_router(delivery_router)
+app.include_router(economics_router)
+app.include_router(evidence_router)
 app.include_router(review_router)
 app.include_router(ui_router)
 

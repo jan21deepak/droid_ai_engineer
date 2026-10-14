@@ -123,6 +123,7 @@
     $("#overview-reviews").innerHTML = `PR reviews: ${Number(reviews.pr_reviews_total || 0)} total,
       ${Number(reviews.pr_reviews_active || 0)} active, ${Number(reviews.pr_reviews_completed || 0)} completed.
       <a href="#reviews" data-tab-link="reviews">Assign or inspect PR reviews</a>.`;
+    window.ForgeEconomics?.render(data.economics);
     $("#overview-status").textContent = "Overview updated.";
   }
 

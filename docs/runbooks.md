@@ -61,9 +61,27 @@ GitHub rejects APPROVE/REQUEST_CHANGES from the token owner's own PRs. Forge
 falls back to COMMENT automatically; if the fallback also fails, check
 `github.review_post_failed` in the logs and the token's scopes.
 
+### Cost per accepted change says "unknown"
+
+Expected until every attempt has a dollar value. Factory credits are observations;
+Forge never converts them to dollars on its own. Record an explicit estimate
+(`FORGE_USD_PER_CREDIT_ESTIMATE` with `FORGE_USD_ESTIMATE_SOURCE`) or a reconciled
+amount on each attempt, and check `usd.attempts_unknown` in `GET /api/economics`.
+A `no_accepted_changes` state means no candidate has been approved yet. The capacity
+scenario stays empty until baseline assumptions are saved and each accepted change
+has human review/rework minutes; those values are user-entered, not measured.
+
+### Sharing evidence for one task
+
+Use **Preview evidence** or **Download JSON** on the task page
+(`GET /api/tasks/{id}/evidence?download=true`, operator sign-in required). The file
+covers only that task and omits summaries, thinking, tool/check output and
+credentials, but it does include repository names, SHAs and user-entered notes, so
+review it before sending it anywhere. Forge itself uploads nothing.
+
 ## Escalation
 
-- Dashboard: `GET /dashboard` (task history, KPIs, session ids).
+- Dashboard: `GET /dashboard` (overview, task history, agent activity indicators, session ids).
 - Metrics: `GET /metrics` for success-rate and runtime regressions.
 - Logs are single-line structured SGT events; grep by `task_id=` or `session_id=`.
 - For Factory-side problems (credits, model availability), check

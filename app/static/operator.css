@@ -196,3 +196,44 @@ code.sha {
         grid-template-columns: 1fr;
     }
 }
+
+/* Outcome economics, capability guide and evidence export. */
+.econ-card,
+.econ-panel {
+    border: 1px solid var(--nf-border);
+    border-radius: 0.5rem;
+    padding: 0.75rem;
+    background: var(--nf-surface);
+}
+
+.econ-card .stat-value {
+    color: var(--nf-cyan);
+}
+
+.econ-notes li {
+    margin-bottom: 0.2rem;
+}
+
+.capability-table td,
+.capability-table th {
+    vertical-align: top;
+    white-space: normal;
+    min-width: 12rem;
+}
+
+.capability-table th[scope="row"] {
+    width: 18%;
+}
+
+.evidence-preview {
+    max-height: 26rem;
+    overflow: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-size: 0.78rem;
+    padding: 0.75rem;
+    border: 1px solid var(--nf-border);
+    border-radius: 0.4rem;
+    background: var(--nf-surface-solid);
+    color: var(--nf-text);
+}

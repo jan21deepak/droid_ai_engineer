@@ -186,13 +186,51 @@
     return badge(`${prefix}${label}`, tone);
   }
 
+  // Economics values: null/undefined is unknown and is never shown as zero.
+  function known(value) {
+    return value !== null && value !== undefined && Number.isFinite(Number(value));
+  }
+
+  function formatNumber(value, digits = 2) {
+    if (!known(value)) return "unknown";
+    return Number(value).toLocaleString("en-US", { maximumFractionDigits: digits });
+  }
+
+  function formatUsd(value) {
+    if (!known(value)) return "unknown";
+    return `$${Number(value).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+  }
+
+  function formatElapsed(seconds) {
+    if (!known(seconds)) return "unknown";
+    const s = Number(seconds);
+    if (s < 60) return `${Math.round(s)} s`;
+    if (s < 3600) return `${(s / 60).toFixed(1)} min`;
+    if (s < 172800) return `${(s / 3600).toFixed(1)} h`;
+    return `${(s / 86400).toFixed(1)} days`;
+  }
+
+  // Parses a form value as a finite, bounded, non-negative number; returns null when it is not one.
+  function parseAmount(raw, { max, allowZero = true }) {
+    const text = String(raw ?? "").trim();
+    if (!/^[0-9]+(\.[0-9]+)?$/.test(text)) return null;
+    const value = Number(text);
+    if (!Number.isFinite(value) || value > max || (!allowZero && value === 0)) return null;
+    return value;
+  }
+
   window.Forge = {
     apiFetch,
     apiJson,
     badge,
     errorMessage,
     escapeHtml,
+    formatElapsed,
+    formatNumber,
     formatSgt,
+    formatUsd,
+    known,
+    parseAmount,
     hideAlert,
     humanize,
     reviewReadinessBadge,

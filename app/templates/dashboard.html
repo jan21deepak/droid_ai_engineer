@@ -195,55 +195,50 @@
                 </div>
             </div>
 
-            <div class="card shadow-sm border-0 mb-4 roi-card">
-                <div class="card-body">
-                    <div class="text-muted small text-uppercase mb-1">
-                        Time-to-Dollar Savings
-                        <span class="metric-info" data-bs-toggle="tooltip" data-bs-title="Engineering cost avoided by Droid. Counts are real: {{ stats.fix.completed }} completed fixes and {{ stats.review.completed }} completed reviews. Each is valued at the human effort it replaced — {{ stats.assumptions.junior_hours_per_issue }}h per fix and {{ stats.assumptions.junior_hours_per_review }}h per review at ${{ '%.2f'|format(stats.assumptions.junior_hourly_usd) }}/hr (a ${{ '{:,.0f}'.format(stats.assumptions.junior_swe_annual_cost_usd) }} junior SWE over 1,920 hrs) — minus Droid agent run cost estimate of ${{ '%.2f'|format(stats.agent_cost_usd) }}. The hours-per-item rates are configurable assumptions; everything else is measured.">i</span>
-                    </div>
-                    <div class="stat-value text-success" data-metric="productivity_gained_usd">${{ '%.2f'|format(stats.productivity_gained_usd) }}</div>
-                    <div class="text-muted small mt-1">
-                        combined fix + review cost avoidance vs junior SWE FTE
-                        <span data-metric="cost_avoidance_percent">({{ stats.cost_avoidance_percent }}%)</span>
-                    </div>
+            <div class="card shadow-sm border-0 mb-4">
+                <div class="card-body small">
+                    <p class="mb-1"><strong>Outcome economics are on the <a href="#overview" data-tab-link="overview">Overview</a>.</strong>
+                        They count accepted changes, observed Factory credits, dollar coverage and user-entered human effort.</p>
+                    <p class="mb-0 text-muted">This tab shows agent activity only. Runtime here is active Droid working time, and failure
+                        counts are agent runs. Neither is a delivery or production metric, and nothing here is a cash saving.</p>
                 </div>
             </div>
 
             <div class="card shadow-sm border-0 mb-4">
-                <div class="card-header fw-semibold">Engineering KPIs</div>
+                <div class="card-header fw-semibold">Agent activity indicators</div>
                 <div class="card-body">
                     <div class="row g-3">
                         <div class="col-6 col-lg">
                             <div class="text-muted small text-uppercase mb-1">
-                                Avg PR Cycle Time
-                                <span class="metric-info" data-bs-toggle="tooltip" data-bs-title="Average active Droid working time to open a PR. Sample: {{ stats.engineering.pr_cycle_time_sample }} completed fix session(s). Shorter means changes reach review faster.">i</span>
+                                Avg agent time per completed fix
+                                <span class="metric-info" data-bs-toggle="tooltip" data-bs-title="Average active Droid working time per completed fix session, as reported by the session. Sample: {{ stats.engineering.pr_cycle_time_sample }} completed fix session(s). This is not end-to-end pull request cycle time.">i</span>
                             </div>
                             <div class="stat-value fs-4" data-metric="eng.pr_cycle_time_hours">{{ stats.engineering.pr_cycle_time_hours }}</div>
-                            <div class="text-muted small">avg hours of active work</div>
+                            <div class="text-muted small">avg hours of active agent work; not end-to-end pull request cycle time</div>
                         </div>
                         <div class="col-6 col-lg">
                             <div class="text-muted small text-uppercase mb-1">
-                                PRs Delivered (7d)
-                                <span class="metric-info" data-bs-toggle="tooltip" data-bs-title="Distinct pull requests opened by Droid fix sessions in the last 7 days ({{ stats.engineering.prs_total }} PR(s) all-time). One issue produces one PR, so this is lower than the completed-runs count, which also includes reviews.">i</span>
+                                PRs recorded (7d)
+                                <span class="metric-info" data-bs-toggle="tooltip" data-bs-title="Distinct pull requests recorded on fix tasks in the last 7 days ({{ stats.engineering.prs_total }} PR(s) all-time). One issue produces one PR, so this is lower than the completed-runs count, which also includes reviews.">i</span>
                             </div>
                             <div class="stat-value fs-4" data-metric="eng.prs_last_7_days">{{ stats.engineering.prs_last_7_days }}</div>
-                            <div class="text-muted small">PRs opened in last 7 days</div>
+                            <div class="text-muted small">PRs recorded in last 7 days</div>
                         </div>
                         <div class="col-6 col-lg">
                             <div class="text-muted small text-uppercase mb-1">
-                                Merge Rate
-                                <span class="metric-info" data-bs-toggle="tooltip" data-bs-title="Share of every PR Droid opened that has landed on the default branch: {{ stats.engineering.prs_merged }} merged of {{ stats.engineering.prs_total }} PR(s), with {{ stats.engineering.prs_open }} still open and {{ stats.engineering.prs_closed }} closed unmerged. Merge state is read from GitHub for each PR.">i</span>
+                                Merged (observed)
+                                <span class="metric-info" data-bs-toggle="tooltip" data-bs-title="Share of recorded PRs observed as merged on GitHub; Forge never merges: {{ stats.engineering.prs_merged }} merged of {{ stats.engineering.prs_total }} PR(s), with {{ stats.engineering.prs_open }} still open and {{ stats.engineering.prs_closed }} closed unmerged. Merge state is read from GitHub for each PR.">i</span>
                             </div>
                             <div class="stat-value fs-4"><span data-metric="eng.merge_rate_percent">{{ stats.engineering.merge_rate_percent }}</span>%</div>
                             <div class="text-muted small"><span data-metric="eng.merge_detail">{{ stats.engineering.prs_merged }} of {{ stats.engineering.prs_total }} PRs merged</span></div>
                         </div>
                         <div class="col-6 col-lg">
                             <div class="text-muted small text-uppercase mb-1">
-                                Change Failure Rate
-                                <span class="metric-info" data-bs-toggle="tooltip" data-bs-title="Share of every finished Droid run — fixes and reviews — that ended in failure rather than a usable result: {{ stats.engineering.runs_failed }} failed out of {{ stats.engineering.runs_finished }} finished run(s), made up of {{ stats.engineering.fixes_failed }}/{{ stats.engineering.fixes_finished }} fixes and {{ stats.engineering.reviews_failed }}/{{ stats.engineering.reviews_finished }} reviews. Rising values mean Droid is burning spend without shipping.">i</span>
+                                Agent run failure rate
+                                <span class="metric-info" data-bs-toggle="tooltip" data-bs-title="Share of finished Droid runs (fixes and reviews) that failed: {{ stats.engineering.runs_failed }} of {{ stats.engineering.runs_finished }}, made up of {{ stats.engineering.fixes_failed }}/{{ stats.engineering.fixes_finished }} fixes and {{ stats.engineering.reviews_failed }}/{{ stats.engineering.reviews_finished }} reviews. This is not the DORA change failure rate, which counts failed production changes.">i</span>
                             </div>
                             <div class="stat-value fs-4"><span data-metric="eng.change_failure_rate_percent">{{ stats.engineering.change_failure_rate_percent }}</span>%</div>
-                            <div class="text-muted small"><span data-metric="eng.failure_detail">{{ stats.engineering.runs_failed }} of {{ stats.engineering.runs_finished }} runs failed</span></div>
+                            <div class="text-muted small"><span data-metric="eng.failure_detail">{{ stats.engineering.runs_failed }} of {{ stats.engineering.runs_finished }} runs failed</span>; not the DORA change failure rate</div>
                         </div>
                     </div>
                 </div>
@@ -381,6 +376,7 @@
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
 <script src="/static/forge_common.js?v={{ asset_version }}"></script>
 <script src="/static/dashboard.js?v={{ asset_version }}"></script>
+<script src="/static/economics.js?v={{ asset_version }}"></script>
 <script src="/static/overview.js?v={{ asset_version }}"></script>
 </body>
 </html>

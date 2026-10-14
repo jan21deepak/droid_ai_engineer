@@ -114,20 +114,22 @@ def test_dashboard_renders(client):
     assert "Assign to Droid Review" not in resp.text
     assert "Fix Time Stats" in resp.text
     assert "Review Time Stats" in resp.text
-    assert "Engineering KPIs" in resp.text
-    assert "Avg PR Cycle Time" in resp.text
-    assert "PRs Delivered (7d)" in resp.text
-    assert "Merge Rate" in resp.text
-    assert "Change Failure Rate" in resp.text
-    assert "Time-to-Dollar Savings" in resp.text
+    assert "Agent activity indicators" in resp.text
+    assert "Avg agent time per completed fix" in resp.text
+    assert "PRs recorded (7d)" in resp.text
+    assert "Merged (observed)" in resp.text
+    assert "Avg PR Cycle Time" not in resp.text
+    assert "Time-to-Dollar" not in resp.text
+    assert "Agent run failure rate" in resp.text
+    assert "Change Failure Rate" not in resp.text
     assert "Droid Forge" in resp.text
     assert "The AI Engineer That Delivers" in resp.text
     assert 'data-bs-theme="dark"' in resp.text
     assert "Daily Activity" in resp.text
     assert 'id="daily-chart"' in resp.text
     assert "last 14 days · SGT" in resp.text
-    # Status cards, KPIs, ROI figure and the daily chart all carry explanations
-    assert resp.text.count('class="metric-info"') == 12
+    # Status cards, activity indicators and the daily chart all carry explanations
+    assert resp.text.count('class="metric-info"') == 11
     assert "Droid Runs Completed" in resp.text
     assert "PRs merged" in resp.text
     assert "Tokens Used" not in resp.text

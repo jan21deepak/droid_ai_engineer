@@ -416,6 +416,7 @@
     renderAttempts();
     renderTimeline(timeline.ok ? timeline.data : null);
     $("#detail-status").textContent = `Task status: ${humanize(state.task.status)}.`;
+    document.dispatchEvent(new CustomEvent("forge:task-updated"));
     if (needsPolling()) pollTimer = setTimeout(load, POLL_MS);
   }
 

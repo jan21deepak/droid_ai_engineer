@@ -32,41 +32,61 @@ Droid sessions run **locally, next to the forge app** — in your venv, your lap
 ```mermaid
 flowchart LR
     ISSUE["GitHub Issue<br/>labeled Droid-complete"]
-    WEB["Droid Forge FastAPI<br/>POST /webhook / Assign"]
-    DB[("SQLite<br/>Task + Repo store<br/>per-repo model + setup cmd")]
-    WS["Workspace Clones<br/>credential-free origin"]
-    SDK["droid-sdk Sessions<br/>autonomy HIGH"]
-    FIX["Droid Fix Agent<br/>code, test, commit"]
-    CAND["Local candidate<br/>base + head SHA"]
-    PR["Pull Request<br/>assigned for review"]
-    REV["Restricted Droid Review<br/>Read / Grep / Glob"]
-    GRV["GitHub PR Review<br/>approve / request changes"]
-    WORK["Worker loop<br/>PR state observation"]
-    DASH["Dashboard<br/>GET /dashboard"]
-    METRICS["Metrics<br/>GET /metrics"]
+    WEB["Droid Forge FastAPI<br/>signed /webhook or Assign<br/>operator sign-in"]
+    DB[("SQLite<br/>tasks, attempts, usage,<br/>checks, approvals")]
+    WS["Workspace clone<br/>credential-free origin"]
+    SDK["droid-sdk turn<br/>clean agent environment<br/>one paid turn at a time"]
+    CAND["Local candidate<br/>base + head SHA<br/>agent never pushes"]
+    CHECKS["App-run acceptance checks<br/>clean checkout at SHA"]
+    CREV["Restricted candidate review<br/>Read / Grep / Glob on exact diff"]
+    APPROVE["Operator approval<br/>bound to one SHA"]
+    PUSH["App-owned publish<br/>policy-gated, no force<br/>transient scoped token"]
+    PR["Draft pull request"]
+    CI["Remote CI<br/>observed read-only"]
+    PRREV["PR review by number<br/>restricted Droid review"]
+    UI["Overview, task detail,<br/>economics, evidence export"]
 
     ISSUE -->|"webhook / assign"| WEB
-    WEB -->|"persist Task"| DB
-    DB -->|"model + setup command"| WS
-    WEB -->|"launch background task"| SDK
+    WEB -->|"persist task"| DB
+    WEB -->|"launch attempt"| SDK
     WS -->|"session cwd"| SDK
-    SDK --> FIX
-    FIX -->|"BRANCH: committed"| CAND
-    CAND -.->|"separate delivery step"| PR
-    PR --> REV --> GRV
-    FIX -->|"summary, duration, credits"| DB
-    WORK -->|"PR open/merged"| DB
-    DB -.-> DASH
-    DB -.-> METRICS
+    SDK -->|"commit on branch"| CAND
+    CAND --> CHECKS
+    CAND --> CREV
+    CHECKS -->|"passed on SHA"| APPROVE
+    CREV -->|"approving on SHA"| APPROVE
+    APPROVE -->|"explicit publish request"| PUSH
+    PUSH --> PR
+    PR --> CI
+    PR -.->|"assigned for review"| PRREV
+    SDK -->|"credits, status per attempt"| DB
+    CHECKS --> DB
+    CREV --> DB
+    APPROVE --> DB
+    CI -->|"state + observed time"| DB
+    DB -.-> UI
+
+    NOMERGE["Forge never merges"]
+    CI -.- NOMERGE
+
+    classDef droid fill:#a855f7,stroke:#6b21a8,color:#fff
+    classDef gh fill:#10b981,stroke:#047857,color:#fff
+    classDef gate fill:#0ea5e9,stroke:#0369a1,color:#fff
+    classDef note fill:#1f2937,stroke:#6b7280,color:#e5e7eb
+    class SDK,CREV,PRREV droid
+    class PR,CI,ISSUE gh
+    class CHECKS,APPROVE,PUSH gate
+    class NOMERGE note
 ```
 
-Source: [`docs/architecture.mmd`](docs/architecture.mmd). To regenerate the PNG:
+The PNG and the block above render the same source, [`docs/architecture.mmd`](docs/architecture.mmd).
+Keep them in sync; to regenerate the PNG:
 
 ```bash
 npx -p @mermaid-js/mermaid-cli mmdc \
   -i docs/architecture.mmd \
   -o docs/architecture.png \
-  -b "#0b1220" -w 1500 -s 1
+  -t dark -b "#0b1220" --size 1800 -s 1
 ```
 
 ## Technology Stack
@@ -139,7 +159,7 @@ Generate the operator token locally and keep it out of commits, logs and
 screenshots, e.g. `python3 -c 'import secrets; print(secrets.token_urlsafe(36))'`.
 See [Operator access](#operator-access) for the full access model.
 
-Optional: `DROID_MODEL` (default `auto` = Factory Router), `DROID_AUTONOMY` (default `high`, fix sessions; reviews always use the restricted tool set), `DROID_USD_PER_AGENT_RUN` for ROI estimates, `DROID_TURN_TIMEOUT_SECONDS` (default 3600) for the per-turn wall-clock budget.
+Optional: `DROID_MODEL` (default `auto` = Factory Router), `DROID_AUTONOMY` (default `high`, fix sessions; reviews always use the restricted tool set), `DROID_USD_PER_AGENT_RUN` for the legacy assumption-based `/metrics` estimate, `DROID_TURN_TIMEOUT_SECONDS` (default 3600) for the per-turn wall-clock budget.
 
 Verify the Droid key (the SDK uses the same key):
 
@@ -476,7 +496,10 @@ to commit on that checked-out branch instead of creating another one.
 | `FORGE_DEMO_ACCOUNT_CAP_USD` | `account_cap` only: the USD cap the account owner confirmed Factory billing enforces. Recorded and shown, not enforced by Forge | — |
 | `FORGE_CREDIT_LIMIT` | `credit_limit` only: Factory credits Forge may observe before it blocks new turns. Unknown usage blocks | — |
 
-Time-to-Dollar Savings divides annual cost by **1,920** working hours/year. The service boots without API keys, logs warnings, and reports `degraded` on `/api/health`.
+The `JUNIOR_*` and `DROID_USD_PER_AGENT_RUN` values feed only the legacy assumption-based
+`productivity` figures in `GET /metrics` (annual cost divided by **1,920** working hours/year). They are
+labeled estimates, not cash savings, and the dashboard no longer shows them; outcome economics use
+the user-entered assumptions described under [Outcome economics](#outcome-economics). The service boots without API keys, logs warnings, and reports `degraded` on `/api/health`.
 
 > **Schema note**: v2.0 renamed the task columns (`cursor_agent_id`→`droid_session_id`, etc.). Point `DATABASE_URL` at a fresh database; existing v1 SQLite files are not migrated (the lightweight migration system adds the new columns but old data is ignored).
 >
@@ -490,25 +513,82 @@ addressable by hash (`#overview`, `#repos`, `#issues`, `#reviews`, `#metrics`, `
 - **Overview** (`GET /api/overview`): counts each delivery stage separately. These are agent turn
   completed, awaiting checks or review, awaiting approval, accepted (operator-approved), published as
   a draft PR, remote CI by state, merged (observed only) and needs attention. Each task links to its
-  detail page.
+  detail page. The **Outcome economics** panel below the stage cards shows accepted changes, elapsed
+  delivery time, observed credits, cost per accepted change, user-entered human effort, the baseline
+  assumptions form and the capacity scenario (see [Outcome economics](#outcome-economics)).
 - **Task detail** (`/tasks/{id}`): lifecycle, attempts, bounded timeline, candidate SHA, checks,
   restricted review, approval, publication and remote CI, with explicit follow-up, stop, continue,
   run checks, start review, approve and publish controls. Approve and publish open a confirmation
   that names the destination and the full commit SHA. Blocked, stale or unready cases show the
-  reason instead of an enabled button.
+  reason instead of an enabled button. The page also shows the task's outcome economics, a
+  human-effort form and the selected-task evidence export.
 - **PR reviews**: assign a review by pull request number (`POST /api/pulls/assign-number`, draft PRs
   included) or from the synced list, and see `GET /api/reviews`. Each review page (`/reviews/{id}`)
   shows the reviewed head, findings, AI verdict and GitHub outcome. Forge never merges.
+- **Guide**: how to use Forge, plus a capability guide that separates what is *implemented in Forge*,
+  what Factory documents as a *native Factory capability* (with links to the current
+  [Factory documentation](https://docs.factory.com)) and what is a *future extension*. Native
+  capabilities are not implemented or configured by Forge, and Forge does not inspect any
+  organization's Factory settings.
 - Repositories / Issues / Activity tabs; the Activity tab auto-refreshes every 15 seconds while visible
 - Per-repo **model** override + **setup command**
 - Fix + review time stats (active Droid working time)
-- Engineering KPIs (avg PR cycle time, PRs delivered, merge rate, change failure rate)
+- Agent activity indicators: average agent time per completed fix (not end-to-end pull request cycle
+  time), PRs recorded, PRs observed merged, and the agent run failure rate (not the DORA change failure rate)
 - Daily activity bar chart (last 14 days, SGT)
 - Recent activity with Droid session ids and PR deep links
 
+## Outcome economics
+
+`GET /api/economics` (also embedded in `GET /api/overview` as `economics`) and
+`GET /api/tasks/{id}/economics` report:
+
+- **Population.** Every implementation task, including failed, retried, stopped and not-yet-accepted
+  work. A change is *accepted* when the operator approved the current candidate SHA after its checks
+  and restricted review passed; that is not publication, CI or merge. A task's candidate reviews count
+  toward it; reviews of existing PRs are reported separately.
+- **Credits and dollars.** Factory credits are observations from the SDK, with a coverage of
+  `complete`, `partial` or `unknown`. Dollars come only from explicit per-attempt estimates or
+  reconciled amounts; a total appears only when every attempt has one. No dollar amount is inferred
+  from credits, and unknown is never shown as zero.
+- **Cost per accepted change** is the dollar total of all those attempts divided by the number of
+  accepted changes. It is reported only when dollar coverage is complete and at least one change is
+  accepted; otherwise its `state` says why (`no_accepted_changes`, `cost_incomplete`).
+- **Elapsed delivery time** is wall clock from task creation to the operator's approval, so it includes
+  waiting and excludes publication, CI and merge.
+- **Human effort** (`PUT /api/tasks/{id}/human-effort` with `review_minutes`, `rework_minutes`, optional
+  `note`) and **baseline assumptions** (`PUT /api/economics/assumptions` with
+  `baseline_minutes_per_change`, optional `loaded_hourly_usd`, and a required `source`) are stored as
+  user-entered values, never measurements. Negative, non-finite and out-of-range numbers are rejected.
+- **Capacity scenario.** Once assumptions are saved and every accepted change has recorded effort,
+  the scenario reports estimated engineering capacity (accepted changes × baseline minutes, minus the
+  recorded human minutes) and, with an hourly cost, its estimated value. It is labeled an estimate,
+  not realized cash savings, and a net figure appears only when agent dollars are known.
+
+## Evidence export
+
+`GET /api/tasks/{id}/evidence` returns a bounded JSON summary of one selected task
+(`format: droid-forge.task-evidence.v1`); add `?download=true` for an attachment named
+`forge-task-{id}-evidence.json`. The task page has **Preview evidence** and **Download JSON**.
+
+It contains the candidate and approved SHA, attempts (status, timing, usage, a redacted short error
+and event counts), acceptance check results, the restricted review verdict and link, publication and
+remote CI state with its observation age, usage and dollar coverage, elapsed time, and the
+user-entered effort and assumptions. Missing observations stay `null`/unknown. It excludes other
+tasks, agent summaries, thinking, tool and check output, finding text, credentials and file contents,
+and the whole document is redacted before it is returned. The task id must be an integer, so
+filename- or path-shaped requests return **404**/**422** without reading any file. Like every API, it
+requires operator sign-in; it makes no GitHub request and uploads nothing.
+
 ## Metrics Endpoint
 
-`GET /metrics` — computed live from SQLite (fix/review buckets, engineering KPIs, daily series, ROI assumptions). Cost uses stored `cost_usd` / `DROID_USD_PER_AGENT_RUN`; token usage comes straight from the Droid sessions.
+`GET /metrics` — computed live from SQLite (fix/review buckets, agent activity indicators, daily series and
+the legacy assumption-based productivity figures). The response's `labels` object explains what each
+indicator measures: the `change_failure_rate_percent` key is the agent run failure rate (not DORA),
+`pr_cycle_time_hours` is active agent time (not pull request cycle time) and `productivity_gained_usd`
+is an assumption-based estimate (not realized cash savings). Cost uses stored `cost_usd` /
+`DROID_USD_PER_AGENT_RUN`; token usage comes straight from the Droid sessions. For outcome economics
+use `GET /api/economics`.
 
 ## Health Endpoint
 

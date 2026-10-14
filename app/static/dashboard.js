@@ -4,13 +4,6 @@
 
   const { apiFetch, showAlert, hideAlert, escapeHtml } = window.Forge;
 
-  function formatMoney(n) {
-    return `$${Number(n || 0).toLocaleString(undefined, {
-      minimumFractionDigits: 2,
-      maximumFractionDigits: 2,
-    })}`;
-  }
-
   const SGT_FORMATTER = new Intl.DateTimeFormat("en-GB", {
     timeZone: "Asia/Singapore",
     day: "2-digit",
@@ -657,8 +650,6 @@
       set("fix.total_runtime_minutes", stats.fix?.total_runtime_minutes ?? 0);
       set("review.average_runtime_minutes", stats.review?.average_runtime_minutes ?? 0);
       set("review.total_runtime_minutes", stats.review?.total_runtime_minutes ?? 0);
-      set("productivity_gained_usd", formatMoney(stats.productivity_gained_usd));
-      set("cost_avoidance_percent", `(${stats.cost_avoidance_percent}%)`);
 
       const eng = stats.engineering || {};
       set("eng.pr_cycle_time_hours", eng.pr_cycle_time_hours ?? 0);

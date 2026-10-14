@@ -91,6 +91,44 @@
         "title": "AssignPullsRequest",
         "type": "object"
       },
+      "AssumptionsRequest": {
+        "properties": {
+          "baseline_minutes_per_change": {
+            "description": "Assumed human engineering minutes per change without the agent (not measured)",
+            "exclusiveMinimum": 0.0,
+            "maximum": 100000.0,
+            "title": "Baseline Minutes Per Change",
+            "type": "number"
+          },
+          "loaded_hourly_usd": {
+            "anyOf": [
+              {
+                "maximum": 10000.0,
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional assumed loaded engineering cost per hour, used only to value the capacity scenario",
+            "title": "Loaded Hourly Usd"
+          },
+          "source": {
+            "description": "Where the assumptions came from",
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Source",
+            "type": "string"
+          }
+        },
+        "required": [
+          "baseline_minutes_per_change",
+          "source"
+        ],
+        "title": "AssumptionsRequest",
+        "type": "object"
+      },
       "CandidateRequest": {
         "properties": {
           "candidate_sha": {
@@ -180,6 +218,37 @@
           }
         },
         "title": "HTTPValidationError",
+        "type": "object"
+      },
+      "HumanEffortRequest": {
+        "properties": {
+          "note": {
+            "default": "",
+            "description": "Optional short note on how the minutes were counted",
+            "maxLength": 200,
+            "title": "Note",
+            "type": "string"
+          },
+          "review_minutes": {
+            "description": "Human minutes spent reviewing this task's change (user-entered)",
+            "maximum": 100000.0,
+            "minimum": 0.0,
+            "title": "Review Minutes",
+            "type": "number"
+          },
+          "rework_minutes": {
+            "description": "Human minutes spent reworking or fixing it (user-entered)",
+            "maximum": 100000.0,
+            "minimum": 0.0,
+            "title": "Rework Minutes",
+            "type": "number"
+          }
+        },
+        "required": [
+          "review_minutes",
+          "rework_minutes"
+        ],
+        "title": "HumanEffortRequest",
         "type": "object"
       },
       "UpdateRepositoryRequest": {
@@ -442,6 +511,60 @@
           }
         },
         "summary": "List Droid Models"
+      }
+    },
+    "/api/economics": {
+      "get": {
+        "description": "Accepted population, observed credits, dollar coverage, cost per accepted change, effort and scenario.",
+        "operationId": "economics_api_economics_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Economics"
+      }
+    },
+    "/api/economics/assumptions": {
+      "put": {
+        "description": "Save the baseline assumptions for the capacity scenario. They are labeled user-entered everywhere.",
+        "operationId": "save_assumptions_api_economics_assumptions_put",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AssumptionsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Save Assumptions"
       }
     },
     "/api/health": {
@@ -1332,6 +1455,92 @@
         "summary": "Delivery Detail"
       }
     },
+    "/api/tasks/{task_id}/economics": {
+      "get": {
+        "description": "One task's acceptance, observed credits (including failed and retried attempts), dollars, time and effort.",
+        "operationId": "task_economics_detail_api_tasks__task_id__economics_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "task_id",
+            "required": true,
+            "schema": {
+              "title": "Task Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Task Economics Detail"
+      }
+    },
+    "/api/tasks/{task_id}/evidence": {
+      "get": {
+        "description": "Bounded, redacted evidence for one selected task. ``download=true`` returns it as an attachment.",
+        "operationId": "export_task_evidence_api_tasks__task_id__evidence_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "task_id",
+            "required": true,
+            "schema": {
+              "title": "Task Id",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "download",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Download",
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Export Task Evidence"
+      }
+    },
     "/api/tasks/{task_id}/follow-up": {
       "post": {
         "description": "Send a follow-up prompt to the task's Droid session as a new attempt.\n\nRefused while the task has an active attempt; earlier attempts keep their\noutcome and usage.",
@@ -1378,6 +1587,54 @@
           }
         },
         "summary": "Follow Up Task"
+      }
+    },
+    "/api/tasks/{task_id}/human-effort": {
+      "put": {
+        "description": "Record the human review and rework minutes for one task, replacing any earlier entry.",
+        "operationId": "save_human_effort_api_tasks__task_id__human_effort_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "task_id",
+            "required": true,
+            "schema": {
+              "title": "Task Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/HumanEffortRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Save Human Effort"
       }
     },
     "/api/tasks/{task_id}/publish": {

@@ -77,7 +77,7 @@ Before declaring any change done: run `ruff check`, `ruff format --check`,
 - `app/droid_client.py` — Droid SDK wrapper: workspaces, fix/review sessions, resume
 - `app/github.py` — GitHub REST client: comments, PRs, reviews, webhook signature
 - `app/models.py` — SQLAlchemy `Task` / `ReviewTask` / `Repository` models
-- `app/metrics.py` — KPI / ROI / daily-series computation
+- `app/metrics.py` — agent activity indicators, legacy assumption-based estimates and daily series; `app/economics.py` / `app/economics_routes.py` — outcome economics and user-entered effort/assumptions; `app/evidence_export.py` — selected-task evidence export
 - `tests/` — unit tests; `tests/integration/` — cross-layer pipeline test
 
 ## Conventions

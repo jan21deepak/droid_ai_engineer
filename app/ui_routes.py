@@ -12,8 +12,9 @@ from fastapi import APIRouter, Request, Response
 from fastapi.responses import HTMLResponse
 
 from app.database import db_session
+from app.economics import portfolio_economics
 from app.models import ReviewTask, Task
-from app.overview import overview_summary
+from app.overview import overview_summary, staged_tasks
 from app.ui_templates import page_context, templates
 
 router = APIRouter()
@@ -23,7 +24,8 @@ router = APIRouter()
 async def overview() -> dict[str, Any]:
     """Delivery-stage counts and the most recent tasks, keeping completion, acceptance, publication, CI and merge apart."""
     with db_session() as session:
-        return overview_summary(session)
+        staged = staged_tasks(session)
+        return {**overview_summary(session, staged), "economics": portfolio_economics(session, staged)}
 
 
 @router.get("/tasks/{task_id}", response_class=HTMLResponse)

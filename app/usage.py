@@ -309,7 +309,8 @@ def usage_totals(attempts: list[RunAttempt]) -> dict[str, Any]:
     return totals
 
 
-def _coverage(states: list[str]) -> str:
+def coverage_of(states: list[str]) -> str:
+    """``complete`` only when every state is complete, ``unknown`` when none is known, else ``partial``."""
     if not states or all(s == UsageCompleteness.UNKNOWN for s in states):
         return UsageCompleteness.UNKNOWN
     if all(s == UsageCompleteness.COMPLETE for s in states):
@@ -326,7 +327,7 @@ def usage_coverage(attempts: list[RunAttempt], history: str | None) -> str:
     states = [a.usage_completeness or UsageCompleteness.UNKNOWN for a in attempts]
     if history is not None:
         states.append(history)
-    return _coverage(states)
+    return coverage_of(states)
 
 
 def usd_summary(attempts: list[RunAttempt], *, has_history: bool = False) -> dict[str, Any]:
@@ -344,7 +345,7 @@ def usd_summary(attempts: list[RunAttempt], *, has_history: bool = False) -> dic
     ]
     if has_history:
         states.append(UsageCompleteness.UNKNOWN)
-    coverage = _coverage(states)
+    coverage = coverage_of(states)
     reconciled_subtotal = sum_known(a.reconciled_usd for a in reconciled)
     estimated_subtotal = sum_known(a.estimated_usd for a in estimated)
     known = sum_known([reconciled_subtotal, estimated_subtotal])
@@ -374,6 +375,7 @@ __all__ = [
     "clean_source",
     "clean_usage",
     "configured_estimate_rate",
+    "coverage_of",
     "finalize_usage",
     "finite_number",
     "record_snapshot",

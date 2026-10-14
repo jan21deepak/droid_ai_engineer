@@ -141,12 +141,23 @@ def _review_counts(session: Session) -> dict[str, int]:
     }
 
 
-def overview_summary(session: Session) -> dict[str, Any]:
+StagedTask = tuple[Task, dict[str, Any], str]
+
+
+def staged_tasks(session: Session) -> list[StagedTask]:
+    """Every task, newest first, with its delivery state and stage."""
     tasks = session.query(Task).order_by(Task.created_at.desc(), Task.id.desc()).all()
-    rows = []
+    staged = []
     for task in tasks:
         delivery = delivery_state(session, task)
-        rows.append(_task_row(task, delivery, task_stage(task, delivery)))
+        staged.append((task, delivery, task_stage(task, delivery)))
+    return staged
+
+
+def overview_summary(session: Session, staged: list[StagedTask] | None = None) -> dict[str, Any]:
+    staged = staged_tasks(session) if staged is None else staged
+    tasks = [task for task, _, _ in staged]
+    rows = [_task_row(task, delivery, stage) for task, delivery, stage in staged]
     by_stage = {stage: sum(1 for r in rows if r["stage"] == stage) for stage in STAGE_LABELS}
     published = [r for r in rows if r["stage"] == Stage.PUBLISHED]
     counts = {
@@ -176,4 +187,13 @@ def overview_summary(session: Session) -> dict[str, Any]:
     }
 
 
-__all__ = ["DEFINITIONS", "STAGE_LABELS", "Stage", "overview_summary", "task_stage"]
+__all__ = [
+    "ACCEPTED_STAGES",
+    "DEFINITIONS",
+    "STAGE_LABELS",
+    "Stage",
+    "StagedTask",
+    "overview_summary",
+    "staged_tasks",
+    "task_stage",
+]

@@ -85,6 +85,54 @@
             <div class="card-footer small text-muted" id="accounting-note"></div>
         </section>
 
+        <div class="row g-3 mb-3">
+            <div class="col-lg-7">
+                <section class="card shadow-sm border-0 h-100" aria-labelledby="task-economics-heading">
+                    <div class="card-header fw-semibold" id="task-economics-heading">Outcome economics</div>
+                    <div class="card-body">
+                        <div id="task-economics-body"><span class="text-muted">Loading…</span></div>
+                        <form id="effort-form" class="econ-panel mt-3" novalidate aria-describedby="effort-help">
+                            <h3 class="h6 mb-1">Human effort <span class="badge text-bg-warning">User-entered</span></h3>
+                            <p class="small text-muted mb-2" id="effort-help">Minutes people spent reviewing and reworking this change. Not measured by Forge; saving replaces the earlier entry.</p>
+                            <div class="row g-2">
+                                <div class="col-sm-4">
+                                    <label class="form-label small mb-1" for="effort-review">Review minutes</label>
+                                    <input type="number" class="form-control form-control-sm" id="effort-review" min="0" max="100000" step="any" inputmode="decimal" required>
+                                </div>
+                                <div class="col-sm-4">
+                                    <label class="form-label small mb-1" for="effort-rework">Rework minutes</label>
+                                    <input type="number" class="form-control form-control-sm" id="effort-rework" min="0" max="100000" step="any" inputmode="decimal" required>
+                                </div>
+                                <div class="col-sm-4">
+                                    <label class="form-label small mb-1" for="effort-note">Note (optional)</label>
+                                    <input type="text" class="form-control form-control-sm" id="effort-note" maxlength="200">
+                                </div>
+                            </div>
+                            <div class="d-flex align-items-center gap-2 mt-2 flex-wrap">
+                                <button type="submit" class="btn btn-sm btn-outline-primary" id="effort-btn">Save human effort</button>
+                                <span class="small text-muted" id="effort-saved"></span>
+                            </div>
+                            <div id="effort-alert" class="alert d-none mt-2 mb-0" role="alert"></div>
+                        </form>
+                    </div>
+                </section>
+            </div>
+            <div class="col-lg-5">
+                <section class="card shadow-sm border-0 h-100" aria-labelledby="export-heading">
+                    <div class="card-header fw-semibold" id="export-heading">Evidence export</div>
+                    <div class="card-body small">
+                        <p class="mb-2">A local JSON summary of this task only: candidate and approved SHA, attempts, checks, review, publication and remote CI, usage coverage and the user-entered effort and assumptions.</p>
+                        <p class="text-muted mb-2">It excludes other tasks, agent summaries, thinking, tool and check output, credentials and file contents. Nothing is uploaded or posted.</p>
+                        <div class="d-flex flex-wrap gap-2">
+                            <button type="button" class="btn btn-sm btn-outline-secondary" id="export-preview-btn" aria-controls="export-preview" aria-expanded="false">Preview evidence</button>
+                            <a class="btn btn-sm btn-outline-primary" id="export-download" href="/api/tasks/{{ task_id }}/evidence?download=true" download="forge-task-{{ task_id }}-evidence.json">Download JSON</a>
+                        </div>
+                        <pre class="evidence-preview d-none mt-2 mb-0" id="export-preview" tabindex="0" aria-label="Evidence preview"></pre>
+                    </div>
+                </section>
+            </div>
+        </div>
+
         <section class="card shadow-sm border-0" aria-labelledby="timeline-heading">
             <div class="card-header fw-semibold d-flex justify-content-between align-items-center">
                 <span id="timeline-heading">Operational timeline</span>
@@ -113,6 +161,7 @@
 </main>
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
 <script src="/static/forge_common.js?v={{ asset_version }}"></script>
-{% if task %}<script src="/static/task_detail.js?v={{ asset_version }}"></script>{% endif %}
+{% if task %}<script src="/static/task_detail.js?v={{ asset_version }}"></script>
+<script src="/static/task_economics.js?v={{ asset_version }}"></script>{% endif %}
 </body>
 </html>
