@@ -29,7 +29,8 @@ from typing import Any
 
 class Purpose:
     PUBLICATION = "publication"
-    # Follow-up or recovery: from the admission checks until the attempt is committed and the task marked active.
+    # Follow-up or recovery: from the admission checks through workspace preparation and session
+    # opening until the turn is spawned and its attempt marked running.
     ADMISSION = "admission"
     CHECKS = "checks"
     CANDIDATE_REVIEW = "candidate_review"

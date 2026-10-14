@@ -36,11 +36,13 @@ from app.delivery_models import (
     Publication,
     PublicationStatus,
 )
+from app.droid_client import get_droid_client, task_launch_key
 from app.logging_conf import log_event
 from app.models import ReviewTask, Task, TaskStatus
 from app.policy import OutwardAction, configured_publication_branch, outward_decision, repository_decision
 from app.review_outcomes import REVIEW_TARGET_CANDIDATE
 from app.review_policy import REVIEW_POLICY_RESTRICTED, ReviewVerdict
+from app.run_models import PARENT_TASK, RunAttempt
 from app.task_reservations import Purpose, Reservation, TaskReservedError, claim
 
 logger = logging.getLogger("app.delivery")
@@ -76,6 +78,34 @@ def candidate_refusal(task: Task) -> DeliveryRefusedError | None:
             reason=f"candidate status is {task.candidate_status or 'unknown'}; a committed, clean candidate is required",
             candidate_status=task.candidate_status,
         )
+    return None
+
+
+def task_live_work(session: Session, task: Task) -> list[str]:
+    """This task's SDK work still in flight in this process, whatever its persisted status says.
+
+    A stop is durable before the SDK turn has wound down, so a stopped task can
+    still have a live turn that may change the workspace. Covers the pending
+    initial launch, the task's session and every attempt's session (stopped or
+    finished ones included); other tasks' sessions are never consulted.
+    """
+    keys = {task_launch_key(task.id)}
+    if task.droid_session_id:
+        keys.add(task.droid_session_id)
+    attempts = session.query(RunAttempt.session_id).filter(
+        RunAttempt.parent_type == PARENT_TASK, RunAttempt.parent_id == task.id, RunAttempt.session_id.is_not(None)
+    )
+    keys.update(session_id for (session_id,) in attempts if session_id)
+    return get_droid_client().live_work(keys)
+
+
+_LIVE_WORK_REASON = "the agent's turn on this task is still winding down (interrupt, session close or callback)"
+
+
+def live_work_refusal(session: Session, task: Task) -> DeliveryRefusedError | None:
+    live = task_live_work(session, task)
+    if live:
+        return DeliveryRefusedError(409, "task_active", reason=_LIVE_WORK_REASON, live_work=live)
     return None
 
 
@@ -307,6 +337,8 @@ def approval_blockers(session: Session, task: Task) -> list[dict[str, str]]:
     blockers: list[dict[str, str]] = []
     if task.status in TaskStatus.ACTIVE:
         blockers.append(_blocker("task_active", "an agent turn is still active on this task"))
+    elif task_live_work(session, task):
+        blockers.append(_blocker("task_active", _LIVE_WORK_REASON))
     if not task.candidate_sha or task.candidate_status != CandidateStatus.READY:
         blockers.append(
             _blocker(
@@ -436,8 +468,11 @@ def workspace_refusal(recheck: WorkspaceRecheck) -> DeliveryRefusedError | None:
 
 
 def publication_gate(session: Session, task: Task, sha: str) -> DeliveryApproval:
-    """Every recorded precondition for publishing ``sha`` now; returns the approval it rests on or raises."""
-    refusal = stale_refusal(task, sha) or candidate_refusal(task)
+    """Every precondition for publishing ``sha`` now; returns the approval it rests on or raises.
+
+    Besides the recorded facts this includes the task's live SDK work in this process.
+    """
+    refusal = stale_refusal(task, sha) or candidate_refusal(task) or live_work_refusal(session, task)
     if refusal is not None:
         raise refusal
     dest = destination(task)
@@ -454,7 +489,7 @@ def _approvable(session: Session, task_id: int, sha: str) -> Task:
     task = session.get(Task, task_id)
     if task is None:
         raise DeliveryRefusedError(404, "task not found")
-    refusal = stale_refusal(task, sha) or candidate_refusal(task)
+    refusal = stale_refusal(task, sha) or candidate_refusal(task) or live_work_refusal(session, task)
     if refusal is not None:
         raise refusal
     blockers = approval_blockers(session, task)
@@ -516,11 +551,13 @@ __all__ = [
     "delivery_state",
     "destination",
     "latest_check_run",
+    "live_work_refusal",
     "publication_for",
     "publication_gate",
     "publish_blockers",
     "stale_refusal",
     "task_delivery",
+    "task_live_work",
     "task_snapshot",
     "workspace_refusal",
 ]

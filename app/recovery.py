@@ -213,6 +213,12 @@ async def continue_task(task_id: int, kind: str, instruction: str = "") -> dict[
     The attempt is committed (and the task marked running) before the SDK
     turn is spawned. A turn that cannot start closes its attempt as failed and
     puts the task back as it was. Raises ``ContinuationRefusedError``.
+
+    The admission reservation is held from the admission checks through
+    workspace preparation, session opening and spawning the turn until the
+    attempt is marked running, so a stop during startup cannot let a
+    publication in before the session is registered. It is released before the
+    spawned turn first runs, never through the SDK turn or its callbacks.
     """
     if kind not in _CONTINUATION_KINDS:
         raise ValueError(f"not a continuation kind: {kind}")
@@ -220,36 +226,13 @@ async def continue_task(task_id: int, kind: str, instruction: str = "") -> dict[
         admission = claim(task_id, Purpose.ADMISSION)
     except TaskReservedError as exc:
         raise ContinuationRefusedError(exc.status_code, exc.detail, **exc.extra) from None
-    # Held only until the attempt is committed and the task marked active, never through the SDK turn.
     with admission:
         start, session_id, repository, droid = _admit_continuation(task_id, kind)
-
-    on_complete = partial(worker.finalize_fix_task, task_id, attempt_id=start.attempt_id)
-    cwd = task_workspace_dir(repository, task_id)
-    observer = TurnRecorder(start.attempt_id)
-    try:
-        if kind == AttemptKind.FOLLOW_UP:
-            result = await droid.send_follow_up(
-                session_id, instruction, repository=repository, cwd=cwd, on_complete=on_complete, observer=observer
-            )
-        else:
-            result = await droid.resume_interrupted(
-                session_id, repository=repository, cwd=cwd, on_complete=on_complete, observer=observer
-            )
-    except DroidSessionBusyError:
-        _abandon_start(task_id, start.attempt_id, "session already had a turn in flight", start)
-        raise ContinuationRefusedError(
-            409, "the Droid session is still running a turn; retry when it finishes"
-        ) from None
-    except Exception as exc:
-        error = f"{kind.replace('_', '-')} failed: {safe_error(exc)}"
-        _abandon_start(task_id, start.attempt_id, error, start)
-        raise ContinuationRefusedError(502, error) from None
-
-    # False when the attempt was stopped while it was starting; it stays stopped.
-    still_active = mark_attempt_running(
-        start.attempt_id, session_id=result.get("session_id") or session_id, base_sha=result.get("base_sha")
-    )
+        result = await _spawn_continuation(droid, task_id, kind, instruction, start, session_id, repository)
+        # False when the attempt was stopped while it was starting; it stays stopped.
+        still_active = mark_attempt_running(
+            start.attempt_id, session_id=result.get("session_id") or session_id, base_sha=result.get("base_sha")
+        )
     log_event(
         logger,
         logging.INFO,
@@ -269,6 +252,38 @@ async def continue_task(task_id: int, kind: str, instruction: str = "") -> dict[
         "session_id": result.get("session_id") or session_id,
         "status": AttemptStatus.RUNNING if still_active else AttemptStatus.STOPPED,
     }
+
+
+async def _spawn_continuation(
+    droid: DroidClient,
+    task_id: int,
+    kind: str,
+    instruction: str,
+    start: AttemptStart,
+    session_id: str,
+    repository: str,
+) -> dict[str, Any]:
+    """Prepare the workspace, open the session and spawn the turn; a failed start is closed and refused."""
+    on_complete = partial(worker.finalize_fix_task, task_id, attempt_id=start.attempt_id)
+    cwd = task_workspace_dir(repository, task_id)
+    observer = TurnRecorder(start.attempt_id)
+    try:
+        if kind == AttemptKind.FOLLOW_UP:
+            return await droid.send_follow_up(
+                session_id, instruction, repository=repository, cwd=cwd, on_complete=on_complete, observer=observer
+            )
+        return await droid.resume_interrupted(
+            session_id, repository=repository, cwd=cwd, on_complete=on_complete, observer=observer
+        )
+    except DroidSessionBusyError:
+        _abandon_start(task_id, start.attempt_id, "session already had a turn in flight", start)
+        raise ContinuationRefusedError(
+            409, "the Droid session is still running a turn; retry when it finishes"
+        ) from None
+    except Exception as exc:
+        error = f"{kind.replace('_', '-')} failed: {safe_error(exc)}"
+        _abandon_start(task_id, start.attempt_id, error, start)
+        raise ContinuationRefusedError(502, error) from None
 
 
 def _admit_continuation(task_id: int, kind: str) -> tuple[AttemptStart, str, str, DroidClient]:

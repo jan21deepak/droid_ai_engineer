@@ -83,8 +83,13 @@ class WorkspaceRecheck:
 
 
 async def recheck_candidate_workspace(task: Task) -> WorkspaceRecheck:
-    """Re-inspect the task workspace now, rather than trusting what was recorded earlier."""
-    state = await get_droid_client().inspect_workspace(task.repository, task.id, task.candidate_branch)
+    """Re-inspect the task workspace now, rather than trusting what was recorded earlier.
+
+    This reads the actual HEAD, never the candidate branch tip: a workspace moved
+    or detached elsewhere is stale even when the branch still points at the
+    candidate. A clean HEAD detached exactly at the candidate is fine.
+    """
+    state = await get_droid_client().inspect_workspace(task.repository, task.id, None)
     code = problem = None
     if not state.head_sha:
         code, problem = "workspace_unavailable", "the task workspace could not be inspected"

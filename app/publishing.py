@@ -7,7 +7,8 @@ approving restricted review, the operator's approval of that exact candidate
 recording, and outward-action policy for the branch push and draft PR. The
 task's publication reservation (``app.task_reservations``) keeps follow-up,
 recovery, new evidence and approval out while publication runs, and after
-the awaited GitHub and remote lookups every gate and the workspace are
+the awaited GitHub and remote lookups every gate, the task's live SDK work
+(a stopped turn still winding down) and the workspace's actual HEAD are
 rechecked immediately before the push.
 
 The push sends that SHA to the candidate's own (allowed) branch without force,

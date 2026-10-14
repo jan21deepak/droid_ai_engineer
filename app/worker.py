@@ -52,6 +52,7 @@ from app.droid_client import (
     extract_branch_name,
     get_droid_client,
     map_outcome_status,
+    task_launch_key,
 )
 from app.github import GitHubClient
 from app.logging_conf import log_event
@@ -229,7 +230,7 @@ def spawn_fix_launch(task_id: int, **launch_kwargs: Any) -> asyncio.Task[None]:
     """Fire the launcher in the background so webhook handlers stay fast."""
     droid = get_droid_client()
     task = asyncio.create_task(launch_fix_task(task_id, **launch_kwargs))
-    droid.track(f"launch:task-{task_id}", task)
+    droid.track(task_launch_key(task_id), task)
     return task
 
 

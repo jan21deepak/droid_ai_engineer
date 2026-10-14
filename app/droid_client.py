@@ -20,7 +20,8 @@ import logging
 import os
 import shutil
 import tempfile
-from collections.abc import Callable
+from collections import Counter
+from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Any
 
@@ -139,6 +140,11 @@ def task_workspace_dir(repository: str, task_id: int) -> Path:
     full_name = parse_repository_ref(repository) or repository
     owner, _, repo = full_name.partition("/")
     return workspace_root() / owner / repo / f"task-{task_id}"
+
+
+def task_launch_key(task_id: int) -> str:
+    """Registry key of a task's background implementation launch, before its session id is known."""
+    return f"launch:task-{task_id}"
 
 
 def review_workspace_dir(repository: str, review_id: int) -> Path:
@@ -266,6 +272,8 @@ class DroidClient:
         self._tasks: dict[str, asyncio.Task[Any]] = {}
         # Open SDK sessions with a turn in flight, kept so a stop can interrupt them.
         self._sessions: dict[str, Session] = {}
+        # Session ids whose SDK interrupt request is still awaiting an answer.
+        self._interrupting: Counter[str] = Counter()
         self.stop_grace_seconds = STOP_GRACE_SECONDS
 
     @property
@@ -290,12 +298,33 @@ class DroidClient:
         if existing and not existing.done():
             raise DroidSessionBusyError(f"run {key} is already in flight")
         self._tasks[key] = task
-        task.add_done_callback(lambda _t: self._tasks.pop(key, None))
+
+        def _forget(finished: asyncio.Task[Any]) -> None:
+            # Done callbacks run after ``done()`` is already true, so a replacement may own the key by now.
+            if self._tasks.get(key) is finished:
+                del self._tasks[key]
+
+        task.add_done_callback(_forget)
         return task
 
     def session_busy(self, session_id: str) -> bool:
         task = self._tasks.get(session_id)
         return bool(task and not task.done())
+
+    def live_work(self, keys: Iterable[str]) -> list[str]:
+        """Which of ``keys`` (session ids or ``launch:`` keys) still have work in flight.
+
+        A turn counts until its task ends, which is after its session closed and its
+        completion callback returned; a session also counts while an interrupt request
+        for it is awaiting an answer. Finished handles and ``stop:`` timers never count.
+        """
+        return sorted(
+            {
+                key
+                for key in keys
+                if not key.startswith("stop:") and (self.session_busy(key) or self._interrupting[key] > 0)
+            }
+        )
 
     async def interrupt_run(self, session_id: str | None) -> dict[str, Any]:
         """Ask the SDK to interrupt the turn in flight on ``session_id``; cancel it if it does not wind down.
@@ -311,11 +340,16 @@ class DroidClient:
         session = self._sessions.get(session_id)
         interrupt = getattr(session, "interrupt", None)
         if callable(interrupt):
+            self._interrupting[session_id] += 1
             try:
                 await asyncio.wait_for(interrupt(), timeout=INTERRUPT_REQUEST_TIMEOUT_SECONDS)
                 result["interrupt_sent"] = True
             except Exception as exc:
                 result["interrupt_error"] = safe_error(exc)
+            finally:
+                self._interrupting[session_id] -= 1
+                if self._interrupting[session_id] <= 0:
+                    del self._interrupting[session_id]
         if not self.session_busy(f"stop:{session_id}"):
             self.track(f"stop:{session_id}", asyncio.create_task(self._cancel_if_still_running(task, session_id)))
         log_event(logger, logging.WARNING, "droid.turn_interrupt_requested", session_id=session_id, **result)
@@ -950,6 +984,7 @@ __all__ = [
     "map_outcome_status",
     "reset_droid_client_for_tests",
     "review_workspace_dir",
+    "task_launch_key",
     "task_workspace_dir",
     "workspace_root",
 ]
