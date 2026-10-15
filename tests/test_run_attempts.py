@@ -108,7 +108,9 @@ class FakeDroid:
         self._enter("fix", kwargs["on_complete"], model=kwargs.get("model"))
         return {"session_id": "sess-1", "status": "running", "base_sha": BASE}
 
-    async def send_follow_up(self, session_id, instruction, *, repository, cwd, on_complete=None, observer=None):
+    async def send_follow_up(
+        self, session_id, instruction, *, repository, cwd, model=None, on_complete=None, observer=None
+    ):
         self._enter("follow_up", on_complete, instruction=instruction, cwd=cwd)
         return {
             "session_id": session_id,
@@ -116,7 +118,7 @@ class FakeDroid:
             "base_sha": self.heads[min(self.inspected, len(self.heads)) - 1],
         }
 
-    async def resume_interrupted(self, session_id, *, repository, cwd, on_complete=None, observer=None):
+    async def resume_interrupted(self, session_id, *, repository, cwd, model=None, on_complete=None, observer=None):
         self._enter("recovery", on_complete, cwd=cwd)
         return {"session_id": session_id, "status": "running", "base_sha": None}
 
@@ -427,7 +429,7 @@ class SpawnRecorder:
         for name in ("start_fix_run", "start_review_run", "send_follow_up"):
             monkeypatch.setattr(DroidClient, name, self._refuse(name))
 
-        async def resume(client, session_id, *, repository, cwd, on_complete=None, observer=None):
+        async def resume(client, session_id, *, repository, cwd, model=None, on_complete=None, observer=None):
             self.spawns.append(f"resume_interrupted:{session_id}")
             return {"session_id": session_id, "status": "running", "base_sha": None}
 

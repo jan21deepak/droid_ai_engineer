@@ -32,7 +32,6 @@ from app.agent_env import agent_environment, close_runtime, git_environment, ope
 from app.candidates import WorkspaceState
 from app.config import get_settings
 from app.logging_conf import log_event
-from app.models import TaskStatus
 from app.policy import OutwardAction, configured_publication_branch, outward_decision, privileged_setup_allowed
 from app.prompts import (
     FIX_PROMPT_TEMPLATE,
@@ -53,7 +52,7 @@ from app.review_policy import (
     review_session_config,
 )
 from app.run_events import TurnObserver
-from app.run_models import USAGE_FIELDS
+from app.turn_outcomes import map_outcome_status, reported_model, result_outcome
 from app.workspace_config import (
     IDENTITY_VARS,
     ConfigEntry,
@@ -90,46 +89,6 @@ class DroidRunError(Exception):
 
 class DroidSessionBusyError(DroidRunError):
     """Raised when the session already has an active turn in flight."""
-
-
-def _usage_categories(usage: object | None) -> dict[str, Any] | None:
-    """A terminal result's usage, category by category; ``None`` when the result carried none."""
-    if usage is None:
-        return None
-    return {name: getattr(usage, name, None) for name in USAGE_FIELDS}
-
-
-def _reported_model(session: Session) -> str | None:
-    """The model the opened session reports for itself (may be a router alias such as ``auto``)."""
-    try:
-        model = session.settings.model
-    except Exception:
-        return None
-    return model if isinstance(model, str) and model else None
-
-
-def _result_outcome(result: Any) -> dict[str, Any]:
-    """Outcome fields from a completed turn's terminal result."""
-    usage = getattr(result, "usage", None)
-    tokens = None
-    if usage is not None:
-        tokens = (getattr(usage, "input_tokens", 0) or 0) + (getattr(usage, "output_tokens", 0) or 0)
-    duration = getattr(result, "duration", None)
-    return {
-        "success": bool(result.success),
-        "subtype": getattr(result, "subtype", ""),
-        "text": getattr(result, "text", "") or "",
-        "duration_seconds": duration.total_seconds() if duration else None,
-        "credits": getattr(usage, "factory_credits", None) if usage else None,
-        "tokens": tokens or None,
-        "usage": _usage_categories(usage),
-        "error": None,
-    }
-
-
-def map_outcome_status(outcome: dict[str, Any]) -> str:
-    """Map a Droid turn outcome to an internal TaskStatus."""
-    return TaskStatus.COMPLETED if outcome.get("success") else TaskStatus.FAILED
 
 
 def workspace_root() -> Path:
@@ -679,7 +638,7 @@ class DroidClient:
         observer: TurnObserver | None = None,
     ) -> dict[str, Any]:
         session_id = session.id
-        outcome: dict[str, Any] = {"session_id": session_id, "kind": kind, "reported_model": _reported_model(session)}
+        outcome: dict[str, Any] = {"session_id": session_id, "kind": kind, "reported_model": reported_model(session)}
         events = 0
         if not await self._admit_turn(session, observer, kind):
             outcome.update(success=False, subtype="not_admitted", text="", error="attempt is no longer active")
@@ -702,7 +661,7 @@ class DroidClient:
                             session_id=session_id,
                             events=events,
                         )
-            outcome.update(_result_outcome(stream.result))
+            outcome.update(result_outcome(stream.result))
         except asyncio.CancelledError:
             outcome.update(success=False, subtype="cancelled", text="", error="run cancelled")
             raise
@@ -906,25 +865,21 @@ class DroidClient:
         *,
         repository: str,
         cwd: Path,
+        model: str | None = None,
         on_complete: Callable[[dict[str, Any]], Any] | None = None,
         observer: TurnObserver | None = None,
     ) -> dict[str, Any]:
         """Resume a saved session in its task workspace and run a follow-up turn in the background.
 
         The workspace's legacy credentials are removed (from ``repository``,
-        the task's stored repository) before the session opens.
+        the task's stored repository) before the session opens. A non-empty
+        ``model`` replaces the session's saved model before the turn is sent;
+        without one the saved model is kept (never the global default).
         """
-        if not self.configured:
-            raise DroidRunError("Droid is not configured (FACTORY_API_KEY missing)")
-        if self.session_busy(session_id):
-            raise DroidSessionBusyError("session already has a turn in flight")
         prompt = build_follow_up_prompt(instruction)
-        await _prepare_continuation_workspace(repository, cwd)
-        base_sha = await _git_or_none(["rev-parse", "--verify", "HEAD^{commit}"], cwd=cwd)
-        session = await self._open_session(cwd=cwd, resume_id=session_id, purpose=f"session {session_id}")
-        self._spawn_turn(session, prompt, kind="follow_up", on_complete=on_complete, observer=observer)
-        log_event(logger, logging.INFO, "droid.follow_up_sent", session_id=session_id)
-        return {"session_id": session_id, "status": "running", "base_sha": base_sha}
+        return await self._continue_session(
+            session_id, prompt, "follow_up", repository, cwd, model, on_complete, observer, "droid.follow_up_sent"
+        )
 
     async def resume_interrupted(
         self,
@@ -932,15 +887,41 @@ class DroidClient:
         *,
         repository: str,
         cwd: Path,
+        model: str | None = None,
         on_complete: Callable[[dict[str, Any]], Any] | None = None,
         observer: TurnObserver | None = None,
     ) -> dict[str, Any]:
         """Resume an interrupted implementation session on explicit operator request.
 
         Only for fix/follow-up sessions; review sessions are never resumed. As
-        with follow-ups, the workspace is cleaned of legacy credentials first.
-        Startup never calls this: restart recovery only marks work interrupted.
+        with follow-ups, the workspace is cleaned of legacy credentials first
+        and ``model`` is applied the same way. Startup never calls this:
+        restart recovery only marks work interrupted.
         """
+        return await self._continue_session(
+            session_id,
+            RECOVERY_PROMPT_TEMPLATE,
+            "recovery",
+            repository,
+            cwd,
+            model,
+            on_complete,
+            observer,
+            "droid.session_recovered",
+        )
+
+    async def _continue_session(
+        self,
+        session_id: str,
+        prompt: str,
+        kind: str,
+        repository: str,
+        cwd: Path,
+        model: str | None,
+        on_complete: Callable[[dict[str, Any]], Any] | None,
+        observer: TurnObserver | None,
+        event: str,
+    ) -> dict[str, Any]:
         if not self.configured:
             raise DroidRunError("Droid is not configured (FACTORY_API_KEY missing)")
         if self.session_busy(session_id):
@@ -948,9 +929,29 @@ class DroidClient:
         await _prepare_continuation_workspace(repository, cwd)
         base_sha = await _git_or_none(["rev-parse", "--verify", "HEAD^{commit}"], cwd=cwd)
         session = await self._open_session(cwd=cwd, resume_id=session_id, purpose=f"session {session_id}")
-        self._spawn_turn(session, RECOVERY_PROMPT_TEMPLATE, kind="recovery", on_complete=on_complete, observer=observer)
-        log_event(logger, logging.INFO, "droid.session_recovered", session_id=session_id)
+        if model:
+            await _apply_session_model(session, model)
+        self._spawn_turn(session, prompt, kind=kind, on_complete=on_complete, observer=observer)
+        log_event(logger, logging.INFO, event, session_id=session_id, model=model)
         return {"session_id": session_id, "status": "running", "base_sha": base_sha}
+
+
+async def _apply_session_model(session: Session, model: str) -> None:
+    """Switch an opened, resumed session to ``model`` before its turn; close it unspawned if that fails.
+
+    ``Session.resume`` takes no model, so without this a resumed session keeps
+    the model it was saved with.
+    """
+    try:
+        await session.update_settings(model=model)
+    except asyncio.CancelledError:
+        with contextlib.suppress(Exception):
+            await session.close()
+        raise
+    except Exception as exc:
+        with contextlib.suppress(Exception):
+            await session.close()
+        raise DroidRunError(safe_error(f"failed to apply model {model} to session {session.id}: {exc}")) from exc
 
 
 _client: DroidClient | None = None

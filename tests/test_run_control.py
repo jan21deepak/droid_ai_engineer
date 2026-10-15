@@ -98,11 +98,13 @@ class FakeDroid:
         self.turns.append({"kind": "fix", "on_complete": kwargs["on_complete"], "observer": kwargs.get("observer")})
         return {"session_id": "sess-1", "status": "running", "base_sha": BASE}
 
-    async def send_follow_up(self, session_id, instruction, *, repository, cwd, on_complete=None, observer=None):
+    async def send_follow_up(
+        self, session_id, instruction, *, repository, cwd, model=None, on_complete=None, observer=None
+    ):
         self.turns.append({"kind": "follow_up", "on_complete": on_complete, "observer": observer})
         return {"session_id": session_id, "status": "running", "base_sha": SHA_A}
 
-    async def resume_interrupted(self, session_id, *, repository, cwd, on_complete=None, observer=None):
+    async def resume_interrupted(self, session_id, *, repository, cwd, model=None, on_complete=None, observer=None):
         self.turns.append({"kind": "recovery", "on_complete": on_complete, "observer": observer})
         return {"session_id": session_id, "status": "running", "base_sha": SHA_A}
 

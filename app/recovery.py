@@ -10,10 +10,11 @@ which keep their own outcome and usage.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import UTC, datetime
 from functools import partial
-from typing import Any
+from typing import Any, NamedTuple
 
 from sqlalchemy.orm import Session
 
@@ -36,6 +37,7 @@ from app.logging_conf import log_event
 from app.models import ReviewTask, Task, TaskStatus
 from app.policy import repository_decision
 from app.redaction import safe_error
+from app.repos import resolve_agent_launch_config
 from app.review_outcomes import GitHubReviewOutcome, interrupt_pending, mark_unposted
 from app.run_events import TurnRecorder
 from app.run_limits import RunRefusedError
@@ -215,10 +217,16 @@ async def continue_task(task_id: int, kind: str, instruction: str = "") -> dict[
     puts the task back as it was. Raises ``ContinuationRefusedError``.
 
     The admission reservation is held from the admission checks through
-    workspace preparation, session opening and spawning the turn until the
-    attempt is marked running, so a stop during startup cannot let a
-    publication in before the session is registered. It is released before the
-    spawned turn first runs, never through the SDK turn or its callbacks.
+    workspace preparation, session opening, applying the selected model and
+    spawning the turn until the attempt is marked running, so a stop during
+    startup cannot let a publication in before the session is registered. It
+    is released before the spawned turn first runs, never through the SDK turn
+    or its callbacks.
+
+    The repository's selected model is read once at admission; that same value
+    is the attempt's ``requested_model`` and is applied to the resumed session.
+    With no selection the session keeps its saved model and
+    ``requested_model`` stays ``None``.
     """
     if kind not in _CONTINUATION_KINDS:
         raise ValueError(f"not a continuation kind: {kind}")
@@ -227,8 +235,9 @@ async def continue_task(task_id: int, kind: str, instruction: str = "") -> dict[
     except TaskReservedError as exc:
         raise ContinuationRefusedError(exc.status_code, exc.detail, **exc.extra) from None
     with admission:
-        start, session_id, repository, droid = _admit_continuation(task_id, kind)
-        result = await _spawn_continuation(droid, task_id, kind, instruction, start, session_id, repository)
+        admitted = _admit_continuation(task_id, kind)
+        start, session_id = admitted.start, admitted.session_id
+        result = await _spawn_continuation(task_id, kind, instruction, admitted)
         # False when the attempt was stopped while it was starting; it stays stopped.
         still_active = mark_attempt_running(
             start.attempt_id, session_id=result.get("session_id") or session_id, base_sha=result.get("base_sha")
@@ -242,6 +251,7 @@ async def continue_task(task_id: int, kind: str, instruction: str = "") -> dict[
         kind=kind,
         sequence=start.sequence,
         session_id=session_id,
+        requested_model=admitted.model,
     )
     return {
         "detail": "accepted",
@@ -250,43 +260,57 @@ async def continue_task(task_id: int, kind: str, instruction: str = "") -> dict[
         "sequence": start.sequence,
         "kind": kind,
         "session_id": result.get("session_id") or session_id,
+        "requested_model": admitted.model,
         "status": AttemptStatus.RUNNING if still_active else AttemptStatus.STOPPED,
     }
 
 
+class _AdmittedContinuation(NamedTuple):
+    start: AttemptStart
+    session_id: str
+    repository: str
+    model: str | None
+    droid: DroidClient
+
+
 async def _spawn_continuation(
-    droid: DroidClient,
-    task_id: int,
-    kind: str,
-    instruction: str,
-    start: AttemptStart,
-    session_id: str,
-    repository: str,
+    task_id: int, kind: str, instruction: str, admitted: _AdmittedContinuation
 ) -> dict[str, Any]:
     """Prepare the workspace, open the session and spawn the turn; a failed start is closed and refused."""
+    start, session_id, repository, model, droid = admitted
     on_complete = partial(worker.finalize_fix_task, task_id, attempt_id=start.attempt_id)
     cwd = task_workspace_dir(repository, task_id)
     observer = TurnRecorder(start.attempt_id)
     try:
         if kind == AttemptKind.FOLLOW_UP:
             return await droid.send_follow_up(
-                session_id, instruction, repository=repository, cwd=cwd, on_complete=on_complete, observer=observer
+                session_id,
+                instruction,
+                repository=repository,
+                cwd=cwd,
+                model=model,
+                on_complete=on_complete,
+                observer=observer,
             )
         return await droid.resume_interrupted(
-            session_id, repository=repository, cwd=cwd, on_complete=on_complete, observer=observer
+            session_id, repository=repository, cwd=cwd, model=model, on_complete=on_complete, observer=observer
         )
     except DroidSessionBusyError:
         _abandon_start(task_id, start.attempt_id, "session already had a turn in flight", start)
         raise ContinuationRefusedError(
             409, "the Droid session is still running a turn; retry when it finishes"
         ) from None
+    except asyncio.CancelledError:
+        # Runs before the caller's admission reservation is released; a stopped attempt stays stopped.
+        _abandon_start(task_id, start.attempt_id, f"{kind.replace('_', '-')} cancelled during startup", start)
+        raise
     except Exception as exc:
         error = f"{kind.replace('_', '-')} failed: {safe_error(exc)}"
         _abandon_start(task_id, start.attempt_id, error, start)
         raise ContinuationRefusedError(502, error) from None
 
 
-def _admit_continuation(task_id: int, kind: str) -> tuple[AttemptStart, str, str, DroidClient]:
+def _admit_continuation(task_id: int, kind: str) -> _AdmittedContinuation:
     """Every admission check, then the committed attempt. Synchronous, so no publication can interleave."""
     with db_session() as session:
         task = session.get(Task, task_id)
@@ -308,16 +332,19 @@ def _admit_continuation(task_id: int, kind: str) -> tuple[AttemptStart, str, str
         raise ContinuationRefusedError(409, "task completed; send a follow-up instead of a recovery")
     if droid.session_busy(session_id):
         raise ContinuationRefusedError(409, "the Droid session is still running a turn; retry when it finishes")
-    return _start_continuation_attempt(task_id, kind, previous_id), session_id, repository, droid
+    model = resolve_agent_launch_config(repository)["model"]
+    start = _start_continuation_attempt(task_id, kind, previous_id, model)
+    return _AdmittedContinuation(start, session_id, repository, model, droid)
 
 
-def _start_continuation_attempt(task_id: int, kind: str, previous_id: int | None) -> AttemptStart:
+def _start_continuation_attempt(task_id: int, kind: str, previous_id: int | None, model: str | None) -> AttemptStart:
     """Commit the continuation attempt, mapping conflicts and limit refusals to HTTP refusals."""
     try:
         start = start_attempt(
             PARENT_TASK,
             task_id,
             kind,
+            requested_model=model,
             continued_from_attempt_id=previous_id,
             parent_status=TaskStatus.RUNNING,
         )
