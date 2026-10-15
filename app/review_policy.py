@@ -170,17 +170,31 @@ security issues and whether it is coherent and complete. Use Read/Grep/Glob to
 inspect surrounding code. You cannot run commands; the application runs the
 configured tests separately, so do not claim that tests passed or failed.
 
-Finish with exactly one fenced ```json block of this shape, then one verdict line:
+Finish with exactly one fenced ```json block, then one verdict line. The block
+below only illustrates the shape; its placeholder values are not valid answers:
 
 ```json
-{{"verdict": "APPROVE" or "REQUEST_CHANGES",
-  "summary": "one-paragraph assessment",
-  "findings": [{{"severity": "blocker|major|minor|nit", "file": "path", "line": 1,
-                "title": "short title", "detail": "what is wrong and how to fix it"}}]}}
+{{"verdict": "<your verdict>",
+  "summary": "<one short paragraph>",
+  "findings": [{{"severity": "<severity>", "file": "path/to/file.py", "line": 1,
+                "title": "<short title>", "detail": "<what is wrong and how to fix it>"}}]}}
 ```
-VERDICT: APPROVE or VERDICT: REQUEST_CHANGES
+VERDICT: <the same value as the json verdict>
 
-Use REQUEST_CHANGES whenever there is any blocker finding.
+Rules for that block:
+- "verdict" is exactly "APPROVE" or "REQUEST_CHANGES", chosen from your own
+  review. The final VERDICT line must repeat the same value.
+- Each finding's "severity" is exactly one of "blocker", "major", "minor" or
+  "nit". Use an empty "findings" list when there are none.
+- Use REQUEST_CHANGES whenever there is any blocker finding.
+- The block must be strict JSON that a standard parser accepts: no comments,
+  no trailing commas, double-quoted strings. Inside strings, escape every
+  double quote and every backslash; a regex such as \\w+ is written "\\\\w+".
+- Keep the summary and each detail concise and in plain English. Describe code
+  instead of pasting it, so that strings rarely need escapes.
+
+Invalid JSON, a mismatched VERDICT line, or an approval with a blocker finding
+makes the review inconclusive.
 """
 
 
