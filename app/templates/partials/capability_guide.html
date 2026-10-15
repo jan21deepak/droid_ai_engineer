@@ -1,0 +1,117 @@
+            <section class="mt-4" id="capability-guide" aria-labelledby="capability-heading">
+                <h2 class="h5 mb-1" id="capability-heading">Capability guide</h2>
+                <p class="small text-muted mb-3">
+                    Three different things, kept apart: what this Forge app implements, what Factory documents as native
+                    platform capabilities, and what would be future work. Native capabilities are not implemented or configured
+                    by Forge, and Forge has not inspected any organization's Factory settings. Availability depends on the
+                    Factory plan and on how an organization configures it.
+                </p>
+
+                <div class="card shadow-sm border-0 mb-3" aria-labelledby="cap-forge-heading">
+                    <div class="card-header d-flex justify-content-between align-items-center flex-wrap gap-2">
+                        <h3 class="h6 fw-semibold mb-0" id="cap-forge-heading">Implemented in Forge</h3>
+                        <span class="badge text-bg-success">Built and exercised in this app</span>
+                    </div>
+                    <div class="card-body small">
+                        <ul class="mb-2">
+                            <li><strong>Issue intake.</strong> A signed GitHub webhook or the Issues tab starts work, only for repositories in <code>FORGE_ALLOWED_REPOSITORIES</code>.</li>
+                            <li><strong>Local Droid SDK turns.</strong> Each turn runs in its own workspace clone with a credential-free remote and a clean agent environment. One paid turn runs at a time, runtime and continuation limits apply, stop is durable, and a restart never resumes work on its own.</li>
+                            <li><strong>Per-attempt accounting.</strong> Every turn is an attempt with its own status and Factory credits as reported by the SDK. Failed and retried work stays in totals; dollars stay unknown unless you record an estimate or a reconciled amount.</li>
+                            <li><strong>Evidence on the exact commit.</strong> App-run acceptance checks in a clean checkout and a restricted Read/Grep/Glob review of the exact diff, both bound to the candidate SHA.</li>
+                            <li><strong>Explicit approval and publication.</strong> You approve one SHA; a separate, policy-gated step pushes it without force to an allowed branch and opens a draft pull request. Remote CI is observed read-only. Forge never merges.</li>
+                            <li><strong>PR review assignment</strong> by number, including drafts, with the AI verdict kept apart from what GitHub recorded.</li>
+                            <li><strong>Outcome economics and evidence export.</strong> Accepted changes, observed credits, dollar coverage, user-entered effort and assumptions, and a bounded JSON export of one selected task.</li>
+                        </ul>
+                        <p class="mb-0 text-muted">
+                            <strong>Boundary.</strong> Forge is a private, single-operator console with one operator token and in-memory sessions,
+                            meant for loopback use. Agents run as the same OS account as the app: this is a trusted workload, not a sandbox,
+                            and not multi-user access control, SSO or a hosted service.
+                        </p>
+                    </div>
+                </div>
+
+                <div class="card shadow-sm border-0 mb-3" aria-labelledby="cap-native-heading">
+                    <div class="card-header d-flex justify-content-between align-items-center flex-wrap gap-2">
+                        <h3 class="h6 fw-semibold mb-0" id="cap-native-heading">Native Factory capability</h3>
+                        <span class="badge text-bg-info">Documented by Factory; not integrated in Forge</span>
+                    </div>
+                    <div class="table-responsive">
+                        <table class="table table-sm align-middle mb-0 capability-table small">
+                            <caption class="visually-hidden">Factory platform capabilities with their documentation and their relation to Forge</caption>
+                            <thead>
+                            <tr>
+                                <th scope="col">Capability family</th>
+                                <th scope="col">What Factory documents</th>
+                                <th scope="col">Relation to Forge</th>
+                            </tr>
+                            </thead>
+                            <tbody>
+                            <tr>
+                                <th scope="row">Controls and deployment options</th>
+                                <td>Managed settings and policy controls for models, tools, safety, network access, retention and telemetry; cloud, hybrid, EU and airgapped deployment patterns.
+                                    <div><a href="https://docs.factory.com/enterprise/hierarchical-settings-and-org-control" target="_blank" rel="noopener">Enterprise Controls &amp; Managed Settings</a> ·
+                                    <a href="https://docs.factory.com/enterprise/network-and-deployment" target="_blank" rel="noopener">Deployment Patterns</a> ·
+                                    <a href="https://docs.factory.com/enterprise/llm-safety-and-agent-controls" target="_blank" rel="noopener">Agent Safety &amp; Controls</a></div></td>
+                                <td>Not configured by Forge. Forge's own policy settings (repositories, branches, GitHub writes) are separate app configuration.</td>
+                            </tr>
+                            <tr>
+                                <th scope="row">Missions</th>
+                                <td>Planning and executing large, multi-feature projects with structured orchestration.
+                                    <div><a href="https://docs.factory.com/missions/overview" target="_blank" rel="noopener">Factory Missions</a></div></td>
+                                <td>Not part of the Forge app. Forge runs one task's turns at a time.</td>
+                            </tr>
+                            <tr>
+                                <th scope="row">Skills and plugins</th>
+                                <td>Reusable <code>SKILL.md</code> workflows, and shareable packages of skills, commands, droids, hooks and MCP servers.
+                                    <div><a href="https://docs.factory.com/harness/skills" target="_blank" rel="noopener">Skills</a> ·
+                                    <a href="https://docs.factory.com/harness/plugins" target="_blank" rel="noopener">Plugins</a></div></td>
+                                <td>Forge's restricted reviewer disables built-in skills. Fix sessions use whatever the local Droid installation provides; Forge manages none.</td>
+                            </tr>
+                            <tr>
+                                <th scope="row">Connectors</th>
+                                <td>Connecting third-party apps so Droid can use their tools in sessions, with managed authentication and organization-level controls.
+                                    <div><a href="https://docs.factory.com/harness/connectors" target="_blank" rel="noopener">Connectors</a></div></td>
+                                <td>Not used. Forge talks to GitHub with its own app-owned client.</td>
+                            </tr>
+                            <tr>
+                                <th scope="row">QA</th>
+                                <td>Automated QA that tests an application as a real user would across web, CLI and API surfaces, with visual evidence.
+                                    <div><a href="https://docs.factory.com/software-factory/automated-qa" target="_blank" rel="noopener">Automated QA</a></div></td>
+                                <td>Not integrated. Forge runs only the acceptance checks you configure in <code>FORGE_ACCEPTANCE_CHECKS</code>.</td>
+                            </tr>
+                            <tr>
+                                <th scope="row">AutoWiki and Agent Readiness</th>
+                                <td>Generated, structured repository wikis, and an Agent Readiness model with a report command and dashboard.
+                                    <div><a href="https://docs.factory.com/software-factory/wiki/overview" target="_blank" rel="noopener">AutoWiki</a> ·
+                                    <a href="https://docs.factory.com/agent-readiness/overview" target="_blank" rel="noopener">Agent Readiness</a></div></td>
+                                <td>Not integrated in the app. Repository documents are maintained separately from Forge.</td>
+                            </tr>
+                            <tr>
+                                <th scope="row">Agent Effectiveness</th>
+                                <td>Measuring how engineering throughput changes with Factory and connecting agent spend to the work it produces, once integrations and Advanced Analytics are enabled.
+                                    <div><a href="https://docs.factory.com/agent-effectiveness/overview" target="_blank" rel="noopener">Agent Effectiveness</a> ·
+                                    <a href="https://docs.factory.com/agent-effectiveness/cost-and-productivity" target="_blank" rel="noopener">Cost &amp; Productivity</a></div></td>
+                                <td>Not connected. Forge's outcome economics are a local view of this app's own tasks, not Agent Effectiveness.</td>
+                            </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <div class="card shadow-sm border-0" aria-labelledby="cap-future-heading">
+                    <div class="card-header d-flex justify-content-between align-items-center flex-wrap gap-2">
+                        <h3 class="h6 fw-semibold mb-0" id="cap-future-heading">Future extension</h3>
+                        <span class="badge text-bg-secondary">Not built</span>
+                    </div>
+                    <div class="card-body small">
+                        <ul class="mb-0">
+                            <li>Multi-user access with SSO and roles instead of one operator token.</li>
+                            <li>A billing source for reconciling dollars automatically, instead of manual estimates and reconciled amounts.</li>
+                            <li>Separate usage attribution for delegated child sessions, which the SDK does not report to Forge today.</li>
+                            <li>Running agents in an isolated sandbox or on remote compute rather than as the app's OS account.</li>
+                            <li>A durable job queue and a shared database for more than one app instance.</li>
+                            <li>Exporting Forge outcomes to an organization's analytics or telemetry pipeline.</li>
+                        </ul>
+                    </div>
+                </div>
+            </section>

@@ -1,0 +1,25 @@
+        <!-- Operator guide -->
+        <div class="tab-pane fade" id="guide" role="tabpanel" aria-labelledby="guide-tab">
+            <h2 class="h5 mb-3">How work moves through Forge</h2>
+            <div class="card shadow-sm border-0 mb-4">
+                <div class="card-body">
+                    <ol class="guide-steps mb-0">
+                        <li><strong>Assign.</strong> Select issues in <a href="#issues" data-tab-link="issues">Issues</a>. Forge runs a local Droid session in an isolated workspace clone.</li>
+                        <li><strong>Agent turn.</strong> Each turn is a separate attempt with its own usage. A completed turn only means the agent stopped; it may leave a local candidate commit. You can send a follow-up (a new attempt) or stop an active turn. Restarts never resume work on their own.</li>
+                        <li><strong>Acceptance checks.</strong> On a task's detail page, run the configured checks. The app runs them in a clean checkout of the exact candidate commit, without GitHub or operator credentials.</li>
+                        <li><strong>Restricted review.</strong> Start a review of the same commit. The reviewer can only read, grep and glob the exact diff. It runs no commands or tests.</li>
+                        <li><strong>Your approval.</strong> When checks passed and the review approved that exact commit, you can approve it. Approval covers only that commit, is not a GitHub review, and grants no merge permission. A new commit needs fresh checks, review and approval.</li>
+                        <li><strong>Publication.</strong> A separate, explicit step pushes the approved commit to the allowed branch (never by force) and creates or reuses a draft pull request. It is refused when policy does not permit GitHub writes.</li>
+                        <li><strong>Remote CI.</strong> GitHub CI can only run after publication. Forge observes it read-only and shows pending, failing, passing or unavailable states as they are.</li>
+                        <li><strong>Merge.</strong> Forge never merges or enables auto-merge. Merging stays a human decision on GitHub.</li>
+                    </ol>
+                </div>
+            </div>
+            <div class="card shadow-sm border-0">
+                <div class="card-body small">
+                    <p class="mb-1"><strong>Reviewing existing pull requests.</strong> Use <a href="#reviews" data-tab-link="reviews">PR reviews</a> to assign an open pull request, including a draft, to a restricted review. The review detail shows the reviewed head commit, the AI verdict and findings, and separately what was recorded on GitHub.</p>
+                    <p class="mb-0 text-muted">A self-review that GitHub refuses as a formal approval is posted as a comment and labeled as such; it is not a formal GitHub approval.</p>
+                </div>
+            </div>
+{% include "partials/capability_guide.html" %}
+        </div>

@@ -11,7 +11,7 @@
           },
           "setup_command": {
             "default": "",
-            "description": "Optional shell command run in the workspace clone before the session",
+            "description": "Optional shell command for the workspace clone; stored only. It runs before the session only when FORGE_ALLOW_PRIVILEGED_SETUP=true",
             "title": "Setup Command",
             "type": "string"
           },
@@ -50,6 +50,30 @@
         "title": "AssignIssuesRequest",
         "type": "object"
       },
+      "AssignPullByNumberRequest": {
+        "properties": {
+          "pr_number": {
+            "description": "Pull request number",
+            "maximum": 10000000.0,
+            "minimum": 1.0,
+            "title": "Pr Number",
+            "type": "integer"
+          },
+          "repository": {
+            "description": "Registered repository, owner/name",
+            "maxLength": 255,
+            "minLength": 3,
+            "title": "Repository",
+            "type": "string"
+          }
+        },
+        "required": [
+          "repository",
+          "pr_number"
+        ],
+        "title": "AssignPullByNumberRequest",
+        "type": "object"
+      },
       "AssignPullsRequest": {
         "properties": {
           "pull_ids": {
@@ -65,6 +89,107 @@
           "pull_ids"
         ],
         "title": "AssignPullsRequest",
+        "type": "object"
+      },
+      "AssumptionsRequest": {
+        "properties": {
+          "baseline_minutes_per_change": {
+            "description": "Assumed human engineering minutes per change without the agent (not measured)",
+            "exclusiveMinimum": 0.0,
+            "maximum": 100000.0,
+            "title": "Baseline Minutes Per Change",
+            "type": "number"
+          },
+          "loaded_hourly_usd": {
+            "anyOf": [
+              {
+                "maximum": 10000.0,
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional assumed loaded engineering cost per hour, used only to value the capacity scenario",
+            "title": "Loaded Hourly Usd"
+          },
+          "source": {
+            "description": "Where the assumptions came from",
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Source",
+            "type": "string"
+          }
+        },
+        "required": [
+          "baseline_minutes_per_change",
+          "source"
+        ],
+        "title": "AssumptionsRequest",
+        "type": "object"
+      },
+      "CandidateRequest": {
+        "properties": {
+          "candidate_sha": {
+            "description": "Full SHA of the candidate commit shown to the operator",
+            "pattern": "^[0-9a-f]{40}([0-9a-f]{24})?$",
+            "title": "Candidate Sha",
+            "type": "string"
+          }
+        },
+        "required": [
+          "candidate_sha"
+        ],
+        "title": "CandidateRequest",
+        "type": "object"
+      },
+      "CostEstimateRequest": {
+        "properties": {
+          "rate_usd_per_credit": {
+            "description": "Explicit USD per Factory credit used for this estimate (not a verified billing rate)",
+            "exclusiveMinimum": 0.0,
+            "maximum": 1000.0,
+            "title": "Rate Usd Per Credit",
+            "type": "number"
+          },
+          "source": {
+            "description": "Where the rate came from",
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Source",
+            "type": "string"
+          }
+        },
+        "required": [
+          "rate_usd_per_credit",
+          "source"
+        ],
+        "title": "CostEstimateRequest",
+        "type": "object"
+      },
+      "CostReconciliationRequest": {
+        "properties": {
+          "source": {
+            "description": "Where the amount came from",
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Source",
+            "type": "string"
+          },
+          "usd": {
+            "description": "Manually supplied dollar amount for this attempt (e.g. from an invoice)",
+            "maximum": 1000000.0,
+            "minimum": 0.0,
+            "title": "Usd",
+            "type": "number"
+          }
+        },
+        "required": [
+          "usd",
+          "source"
+        ],
+        "title": "CostReconciliationRequest",
         "type": "object"
       },
       "FollowUpRequest": {
@@ -95,6 +220,37 @@
         "title": "HTTPValidationError",
         "type": "object"
       },
+      "HumanEffortRequest": {
+        "properties": {
+          "note": {
+            "default": "",
+            "description": "Optional short note on how the minutes were counted",
+            "maxLength": 200,
+            "title": "Note",
+            "type": "string"
+          },
+          "review_minutes": {
+            "description": "Human minutes spent reviewing this task's change (user-entered)",
+            "maximum": 100000.0,
+            "minimum": 0.0,
+            "title": "Review Minutes",
+            "type": "number"
+          },
+          "rework_minutes": {
+            "description": "Human minutes spent reworking or fixing it (user-entered)",
+            "maximum": 100000.0,
+            "minimum": 0.0,
+            "title": "Rework Minutes",
+            "type": "number"
+          }
+        },
+        "required": [
+          "review_minutes",
+          "rework_minutes"
+        ],
+        "title": "HumanEffortRequest",
+        "type": "object"
+      },
       "UpdateRepositoryRequest": {
         "properties": {
           "droid_model": {
@@ -118,7 +274,7 @@
                 "type": "null"
               }
             ],
-            "description": "Optional shell command run in the workspace clone before the session",
+            "description": "Optional shell command for the workspace clone; stored only. It runs before the session only when FORGE_ALLOW_PRIVILEGED_SETUP=true",
             "title": "Setup Command"
           },
           "starting_ref": {
@@ -202,6 +358,140 @@
         "summary": "Root"
       }
     },
+    "/api/attempts/{attempt_id}": {
+      "get": {
+        "description": "One attempt with its usage, dollar status and bounded operational timeline.",
+        "operationId": "attempt_detail_api_attempts__attempt_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "attempt_id",
+            "required": true,
+            "schema": {
+              "title": "Attempt Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Attempt Detail"
+      }
+    },
+    "/api/attempts/{attempt_id}/cost-estimate": {
+      "post": {
+        "description": "Record an explicit dollar *estimate* for a finished attempt's observed credits.\n\nRefused (409) while the attempt runs or when no credits were observed; the\ncost then stays unknown. An estimate is never presented as a bill.",
+        "operationId": "estimate_attempt_cost_api_attempts__attempt_id__cost_estimate_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "attempt_id",
+            "required": true,
+            "schema": {
+              "title": "Attempt Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CostEstimateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Estimate Attempt Cost"
+      }
+    },
+    "/api/attempts/{attempt_id}/cost-reconciliation": {
+      "post": {
+        "description": "Record a manually reconciled dollar amount for a finished attempt, kept apart from any estimate.",
+        "operationId": "reconcile_attempt_cost_api_attempts__attempt_id__cost_reconciliation_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "attempt_id",
+            "required": true,
+            "schema": {
+              "title": "Attempt Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CostReconciliationRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Reconcile Attempt Cost"
+      }
+    },
     "/api/droid/models": {
       "get": {
         "description": "Model catalog for the dashboard dropdown (Factory Router = \"auto\").",
@@ -221,6 +511,77 @@
           }
         },
         "summary": "List Droid Models"
+      }
+    },
+    "/api/economics": {
+      "get": {
+        "description": "Accepted population, observed credits, dollar coverage, cost per accepted change, effort and scenario.",
+        "operationId": "economics_api_economics_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Economics"
+      }
+    },
+    "/api/economics/assumptions": {
+      "put": {
+        "description": "Save the baseline assumptions for the capacity scenario. They are labeled user-entered everywhere.",
+        "operationId": "save_assumptions_api_economics_assumptions_put",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AssumptionsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Save Assumptions"
+      }
+    },
+    "/api/health": {
+      "get": {
+        "description": "Operator-only component status, including GitHub and Droid connectivity.",
+        "operationId": "health_details_api_health_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Health Details"
       }
     },
     "/api/issues": {
@@ -245,7 +606,7 @@
     },
     "/api/issues/assign": {
       "post": {
-        "description": "Add the trigger label on GitHub so the webhook (flow 1) launches the agent.\n\nAlways applies the trigger label on the issue. When ``PUBLIC_BASE_URL`` is\nconfigured, forge waits briefly for the webhook to create the task;\notherwise it dispatches the Droid session directly after labeling\n(same end state, with duplicate protection if the webhook also fires).",
+        "description": "Dispatch selected issues to Droid, labeling them on GitHub when policy permits.\n\nIssues outside repository policy are rejected before any call. With GitHub\nwrites permitted, the trigger label is applied; when ``PUBLIC_BASE_URL`` is\nconfigured, forge waits briefly for the webhook to create the task.\nOtherwise it dispatches the Droid session directly (same end state, with\nduplicate protection if the webhook also fires).",
         "operationId": "assign_issues_to_droid_api_issues_assign_post",
         "requestBody": {
           "content": {
@@ -278,6 +639,23 @@
           }
         },
         "summary": "Assign Issues To Droid"
+      }
+    },
+    "/api/overview": {
+      "get": {
+        "description": "Delivery-stage counts and the most recent tasks, keeping completion, acceptance, publication, CI and merge apart.",
+        "operationId": "overview_api_overview_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Overview"
       }
     },
     "/api/pulls": {
@@ -336,6 +714,43 @@
           }
         },
         "summary": "Assign Pulls To Droid"
+      }
+    },
+    "/api/pulls/assign-number": {
+      "post": {
+        "description": "Start a restricted review of an existing (open, draft or ready) PR in a registered repository.",
+        "operationId": "assign_pull_by_number_api_pulls_assign_number_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AssignPullByNumberRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Assign Pull By Number"
       }
     },
     "/api/repositories": {
@@ -550,6 +965,169 @@
         "summary": "Sync Repository Issues"
       }
     },
+    "/api/reviews": {
+      "get": {
+        "description": "Recent reviews, newest first. ``target`` is ``pull_request``, ``candidate`` or ``all``.",
+        "operationId": "list_reviews_api_reviews_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 20,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "target",
+            "required": false,
+            "schema": {
+              "default": "pull_request",
+              "title": "Target",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Reviews"
+      }
+    },
+    "/api/reviews/{review_id}": {
+      "get": {
+        "description": "One restricted review with its attempt(s) and usage coverage.",
+        "operationId": "review_detail_api_reviews__review_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "review_id",
+            "required": true,
+            "schema": {
+              "title": "Review Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Review Detail"
+      }
+    },
+    "/api/reviews/{review_id}/stop": {
+      "post": {
+        "description": "Durably stop a review that is waiting to start or running.",
+        "operationId": "stop_review_api_reviews__review_id__stop_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "review_id",
+            "required": true,
+            "schema": {
+              "title": "Review Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Stop Review"
+      }
+    },
+    "/api/run-limits": {
+      "get": {
+        "description": "Concurrency, runtime and continuation limits plus the configured spending check.\n\nUnder the ``account_cap`` policy the dollar cap is enforced by the Factory\naccount, not by Forge; dollars stay unknown without a verified rate.",
+        "operationId": "run_limits_api_run_limits_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Run Limits"
+      }
+    },
+    "/api/session": {
+      "get": {
+        "description": "Describe the caller's access mode and session expiry (never returns credentials).",
+        "operationId": "session_info_api_session_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Session Info Api Session Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Session Info"
+      }
+    },
     "/api/tasks": {
       "get": {
         "operationId": "list_tasks_api_tasks_get",
@@ -602,9 +1180,370 @@
         "summary": "List Tasks"
       }
     },
+    "/api/tasks/{task_id}": {
+      "get": {
+        "description": "One implementation task with its ordered attempts and usage coverage.",
+        "operationId": "task_detail_api_tasks__task_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "task_id",
+            "required": true,
+            "schema": {
+              "title": "Task Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Task Detail"
+      }
+    },
+    "/api/tasks/{task_id}/approve": {
+      "post": {
+        "description": "Approve publication of exactly ``candidate_sha``. Not a GitHub review; grants no merge permission.",
+        "operationId": "approve_api_tasks__task_id__approve_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "task_id",
+            "required": true,
+            "schema": {
+              "title": "Task Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CandidateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Approve"
+      }
+    },
+    "/api/tasks/{task_id}/attempts": {
+      "get": {
+        "operationId": "task_attempts_api_tasks__task_id__attempts_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "task_id",
+            "required": true,
+            "schema": {
+              "title": "Task Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Task Attempts"
+      }
+    },
+    "/api/tasks/{task_id}/candidate-review": {
+      "post": {
+        "description": "Start a fresh restricted (Read/Grep/Glob) review of the current candidate. Nothing is posted to GitHub.",
+        "operationId": "review_candidate_api_tasks__task_id__candidate_review_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "task_id",
+            "required": true,
+            "schema": {
+              "title": "Task Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Review Candidate"
+      }
+    },
+    "/api/tasks/{task_id}/checks": {
+      "post": {
+        "description": "Run the configured acceptance checks against the current candidate in a clean checkout.",
+        "operationId": "run_checks_api_tasks__task_id__checks_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "task_id",
+            "required": true,
+            "schema": {
+              "title": "Task Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Run Checks"
+      }
+    },
+    "/api/tasks/{task_id}/ci/refresh": {
+      "post": {
+        "description": "Observe GitHub CI (read-only) for the task's latest pushed publication.",
+        "operationId": "refresh_ci_api_tasks__task_id__ci_refresh_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "task_id",
+            "required": true,
+            "schema": {
+              "title": "Task Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Refresh Ci"
+      }
+    },
+    "/api/tasks/{task_id}/delivery": {
+      "get": {
+        "description": "Candidate, SHA-bound checks/review/approval, destination, publication, remote CI and readiness.",
+        "operationId": "delivery_detail_api_tasks__task_id__delivery_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "task_id",
+            "required": true,
+            "schema": {
+              "title": "Task Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delivery Detail"
+      }
+    },
+    "/api/tasks/{task_id}/economics": {
+      "get": {
+        "description": "One task's acceptance, observed credits (including failed and retried attempts), dollars, time and effort.",
+        "operationId": "task_economics_detail_api_tasks__task_id__economics_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "task_id",
+            "required": true,
+            "schema": {
+              "title": "Task Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Task Economics Detail"
+      }
+    },
+    "/api/tasks/{task_id}/evidence": {
+      "get": {
+        "description": "Bounded, redacted evidence for one selected task. ``download=true`` returns it as an attachment.",
+        "operationId": "export_task_evidence_api_tasks__task_id__evidence_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "task_id",
+            "required": true,
+            "schema": {
+              "title": "Task Id",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "download",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Download",
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Export Task Evidence"
+      }
+    },
     "/api/tasks/{task_id}/follow-up": {
       "post": {
-        "description": "Send a follow-up prompt to the task's Droid session (SDK resume + send).\n\nLive-extend hook for interview demos \u2014 e.g. \"fix failing CI\" or\n\"add a regression test\".",
+        "description": "Send a follow-up prompt to the task's Droid session as a new attempt.\n\nRefused while the task has an active attempt; earlier attempts keep their\noutcome and usage.",
         "operationId": "follow_up_task_api_tasks__task_id__follow_up_post",
         "parameters": [
           {
@@ -650,9 +1589,219 @@
         "summary": "Follow Up Task"
       }
     },
+    "/api/tasks/{task_id}/human-effort": {
+      "put": {
+        "description": "Record the human review and rework minutes for one task, replacing any earlier entry.",
+        "operationId": "save_human_effort_api_tasks__task_id__human_effort_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "task_id",
+            "required": true,
+            "schema": {
+              "title": "Task Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/HumanEffortRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Save Human Effort"
+      }
+    },
+    "/api/tasks/{task_id}/publish": {
+      "post": {
+        "description": "Push the approved candidate to its allowed branch and create or reuse a draft PR.\n\nComplete only when the PR is an open, unmerged draft at the approved SHA.\n502 reports a partial publication with every known fact (pushed or not,\nremote head, PR); retrying continues without duplicating the push or PR.\n409 ``publication_in_progress`` or ``task_busy`` means another task change holds the task.",
+        "operationId": "publish_api_tasks__task_id__publish_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "task_id",
+            "required": true,
+            "schema": {
+              "title": "Task Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CandidateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Publish"
+      }
+    },
+    "/api/tasks/{task_id}/recover": {
+      "post": {
+        "description": "Explicitly resume an interrupted or failed task session as a new recovery attempt.\n\nStartup never does this on its own. The interrupted/failed attempt keeps\nits status and usage; the recovery is appended after it.",
+        "operationId": "recover_task_api_tasks__task_id__recover_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "task_id",
+            "required": true,
+            "schema": {
+              "title": "Task Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Recover Task"
+      }
+    },
+    "/api/tasks/{task_id}/stop": {
+      "post": {
+        "description": "Durably stop the task's active implementation, follow-up or recovery turn.\n\nThe stop is recorded before the SDK is asked to interrupt; a late result\ncannot return the task to running or mark it successful, and a restart\nnever resumes it. Repeating the stop is harmless.",
+        "operationId": "stop_task_api_tasks__task_id__stop_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "task_id",
+            "required": true,
+            "schema": {
+              "title": "Task Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Stop Task"
+      }
+    },
+    "/api/tasks/{task_id}/timeline": {
+      "get": {
+        "description": "Every attempt's public events for a task, in attempt then event order.",
+        "operationId": "task_timeline_api_tasks__task_id__timeline_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "task_id",
+            "required": true,
+            "schema": {
+              "title": "Task Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Task Timeline"
+      }
+    },
     "/api/webhooks/sync": {
       "post": {
-        "description": "Ensure trigger label + issues webhook exist on every registered repository.",
+        "description": "Ensure trigger label + issues webhook exist on every registered repository.\n\nInstalling webhooks is never a permitted outward action, so this is\nrefused before any GitHub call; configure the hook in GitHub instead.",
         "operationId": "sync_github_webhooks_api_webhooks_sync_post",
         "responses": {
           "200": {
@@ -687,6 +1836,7 @@
     },
     "/health": {
       "get": {
+        "description": "Minimal public liveness: database reachability only, no external probes or versions.",
         "operationId": "health_health_get",
         "responses": {
           "200": {
@@ -699,6 +1849,81 @@
           }
         },
         "summary": "Health"
+      }
+    },
+    "/login": {
+      "get": {
+        "description": "Operator sign-in page (public).",
+        "operationId": "login_form_login_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "next",
+            "required": false,
+            "schema": {
+              "default": "/dashboard",
+              "title": "Next",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Login Form"
+      },
+      "post": {
+        "description": "Exchange the operator credential for a session cookie (form-encoded `token`, `next`).",
+        "operationId": "login_submit_login_post",
+        "responses": {
+          "200": {
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Login Submit"
+      }
+    },
+    "/logout": {
+      "post": {
+        "description": "End the operator session (form-encoded `csrf_token`).",
+        "operationId": "logout_logout_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Logout"
       }
     },
     "/metrics": {
@@ -721,8 +1946,87 @@
         "summary": "Metrics"
       }
     },
+    "/reviews/{review_id}": {
+      "get": {
+        "operationId": "review_page_reviews__review_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "review_id",
+            "required": true,
+            "schema": {
+              "title": "Review Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Review Page"
+      }
+    },
+    "/tasks/{task_id}": {
+      "get": {
+        "operationId": "task_page_tasks__task_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "task_id",
+            "required": true,
+            "schema": {
+              "title": "Task Id",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Task Page"
+      }
+    },
     "/webhook": {
       "post": {
+        "description": "GitHub `issues` webhook; requires its own HMAC (`X-Hub-Signature-256`), not operator auth.",
         "operationId": "webhook_webhook_post",
         "responses": {
           "200": {

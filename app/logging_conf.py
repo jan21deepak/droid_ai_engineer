@@ -5,54 +5,36 @@ Two filters run on every record:
 
 - ``RequestIDFilter`` — stamps the current request id (see ``app.tracing``)
   onto each record so log lines from the same HTTP request are correlatable.
-- ``ScrubbingFilter`` — masks token-shaped secrets (GitHub PATs, bearer tokens,
-  ``key=value`` pairs for token/key/secret fields) so credentials never reach
-  log files.
+- ``ScrubbingFilter`` — masks configured credential values, token-shaped
+  secrets (GitHub PATs, bearer tokens, ``key=value`` pairs for token/key/secret
+  fields) and nested structured context so credentials never reach log files.
 """
 
 import logging
-import re
 import sys
 from datetime import datetime
 from typing import Any
 
+from app.redaction import MASK, is_sensitive_key, known_secret_values, redact, redact_text
 from app.timeutil import SGT
 
-# Token shapes seen in this system: GitHub PATs (classic + fine-grained),
-# Factory keys, generic bearer/jwt-ish strings.
-SECRET_PATTERNS = [
-    re.compile(r"gh[pousr]_[A-Za-z0-9]{16,}"),
-    re.compile(r"github_pat_[A-Za-z0-9_]{20,}"),
-    re.compile(r"sk-[A-Za-z0-9_-]{16,}"),
-    re.compile(r"eyJ[A-Za-z0-9_-]{20,}\.eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]+"),
-]
-# key=value / key: value contexts whose value is always sensitive. Matches
-# compound field names like GITHUB_TOKEN or api_key but not "tokens=1234".
-SECRET_KV = re.compile(
-    r"(?i)(?<![\w.-])((?:[\w.-]+_)*(?:api_?key|token|secret|password)(?:_[\w-]+)*)(\s*[=:]\s*)(\"?)([^\s\",;]+)"
-)
-
-MASK = "[REDACTED]"
+__all__ = ["MASK", "log_event", "scrub", "scrub_ctx", "setup_logging"]
 
 
 def scrub(value: str) -> str:
-    """Mask token-shaped secrets and sensitive key=value pairs in free text."""
-    result = value
-    for pattern in SECRET_PATTERNS:
-        result = pattern.sub(MASK, result)
-    return SECRET_KV.sub(lambda m: f"{m.group(1)}{m.group(2)}{m.group(3)}{MASK}", result)
+    """Mask known credentials, token-shaped secrets and sensitive key=value pairs in free text."""
+    return redact_text(value)
 
 
 def scrub_ctx(ctx: dict[str, Any]) -> dict[str, Any]:
-    """Mask sensitive-looking values inside structured log context fields."""
+    """Mask sensitive-looking values inside (possibly nested) structured log context fields."""
+    secrets = known_secret_values()
     cleaned: dict[str, Any] = {}
     for key, value in ctx.items():
-        if any(word in key.lower() for word in ("token", "key", "secret", "password")):
+        if is_sensitive_key(key):
             cleaned[key] = MASK
-        elif isinstance(value, str):
-            cleaned[key] = scrub(value)
         else:
-            cleaned[key] = value
+            cleaned[key] = redact(value, secrets=secrets)
     return cleaned
 
 
@@ -72,11 +54,9 @@ class ScrubbingFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         if record.args:
             if isinstance(record.args, dict):
-                record.args = {
-                    key: (scrub(value) if isinstance(value, str) else value) for key, value in record.args.items()
-                }
+                record.args = redact(record.args)
             else:
-                record.args = tuple(scrub(arg) if isinstance(arg, str) else arg for arg in record.args)
+                record.args = tuple(redact(arg) for arg in record.args)
         record.msg = scrub(str(record.msg))
         ctx = getattr(record, "ctx", None)
         if ctx:
@@ -96,7 +76,7 @@ class StructuredFormatter(logging.Formatter):
             kv = " ".join(f"{k}={v}" for k, v in extras.items())
             base = f"{base} | {kv}"
         if record.exc_info:
-            base = f"{base}\n{self.formatException(record.exc_info)}"
+            base = f"{base}\n{scrub(self.formatException(record.exc_info))}"
         return base
 
 

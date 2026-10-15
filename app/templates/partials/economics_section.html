@@ -1,0 +1,64 @@
+            <section class="card shadow-sm border-0 mb-4" id="economics" aria-labelledby="economics-heading">
+                <div class="card-header d-flex justify-content-between align-items-center flex-wrap gap-2">
+                    <h2 class="h6 fw-semibold mb-0" id="economics-heading">Outcome economics</h2>
+                    <span class="text-muted small">Observed facts, unknowns and user-entered assumptions are labeled separately</span>
+                </div>
+                <div class="card-body">
+                    <div class="row g-3 mb-3">
+                        {% for key, title in [
+                            ('accepted', 'Accepted changes'),
+                            ('elapsed', 'Elapsed delivery time'),
+                            ('credits', 'Observed Factory credits'),
+                            ('cost', 'Cost per accepted change'),
+                            ('effort', 'Human review effort'),
+                        ] %}
+                        <div class="col-12 col-sm-6 col-xl">
+                            <div class="econ-card h-100" data-econ-card="{{ key }}">
+                                <div class="overview-card-title">{{ title }}</div>
+                                <div class="stat-value fs-4" data-econ="{{ key }}">—</div>
+                                <p class="overview-definition mb-0" data-econ-detail="{{ key }}"></p>
+                            </div>
+                        </div>
+                        {% endfor %}
+                    </div>
+                    <p class="small mb-3" id="econ-usd"></p>
+
+                    <div class="row g-3">
+                        <div class="col-lg-6">
+                            <form id="assumptions-form" class="econ-panel" novalidate aria-describedby="assumptions-help">
+                                <h3 class="h6 mb-1">Baseline assumptions <span class="badge text-bg-warning">User-entered</span></h3>
+                                <p class="small text-muted mb-2" id="assumptions-help">
+                                    Your estimate of the work without the agent. These values are not measured; they only drive the
+                                    capacity scenario. Record human review and rework minutes on each task's page.
+                                </p>
+                                <div class="row g-2">
+                                    <div class="col-sm-6">
+                                        <label class="form-label small mb-1" for="assume-baseline">Engineering minutes per change (baseline)</label>
+                                        <input type="number" class="form-control form-control-sm" id="assume-baseline" min="0" max="100000" step="any" inputmode="decimal" required>
+                                    </div>
+                                    <div class="col-sm-6">
+                                        <label class="form-label small mb-1" for="assume-hourly">Loaded cost per hour, USD (optional)</label>
+                                        <input type="number" class="form-control form-control-sm" id="assume-hourly" min="0" max="10000" step="any" inputmode="decimal">
+                                    </div>
+                                    <div class="col-12">
+                                        <label class="form-label small mb-1" for="assume-source">Source of these assumptions</label>
+                                        <input type="text" class="form-control form-control-sm" id="assume-source" maxlength="200" required placeholder="e.g. team estimate, October planning">
+                                    </div>
+                                </div>
+                                <div class="d-flex align-items-center gap-2 mt-2 flex-wrap">
+                                    <button type="submit" class="btn btn-sm btn-outline-primary" id="assumptions-btn">Save assumptions</button>
+                                    <span class="small text-muted" id="assumptions-saved"></span>
+                                </div>
+                                <div id="assumptions-alert" class="alert d-none mt-2 mb-0" role="alert"></div>
+                            </form>
+                        </div>
+                        <div class="col-lg-6">
+                            <div class="econ-panel h-100" aria-labelledby="scenario-heading">
+                                <h3 class="h6 mb-1" id="scenario-heading">Capacity scenario <span class="badge text-bg-secondary">Estimate, not cash savings</span></h3>
+                                <div id="econ-scenario" class="small"><span class="text-muted">Loading…</span></div>
+                            </div>
+                        </div>
+                    </div>
+                    <ul class="small text-muted mt-3 mb-0 econ-notes" id="econ-notes"></ul>
+                </div>
+            </section>

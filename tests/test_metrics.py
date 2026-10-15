@@ -1,5 +1,7 @@
+import time
 from datetime import UTC, datetime, timedelta
 
+from app.config import get_settings
 from app.database import db_session
 from app.models import Repository, ReviewTask, Task, TaskStatus
 from app.repos import parse_repository_ref
@@ -113,20 +115,22 @@ def test_dashboard_renders(client):
     assert "Assign to Droid Review" not in resp.text
     assert "Fix Time Stats" in resp.text
     assert "Review Time Stats" in resp.text
-    assert "Engineering KPIs" in resp.text
-    assert "Avg PR Cycle Time" in resp.text
-    assert "PRs Delivered (7d)" in resp.text
-    assert "Merge Rate" in resp.text
-    assert "Change Failure Rate" in resp.text
-    assert "Time-to-Dollar Savings" in resp.text
+    assert "Agent activity indicators" in resp.text
+    assert "Avg agent time per completed fix" in resp.text
+    assert "PRs recorded (7d)" in resp.text
+    assert "Merged (observed)" in resp.text
+    assert "Avg PR Cycle Time" not in resp.text
+    assert "Time-to-Dollar" not in resp.text
+    assert "Agent run failure rate" in resp.text
+    assert "Change Failure Rate" not in resp.text
     assert "Droid Forge" in resp.text
     assert "The AI Engineer That Delivers" in resp.text
     assert 'data-bs-theme="dark"' in resp.text
     assert "Daily Activity" in resp.text
     assert 'id="daily-chart"' in resp.text
     assert "last 14 days · SGT" in resp.text
-    # Status cards, KPIs, ROI figure and the daily chart all carry explanations
-    assert resp.text.count('class="metric-info"') == 12
+    # Status cards, activity indicators and the daily chart all carry explanations
+    assert resp.text.count('class="metric-info"') == 11
     assert "Droid Runs Completed" in resp.text
     assert "PRs merged" in resp.text
     assert "Tokens Used" not in resp.text
@@ -395,6 +399,12 @@ def test_parse_repository_ref():
     assert parse_repository_ref("jan21deepak/superset") == "jan21deepak/superset"
     assert parse_repository_ref("https://github.com/jan21deepak/superset.git") == "jan21deepak/superset"
     assert parse_repository_ref("not a repo") is None
+    assert parse_repository_ref("https://www.github.com/a/b.git") == "a/b"
+    assert parse_repository_ref("github.com/a/.git") == "a/.git"
+    assert parse_repository_ref("github.com/a/b/c") is None
+    started = time.perf_counter()
+    assert parse_repository_ref("github.com/a/" + "-" * 20_000 + "!") is None
+    assert time.perf_counter() - started < 1
 
 
 def test_add_repository_endpoint(client, monkeypatch):
@@ -415,6 +425,8 @@ def test_add_repository_endpoint(client, monkeypatch):
 
 
 def test_add_issues_imports_five_from_parent_and_syncs(client, monkeypatch):
+    monkeypatch.setenv("FORGE_ALLOW_GITHUB_WRITES", "true")
+    get_settings.cache_clear()
     with db_session() as session:
         repo = Repository(
             full_name="jan21deepak/superset",

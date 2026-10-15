@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en" data-bs-theme="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="referrer" content="same-origin">
+    <title>Droid Forge — Operator sign in</title>
+    <style>
+        body { margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
+               background: #0b0b18; color: #e8ecf5; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
+        main { width: min(420px, 92vw); background: #14142a; border: 1px solid #2a2a4a; border-radius: 12px; padding: 2rem; }
+        h1 { font-size: 1.4rem; margin: 0 0 .25rem; }
+        p { color: #a9b1c7; font-size: .95rem; margin: 0 0 1.25rem; }
+        label { display: block; font-size: .9rem; margin-bottom: .35rem; }
+        input[type=password] { width: 100%; box-sizing: border-box; padding: .6rem .7rem; border-radius: 8px;
+                               border: 1px solid #3a3a5e; background: #0f0f22; color: inherit; font-size: 1rem; }
+        input:focus-visible, button:focus-visible { outline: 3px solid #00e5ff; outline-offset: 2px; }
+        button { margin-top: 1rem; width: 100%; padding: .65rem; border: 0; border-radius: 8px;
+                 background: #00b8d4; color: #0b0b18; font-weight: 700; font-size: 1rem; cursor: pointer; }
+        .error { background: #3b1220; border: 1px solid #a33a55; color: #ffd0da; padding: .6rem .75rem;
+                 border-radius: 8px; margin-bottom: 1rem; font-size: .92rem; }
+    </style>
+</head>
+<body>
+<main>
+    <h1>Droid Forge operator sign in</h1>
+    <p>This private console is restricted to the configured operator.</p>
+    {% if error %}<div class="error" role="alert" id="login-error">{{ error }}</div>{% endif %}
+    <form method="post" action="/login" autocomplete="off">
+        <input type="hidden" name="next" value="{{ next_url }}">
+        <label for="token">Operator token</label>
+        <input type="password" id="token" name="token" required autocomplete="current-password" autofocus>
+        <button type="submit" id="login-submit">Sign in</button>
+    </form>
+</main>
+</body>
+</html>

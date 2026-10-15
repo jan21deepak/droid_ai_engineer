@@ -10,16 +10,20 @@ import httpx
 
 from app.config import get_settings
 from app.logging_conf import log_event
+from app.policy import OutwardAction, OutwardActionDeniedError, PolicyDecision, outward_decision
 from app.resilience import retry_with_backoff
 
 logger = logging.getLogger("app.github")
 
 
 def verify_signature(secret: str, body: bytes, signature_header: str | None) -> bool:
-    """Validate the X-Hub-Signature-256 header using HMAC SHA-256."""
+    """Validate the X-Hub-Signature-256 header using HMAC SHA-256.
+
+    Fails closed: without a configured secret no payload is considered signed.
+    """
     if not secret:
-        log_event(logger, logging.WARNING, "webhook.signature_skipped", reason="no secret configured")
-        return True
+        log_event(logger, logging.WARNING, "webhook.signature_rejected", reason="no secret configured")
+        return False
     if not signature_header or not signature_header.startswith("sha256="):
         return False
     expected = "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
@@ -38,15 +42,33 @@ class IssueEvent:
     label_added: str | None = None
 
 
+# GitHub issue numbers are positive and fit the INTEGER column comfortably.
+MAX_ISSUE_NUMBER = 2**31 - 1
+
+
+def positive_issue_number(value: object) -> int | None:
+    """The value when it is an actual positive JSON integer; booleans, floats and strings are refused."""
+    if type(value) is not int or not 0 < value <= MAX_ISSUE_NUMBER:
+        return None
+    return value
+
+
 def parse_issue_event(payload: dict[str, Any]) -> IssueEvent:
-    """Extract the relevant fields from a GitHub `issues` webhook payload."""
+    """Extract the relevant fields from a GitHub `issues` webhook payload.
+
+    Raises ``ValueError`` unless ``issue.number`` is a positive integer as sent;
+    nothing is coerced, so a malformed number can never target another issue.
+    """
     repo = payload.get("repository") or {}
     issue = payload.get("issue") or {}
+    number = positive_issue_number(issue.get("number"))
+    if number is None:
+        raise ValueError("issue number must be a positive integer")
     return IssueEvent(
         action=payload.get("action", ""),
         repository=repo.get("full_name", ""),
         repository_url=repo.get("html_url", ""),
-        issue_number=int(issue.get("number", 0)),
+        issue_number=number,
         issue_title=issue.get("title", "") or "",
         issue_body=issue.get("body", "") or "",
         labels=[lbl.get("name", "") for lbl in issue.get("labels", []) or []],
@@ -71,6 +93,27 @@ class GitHubClient:
         self.token = token if token is not None else settings.github_token
         self.api_url = (api_url or settings.github_api_url).rstrip("/")
 
+    def _outward_denied(self, action: str, repository: str, *, ref: str | None = None) -> PolicyDecision | None:
+        """Policy gate in front of every GitHub write; returns the denial, if any."""
+        decision = outward_decision(action, repository, ref=ref)
+        if decision.allowed:
+            return None
+        log_event(
+            logger,
+            logging.WARNING,
+            "policy.outward_denied",
+            action=action,
+            repo=repository,
+            ref=ref,
+            reason=decision.reason,
+        )
+        return decision
+
+    def _require_outward(self, action: str, repository: str, *, ref: str | None = None) -> None:
+        decision = self._outward_denied(action, repository, ref=ref)
+        if decision is not None:
+            raise OutwardActionDeniedError(action, repository, decision)
+
     def _headers(self) -> dict[str, str]:
         headers = {
             "Accept": "application/vnd.github+json",
@@ -81,6 +124,8 @@ class GitHubClient:
         return headers
 
     async def post_issue_comment(self, repository: str, issue_number: int, body: str) -> bool:
+        if self._outward_denied(OutwardAction.ISSUE_COMMENT, repository):
+            return False
         if not self.token:
             log_event(
                 logger,
@@ -179,6 +224,7 @@ class GitHubClient:
         labels: list[str] | None = None,
     ) -> dict[str, Any]:
         """Create a GitHub issue and return its API response."""
+        self._require_outward(OutwardAction.ISSUE_CREATE, repository)
         if not self.token:
             raise RuntimeError("GitHub token is not configured")
         payload: dict[str, Any] = {"title": title, "body": body}
@@ -202,6 +248,8 @@ class GitHubClient:
         return issue
 
     async def add_issue_label(self, repository: str, issue_number: int, label: str) -> bool:
+        if self._outward_denied(OutwardAction.ISSUE_LABEL, repository):
+            return False
         if not self.token:
             return False
         url = f"{self.api_url}/repos/{repository}/issues/{issue_number}/labels"
@@ -232,6 +280,8 @@ class GitHubClient:
         description: str = "Assign to Droid Forge for autonomous fix",
     ) -> bool:
         """Create the repo label if missing. Returns True if it exists or was created."""
+        if self._outward_denied(OutwardAction.ISSUE_LABEL, repository):
+            return False
         if not self.token or not name:
             return False
         encoded = name.replace(" ", "%20")
@@ -278,6 +328,7 @@ class GitHubClient:
         secret: str,
     ) -> dict[str, Any]:
         """Install or update an issues webhook pointing at forge's public URL."""
+        self._require_outward(OutwardAction.WEBHOOK_INSTALL, repository)
         if not self.token:
             raise RuntimeError("GitHub token is not configured")
         webhook_url = (webhook_url or "").rstrip("/")
@@ -349,7 +400,7 @@ class GitHubClient:
     async def list_open_pull_requests(
         self, full_name: str, per_page: int = 50, max_pages: int = 5
     ) -> list[dict[str, Any]]:
-        """List open, non-draft pull requests for a repository."""
+        """List open pull requests for a repository, drafts included (each item keeps its ``draft`` flag)."""
         pulls: list[dict[str, Any]] = []
         async with httpx.AsyncClient(timeout=30) as client:
             for page in range(1, max_pages + 1):
@@ -362,10 +413,7 @@ class GitHubClient:
                 batch = resp.json()
                 if not batch:
                     break
-                for item in batch:
-                    if item.get("draft"):
-                        continue
-                    pulls.append(item)
+                pulls.extend(batch)
                 if len(batch) < per_page:
                     break
         return pulls
@@ -387,6 +435,7 @@ class GitHubClient:
         ``owner:branch`` so GitHub opens a PR *within* ``repository`` rather
         than defaulting a fork compare against an upstream parent.
         """
+        self._require_outward(OutwardAction.PULL_REQUEST_CREATE, repository, ref=head)
         if not self.token:
             raise RuntimeError("GitHub token is not configured")
         owner = repository.split("/", 1)[0]
@@ -460,20 +509,26 @@ class GitHubClient:
         body: str,
         *,
         event: str = "COMMENT",
+        commit_id: str | None = None,
     ) -> dict[str, Any]:
         """Post a PR review on behalf of the forge token (Droid review agent).
 
         ``event`` is one of COMMENT, APPROVE, REQUEST_CHANGES. GitHub rejects
         APPROVE / REQUEST_CHANGES when the token owner authored the PR; callers
-        should retry with COMMENT on 403/422.
+        should retry with COMMENT on 403/422. ``commit_id`` pins the review to
+        the exact commit that was reviewed.
         """
+        self._require_outward(OutwardAction.PULL_REQUEST_REVIEW, repository)
         if not self.token:
             raise RuntimeError("GitHub token is not configured")
+        payload: dict[str, Any] = {"body": body, "event": event}
+        if commit_id:
+            payload["commit_id"] = commit_id
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(
                 f"{self.api_url}/repos/{repository}/pulls/{pr_number}/reviews",
                 headers=self._headers(),
-                json={"body": body, "event": event},
+                json=payload,
             )
             resp.raise_for_status()
             review: dict[str, Any] = resp.json()
@@ -559,111 +614,36 @@ class GitHubClient:
                 page += 1
         return reviews
 
-    async def merge_pull_request(
-        self,
-        repository: str,
-        pr_number: int,
-        merge_method: str = "squash",
-        commit_title: str | None = None,
-    ) -> dict[str, Any]:
-        """Merge a pull request via the GitHub REST API."""
-        if not self.token:
-            raise RuntimeError("GitHub token is not configured")
-        payload: dict[str, Any] = {"merge_method": merge_method}
-        if commit_title:
-            payload["commit_title"] = commit_title
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.put(
-                f"{self.api_url}/repos/{repository}/pulls/{pr_number}/merge",
-                headers=self._headers(),
-                json=payload,
-            )
-            resp.raise_for_status()
-            data: dict[str, Any] = resp.json()
-        log_event(
-            logger,
-            logging.INFO,
-            "github.pr_merged",
-            repo=repository,
-            pr=pr_number,
-            sha=data.get("sha"),
-        )
-        return data
+    async def list_commit_check_runs(self, repository: str, sha: str) -> list[dict[str, Any]]:
+        """Check runs GitHub reports for one commit (first 100). Read-only."""
 
-    async def enable_auto_merge(self, repository: str, pr_number: int, merge_method: str = "SQUASH") -> bool:
-        """Enable GitHub auto-merge via GraphQL. Returns True on success."""
-        if not self.token:
-            return False
-        try:
-            pr = await self.get_pull_request(repository, pr_number)
-        except httpx.HTTPError as exc:
-            log_event(
-                logger,
-                logging.WARNING,
-                "github.auto_merge_failed",
-                repo=repository,
-                pr=pr_number,
-                error=str(exc),
-            )
-            return False
-
-        node_id = pr.get("node_id")
-        if not node_id:
-            return False
-
-        query = """
-        mutation($pullRequestId: ID!, $mergeMethod: PullRequestMergeMethod!) {
-          enablePullRequestAutoMerge(input: {
-            pullRequestId: $pullRequestId,
-            mergeMethod: $mergeMethod
-          }) {
-            pullRequest { number autoMergeRequest { enabledAt } }
-          }
-        }
-        """
-        try:
+        async def fetch() -> list[dict[str, Any]]:
             async with httpx.AsyncClient(timeout=20) as client:
-                resp = await client.post(
-                    "https://api.github.com/graphql",
+                resp = await client.get(
+                    f"{self.api_url}/repos/{repository}/commits/{sha}/check-runs",
                     headers=self._headers(),
-                    json={
-                        "query": query,
-                        "variables": {
-                            "pullRequestId": node_id,
-                            "mergeMethod": merge_method,
-                        },
-                    },
+                    params={"per_page": 100},
                 )
                 resp.raise_for_status()
-                payload = resp.json()
-            if payload.get("errors"):
-                log_event(
-                    logger,
-                    logging.WARNING,
-                    "github.auto_merge_failed",
-                    repo=repository,
-                    pr=pr_number,
-                    error=payload["errors"],
+                runs = (resp.json() or {}).get("check_runs") or []
+                return [run for run in runs if isinstance(run, dict)]
+
+        return await retry_with_backoff(fetch)
+
+    async def get_commit_status(self, repository: str, sha: str) -> dict[str, Any]:
+        """Combined commit status (legacy status API) for one commit. Read-only."""
+
+        async def fetch() -> dict[str, Any]:
+            async with httpx.AsyncClient(timeout=20) as client:
+                resp = await client.get(
+                    f"{self.api_url}/repos/{repository}/commits/{sha}/status",
+                    headers=self._headers(),
                 )
-                return False
-            log_event(
-                logger,
-                logging.INFO,
-                "github.auto_merge_enabled",
-                repo=repository,
-                pr=pr_number,
-            )
-            return True
-        except httpx.HTTPError as exc:
-            log_event(
-                logger,
-                logging.WARNING,
-                "github.auto_merge_failed",
-                repo=repository,
-                pr=pr_number,
-                error=str(exc),
-            )
-            return False
+                resp.raise_for_status()
+                data: dict[str, Any] = resp.json() or {}
+                return data
+
+        return await retry_with_backoff(fetch)
 
     async def check_connectivity(self) -> bool:
         try:

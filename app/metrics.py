@@ -24,6 +24,23 @@ class _DayBucket(TypedDict):
     runtime_minutes: float
 
 
+METRIC_LABELS = {
+    "change_failure_rate_percent": (
+        "Agent run failure rate: failed Droid runs (fixes and reviews) as a share of finished runs. "
+        "This is not the DORA change failure rate, which counts production changes that fail."
+    ),
+    "pr_cycle_time_hours": (
+        "Average active Droid working time per completed fix session, as reported by the session. "
+        "This is not end-to-end pull request cycle time (open to merge)."
+    ),
+    "productivity_gained_usd": (
+        "Legacy scenario from configured junior-engineer assumptions minus stored or flat per-run cost estimates. "
+        "It is an assumption-based estimate, not realized cash savings; see /api/economics for outcome economics."
+    ),
+    "agent_cost_usd": "Stored per-run cost or the flat DROID_USD_PER_AGENT_RUN estimate; not a bill.",
+}
+
+
 def _round(value: float | None, digits: int = 2) -> float:
     if value is None:
         return 0.0
@@ -272,6 +289,7 @@ def compute_metrics(session: Session) -> dict[str, Any]:
                 "− Droid cost"
             ),
         },
+        "labels": METRIC_LABELS,
         "completed_with_pr": sum(1 for t in completed_fixes if t.pull_request_url),
         "timezone": "Asia/Singapore (SGT, UTC+08:00)",
         "daily": daily_activity(session),

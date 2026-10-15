@@ -2,24 +2,7 @@
   const $ = (sel, root = document) => root.querySelector(sel);
   const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
 
-  function showAlert(el, message, type = "success") {
-    if (!el) return;
-    el.className = `alert alert-${type}`;
-    el.textContent = message;
-    el.classList.remove("d-none");
-  }
-
-  function hideAlert(el) {
-    if (!el) return;
-    el.classList.add("d-none");
-  }
-
-  function formatMoney(n) {
-    return `$${Number(n || 0).toLocaleString(undefined, {
-      minimumFractionDigits: 2,
-      maximumFractionDigits: 2,
-    })}`;
-  }
+  const { apiFetch, showAlert, hideAlert, escapeHtml } = window.Forge;
 
   const SGT_FORMATTER = new Intl.DateTimeFormat("en-GB", {
     timeZone: "Asia/Singapore",
@@ -38,24 +21,20 @@
     return `${SGT_FORMATTER.format(parsed).replace(",", "")} SGT`;
   }
 
-  function statusBadge(status) {
-    const map = {
-      completed: "success",
-      failed: "danger",
-      running: "primary",
-      queued: "secondary",
-    };
-    const cls = map[status] || "secondary";
-    const label = (status || "unknown").replace(/^./, (c) => c.toUpperCase());
-    return `<span class="badge text-bg-${cls}">${label}</span>`;
-  }
+  const STATUS_LABELS = {
+    completed: ["success", "Agent turn completed"],
+    failed: ["danger", "Failed"],
+    running: ["primary", "Running"],
+    queued: ["secondary", "Queued"],
+    stopped: ["warning", "Stopped"],
+    interrupted: ["warning", "Interrupted"],
+    blocked: ["warning", "Blocked"],
+  };
 
-  function escapeHtml(str) {
-    return String(str || "")
-      .replace(/&/g, "&amp;")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;")
-      .replace(/"/g, "&quot;");
+  function statusBadge(status, isReview = false) {
+    const [cls, label] = STATUS_LABELS[status] || ["secondary", status || "Unknown"];
+    const text = isReview && status === "completed" ? "Review completed" : label;
+    return `<span class="badge text-bg-${cls}">${escapeHtml(text)}</span>`;
   }
 
   // ---- Repositories ----
@@ -84,7 +63,7 @@
 
   async function loadDroidModels() {
     try {
-      const res = await fetch("/api/droid/models");
+      const res = await apiFetch("/api/droid/models");
       const data = await res.json();
       if (!res.ok) throw new Error(data.detail || "Failed to load models");
       droidModels = data.models || [];
@@ -97,7 +76,7 @@
     const tbody = $("#repos-tbody");
     tbody.innerHTML = `<tr><td colspan="5" class="text-center text-muted py-4">Loading…</td></tr>`;
     try {
-      const res = await fetch("/api/repositories");
+      const res = await apiFetch("/api/repositories");
       const data = await res.json();
       const repos = data.repositories || [];
       if (!repos.length) {
@@ -122,7 +101,10 @@
             <input type="text" class="form-control form-control-sm repo-setup-input" data-id="${r.id}"
                    value="${escapeHtml(r.setup_command || "")}"
                    placeholder="e.g. npm ci (optional)"
-                   title="Shell command run in the workspace clone before the session">
+                   title="Stored shell command; runs in the workspace clone only when privileged setup is enabled">
+            ${r.setup_command_execution === "disabled_by_policy"
+              ? `<div class="small text-warning repo-setup-status">Stored, not run: privileged setup is disabled</div>`
+              : ""}
           </td>
           <td class="text-muted small">${r.created_at_display || formatSgt(r.created_at)}</td>
           <td class="text-end text-nowrap">
@@ -148,7 +130,7 @@
     const url = $("#repo-url").value.trim();
     btn.disabled = true;
     try {
-      const res = await fetch("/api/repositories", {
+      const res = await apiFetch("/api/repositories", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ url }),
@@ -179,7 +161,7 @@
       saveBtn.disabled = true;
       saveBtn.textContent = "Saving…";
       try {
-        const res = await fetch(`/api/repositories/${id}`, {
+        const res = await apiFetch(`/api/repositories/${id}`, {
           method: "PATCH",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ droid_model, setup_command }),
@@ -207,7 +189,7 @@
       createBtn.disabled = true;
       createBtn.textContent = "Adding 5…";
       try {
-        const response = await fetch(
+        const response = await apiFetch(
           `/api/repositories/${createBtn.dataset.id}/issues`,
           { method: "POST" }
         );
@@ -229,7 +211,7 @@
     if (removeBtn) {
       const id = removeBtn.dataset.id;
       if (!confirm("Remove this repository and its synced issues?")) return;
-      await fetch(`/api/repositories/${id}`, { method: "DELETE" });
+      await apiFetch(`/api/repositories/${id}`, { method: "DELETE" });
       await loadRepos();
       await loadIssues();
     }
@@ -331,7 +313,7 @@
     const container = $("#issues-container");
     container.innerHTML = `<div class="text-center text-muted py-5">Loading…</div>`;
     try {
-      const res = await fetch("/api/issues");
+      const res = await apiFetch("/api/issues");
       const data = await res.json();
       issueGroups = data.repositories || [];
       renderIssues();
@@ -374,18 +356,25 @@
     btn.disabled = true;
     btn.textContent = "Assigning…";
     try {
-      const res = await fetch("/api/issues/assign", {
+      const res = await apiFetch("/api/issues/assign", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ issue_ids: ids }),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.detail || "Assignment failed");
-      showAlert(alert, `Assigned ${data.accepted} issue(s) to Droid.`, "success");
+      const refused = (data.results || []).filter((r) => !r.ok);
+      const refusedText = refused.length
+        ? ` ${refused.length} not started: ${refused.map((r) => r.detail).join("; ")}.`
+        : "";
+      showAlert(
+        alert,
+        `Assigned ${data.accepted} issue(s) to Droid. Follow progress on the Overview tab or each task's detail page.${refusedText}`,
+        refused.length ? "warning" : "success"
+      );
       await loadIssues();
       await refreshMetrics();
-      const tab = new bootstrap.Tab($("#metrics-tab"));
-      tab.show();
+      document.dispatchEvent(new CustomEvent("forge:refresh-overview"));
     } catch (err) {
       showAlert(alert, err.message, "danger");
     } finally {
@@ -591,16 +580,18 @@
         const typeBadge = isReview
           ? `<span class="badge text-bg-dark">Review</span>`
           : `<span class="badge text-bg-primary">Fix</span>`;
+        const reviewLabel = t.review_target === "candidate" ? "Candidate review" : `PR #${Number(t.pr_number)}`;
         const target = isReview
-          ? `PR #${t.pr_number} <span class="text-muted small">${escapeHtml((t.pr_title || "").slice(0, 60))}</span>`
-          : `#${t.issue_number} <span class="text-muted small">${escapeHtml((t.issue_title || "").slice(0, 60))}</span>`;
+          ? `<a href="/reviews/${Number(t.id)}" class="detail-link">${reviewLabel}</a> <span class="text-muted small">${escapeHtml((t.pr_title || "").slice(0, 60))}</span>`
+          : `<a href="/tasks/${Number(t.id)}" class="detail-link">#${Number(t.issue_number)}</a> <span class="text-muted small">${escapeHtml((t.issue_title || "").slice(0, 60))}</span>`;
         const linkUrl = isReview ? t.pr_url : t.pull_request_url;
-        const link = linkUrl
-          ? `<a href="${linkUrl}" target="_blank" rel="noopener">View PR</a>`
+        const safeLink = window.Forge.safeUrl(linkUrl);
+        const link = safeLink
+          ? `<a href="${escapeHtml(safeLink)}" target="_blank" rel="noopener">View PR</a>`
           : `<span class="text-muted">—</span>`;
-        let statusLabel = statusBadge(t.status);
-        if (t.status === "completed" && t.merged) {
-          statusLabel = `<span class="badge text-bg-success">Completed · Merged</span>`;
+        let statusLabel = statusBadge(t.status, isReview);
+        if (t.merged) {
+          statusLabel += ` <span class="badge text-bg-info" title="Observed on GitHub; Forge never merges">Merged (observed)</span>`;
         }
         const session = t.droid_session_url
           ? `<a class="btn btn-sm btn-outline-dark" href="${t.droid_session_url}" target="_blank" rel="noopener">${isReview ? "Droid Review" : "Droid Fix"}</a>`
@@ -623,7 +614,7 @@
   }
 
   async function loadActivity(page = activityPage) {
-    const res = await fetch(
+    const res = await apiFetch(
       `/api/tasks?page=${encodeURIComponent(page)}&page_size=${encodeURIComponent(ACTIVITY_PAGE_SIZE)}`
     );
     const payload = await res.json();
@@ -633,7 +624,7 @@
 
   async function refreshMetrics() {
     try {
-      const metricsRes = await fetch("/metrics");
+      const metricsRes = await apiFetch("/metrics");
       const stats = await metricsRes.json();
 
       const set = (key, value) => {
@@ -659,8 +650,6 @@
       set("fix.total_runtime_minutes", stats.fix?.total_runtime_minutes ?? 0);
       set("review.average_runtime_minutes", stats.review?.average_runtime_minutes ?? 0);
       set("review.total_runtime_minutes", stats.review?.total_runtime_minutes ?? 0);
-      set("productivity_gained_usd", formatMoney(stats.productivity_gained_usd));
-      set("cost_avoidance_percent", `(${stats.cost_avoidance_percent}%)`);
 
       const eng = stats.engineering || {};
       set("eng.pr_cycle_time_hours", eng.pr_cycle_time_hours ?? 0);

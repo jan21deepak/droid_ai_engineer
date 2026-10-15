@@ -4,6 +4,9 @@ from functools import lru_cache
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+ACCESS_MODE_PROTECTED = "protected"
+ACCESS_MODE_LOCAL_DEV = "local_dev"
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
@@ -31,13 +34,10 @@ class Settings(BaseSettings):
     droid_allow_cli_auth: bool = False
     # Model id for new sessions; "auto" = Factory Router. Overridable per repo.
     droid_model: str = "auto"
-    # Autonomy for fix sessions: off | low | medium | high
+    # Autonomy for fix sessions: off | low | medium | high. Review sessions do
+    # not use autonomy; they are restricted to Read/Grep/Glob (app.review_policy),
+    # so a legacy DROID_REVIEW_AUTONOMY value is ignored.
     droid_autonomy: str = "high"
-    # Autonomy for PR review sessions. Must not be "off": headless runs
-    # auto-reject permission requests, and OFF makes the review agent ask for
-    # permission on ordinary read commands, which aborts the run. The review
-    # prompt keeps the agent read-only; this only controls prompting.
-    droid_review_autonomy: str = "high"
     # Wall-clock budget for a single Droid turn (fix, review, follow-up)
     droid_turn_timeout_seconds: float = 3600.0
     # Where per-task repository workspace clones live
@@ -55,9 +55,36 @@ class Settings(BaseSettings):
     posthog_key: str = ""
     posthog_host: str = "https://us.i.posthog.com"
 
-    # When True, forge squash-merges (or enables GitHub auto-merge) after the
-    # Droid review agent approves. Leave False so humans can review too.
-    review_auto_merge: bool = False
+    # There is deliberately no auto-merge setting: Forge never merges or enables
+    # GitHub auto-merge, and a legacy REVIEW_AUTO_MERGE value is ignored.
+
+    # Operator access. Anything other than the literal "local_dev" is treated
+    # as protected so a typo can never silently disable authentication.
+    forge_access_mode: str = ACCESS_MODE_PROTECTED
+    # Shared single-operator credential (login form or `Authorization: Bearer`).
+    forge_operator_token: str = ""
+    # Absolute lifetime of a browser session created by /login.
+    forge_session_ttl_seconds: int = 8 * 3600
+    # Comma-separated Host header values the app answers to (DNS-rebinding and
+    # spoofed-host defense). PUBLIC_BASE_URL's host is added automatically.
+    forge_trusted_hosts: str = "127.0.0.1,localhost,::1"
+    # Session cookie Secure flag: auto (Secure except plain-HTTP loopback) | true | false
+    forge_cookie_secure: str = "auto"
+    # Comma-separated owner/repo slugs approved for intake and automation.
+    forge_allowed_repositories: str = ""
+    # Comma-separated branch names the app may push to or open PRs from.
+    # Empty approves nothing in protected mode (any branch in local_dev).
+    forge_allowed_branches: str = ""
+    # Master switch for every GitHub write (comments, labels, issues, PRs,
+    # reviews, pushes). Off by default so nothing is published unapproved.
+    forge_allow_github_writes: bool = False
+    # Stored per-repository setup commands only execute with this opt-in.
+    forge_allow_privileged_setup: bool = False
+    # App-owned local acceptance checks run against a clean checkout of each
+    # candidate before approval: a JSON list of {"name", "argv", "timeout_seconds"?}.
+    # Operator configuration only (never supplied over HTTP); argv runs without a
+    # shell in the clean agent environment. Empty or invalid blocks approval.
+    forge_acceptance_checks: str = ""
 
     # ROI / productivity assumptions (leadership dashboard)
     junior_swe_annual_cost_usd: float = 150_000.0
@@ -66,8 +93,39 @@ class Settings(BaseSettings):
     # Flat estimated USD attributed per completed Droid run when real Factory
     # credit usage is unavailable (set 0 to ignore).
     droid_usd_per_agent_run: float = 0.0
+    # Optional explicit credit-to-USD *estimate* applied to attempts with observed
+    # credits. Ignored unless both a finite positive rate and a source label are
+    # set; no conversion is ever assumed, and estimates are never shown as bills.
+    # Kept as text so an empty or malformed value is ignored instead of failing startup.
+    forge_usd_per_credit_estimate: str = ""
+    forge_usd_estimate_source: str = ""
+
+    # Run limits (app.run_limits). At most this many paid Droid turns run at
+    # once across implementation, review, follow-up and recovery.
+    forge_max_concurrent_runs: int = 1
+    # Follow-up + recovery turns allowed per implementation task.
+    forge_max_continuations: int = 3
+    # Spending check applied before every paid turn: none | account_cap | credit_limit.
+    # Any other value blocks every paid turn (fail closed).
+    forge_budget_policy: str = "none"
+    # account_cap: the account-level USD cap the account owner confirmed is
+    # enforced by Factory billing. Forge records it; it does not enforce dollars.
+    forge_demo_account_cap_usd: str = ""
+    # credit_limit: Factory credits Forge may observe being used before it blocks new turns.
+    forge_credit_limit: str = ""
 
 
 @lru_cache
 def get_settings() -> Settings:
     return Settings()
+
+
+def effective_access_mode(settings: Settings) -> str:
+    """Resolve the access mode, failing closed to protected on any unknown value."""
+    if (settings.forge_access_mode or "").strip().lower() == ACCESS_MODE_LOCAL_DEV:
+        return ACCESS_MODE_LOCAL_DEV
+    return ACCESS_MODE_PROTECTED
+
+
+def split_csv(value: str) -> list[str]:
+    return [item.strip() for item in (value or "").replace("\n", ",").split(",") if item.strip()]

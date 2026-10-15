@@ -4,9 +4,17 @@ import httpx
 import pytest
 import respx
 
+from app.config import get_settings
 from app.github import GitHubClient
 
 API = "https://api.github.com"
+
+
+@pytest.fixture(autouse=True)
+def github_writes_enabled(monkeypatch):
+    # These tests exercise the HTTP contract; policy gating is tested in test_outward_policy.py.
+    monkeypatch.setenv("FORGE_ALLOW_GITHUB_WRITES", "true")
+    get_settings.cache_clear()
 
 
 @pytest.mark.asyncio
