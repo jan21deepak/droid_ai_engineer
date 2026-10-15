@@ -48,6 +48,27 @@ its own. Look for `task.candidate_recorded` in the logs. A `candidate.status` of
 `dirty` means the agent left uncommitted changes; `no_changes` means the agent
 made no commit; `unavailable` means the workspace could not be inspected.
 
+### Approval or publication refused (409 or 403)
+
+Both requests name the full candidate SHA shown on the task page. For
+`not_ready_for_approval` and `not_ready_to_publish`, inspect
+`GET /api/tasks/{id}/delivery` and its `blockers` before retrying.
+
+| Response detail | Meaning | Operator next step |
+|---|---|---|
+| `stale_candidate` | The requested SHA is not the task's current candidate, or the candidate changed during the request. | Reload the task, then run checks and the restricted review again and use the current SHA for approval. |
+| `dirty_workspace` | The task workspace has uncommitted changes. | Resolve the workspace changes, then retry; rerun checks and review if the candidate changed. |
+| `workspace_unavailable` | Forge could not inspect the task workspace to verify the candidate. | Restore workspace/service availability and retry. |
+| `candidate_not_ready` | There is no clean, committed candidate ready for delivery. | Wait for the fix to finish with a clean commit, or address the failed/no-change candidate before retrying. |
+| `task_active` | An agent turn is still running or winding down for the task. | Wait for it to finish, or stop it, then retry. |
+| `task_busy` | Another task change, or candidate finalization, is currently being admitted or recorded. | Wait for that operation to finish, then retry publication. |
+| `publication_in_progress` | Publication is already running for this task or candidate. | Wait for publication to finish, then retry the refused request. |
+| `not_ready_for_approval` | Required acceptance checks or the restricted candidate review are missing, incomplete, or not approving. | Follow the listed blockers: run or rerun checks and the restricted review, then approve the exact SHA. |
+| `not_ready_to_publish` | The exact candidate is missing a prerequisite such as approval, checks, or review. | Follow the listed blockers, approve the exact SHA, then publish it. |
+| `policy_denied` (403) | Outward-action policy does not allow the candidate branch push or draft PR, including an unlisted or default branch. | Use an allowed non-default branch or have the operator policy updated, then retry. |
+| `repository_not_allowed` (403) | Repository policy no longer allows this repository for delivery. | Have the repository approved in Forge policy, then retry. |
+| `task not found` (404) | The task ID does not exist. | Reload the task page and verify the task ID. |
+
 ### Review failed with "review not started"
 
 Forge refuses to review a partial change. The error names the reason: the PR's
