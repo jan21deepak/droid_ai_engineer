@@ -94,6 +94,29 @@ A `no_accepted_changes` state means no candidate has been approved yet. The capa
 scenario stays empty until baseline assumptions are saved and each accepted change
 has human review/rework minutes; those values are user-entered, not measured.
 
+### Repository reference rejected or secret scan flags a test fixture
+
+**Accepted forms** for a GitHub repository reference:
+- Slug: `owner/repo`
+- HTTPS URL: `https://github.com/owner/repo` (or `http://`)
+- Scheme-less: `github.com/owner/repo` or `www.github.com/owner/repo`
+- SSH SCP: `git@github.com:owner/repo`
+- SSH URL: `ssh://git@github.com/owner/repo`
+
+Hosts are compared case-insensitively and must be exactly `github.com` or
+`www.github.com`. One trailing `.git` is dropped for URL and SSH forms when a
+repository name still remains. Owner and name may contain only ASCII letters,
+digits, `_`, `.` or `-`.
+
+**Rejected** inputs include: any other host (including visually similar ones),
+credentials or passwords in the URL, ports, query strings, fragment identifiers,
+`.` or `..` path components, and any characters outside the allowed set.
+
+**`.gitleaksignore`** holds only exact `commit:path:rule:line` fingerprints for
+synthetic test fixtures that are not real credentials. Any new real finding still
+fails the scan. Do not add rule, path or value allowlists, CodeQL suppressions
+or alert dismissals.
+
 ### Sharing evidence for one task
 
 Use **Preview evidence** or **Download JSON** on the task page
