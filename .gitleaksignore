@@ -1,0 +1,8 @@
+# Exact Gitleaks fingerprints for synthetic redaction-test fixtures (fake key/value
+# strings asserted to be masked in tests/test_redaction.py). They are not real
+# credentials. Each entry ignores one finding in one historical commit only; add no
+# rule, path or value allowlists here.
+30614217452ae8b40541a8c8a16636cc5d32a900:tests/test_redaction.py:generic-api-key:87
+30614217452ae8b40541a8c8a16636cc5d32a900:tests/test_redaction.py:generic-api-key:88
+30614217452ae8b40541a8c8a16636cc5d32a900:tests/test_redaction.py:generic-api-key:89
+30614217452ae8b40541a8c8a16636cc5d32a900:tests/test_redaction.py:generic-api-key:90
