@@ -7,6 +7,7 @@ layer (configured settings and sensitive environment names) can catch them.
 import asyncio
 import io
 import logging
+import time
 from urllib.parse import quote
 
 import httpx
@@ -81,6 +82,20 @@ class TestRedact:
 
     def test_safe_error_is_bounded(self):
         assert len(safe_error("x" * 10_000)) <= 2000
+
+    def test_key_value_redaction_preserves_non_secret_names(self):
+        assert redact_text("GITHUB_TOKEN=abcdefgh1234") == f"GITHUB_TOKEN={MASK}"
+        assert redact_text('my_api_key: "abcdefgh1234"') == f'my_api_key: "{MASK}"'
+        assert redact_text("token_value=abcdefgh1234") == f"token_value={MASK}"
+        assert redact_text("a=token=abcdefgh1234") == f"a=token={MASK}"
+        assert redact_text("tokens=1234") == "tokens=1234"
+        assert redact_text("x.token_a.b=12345678") == "x.token_a.b=12345678"
+
+    def test_key_value_redaction_handles_adversarial_inputs_quickly(self):
+        for adversarial in ("token_" + "-_" * 20_000 + "=x", "a=" * 20_000):
+            started = time.perf_counter()
+            redact_text(adversarial)
+            assert time.perf_counter() - started < 1
 
 
 class TestPersistenceAndDisplay:

@@ -1,3 +1,4 @@
+import time
 from datetime import UTC, datetime, timedelta
 
 from app.config import get_settings
@@ -398,6 +399,12 @@ def test_parse_repository_ref():
     assert parse_repository_ref("jan21deepak/superset") == "jan21deepak/superset"
     assert parse_repository_ref("https://github.com/jan21deepak/superset.git") == "jan21deepak/superset"
     assert parse_repository_ref("not a repo") is None
+    assert parse_repository_ref("https://www.github.com/a/b.git") == "a/b"
+    assert parse_repository_ref("github.com/a/.git") == "a/.git"
+    assert parse_repository_ref("github.com/a/b/c") is None
+    started = time.perf_counter()
+    assert parse_repository_ref("github.com/a/" + "-" * 20_000 + "!") is None
+    assert time.perf_counter() - started < 1
 
 
 def test_add_repository_endpoint(client, monkeypatch):

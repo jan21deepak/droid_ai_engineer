@@ -56,6 +56,13 @@ def git_identity(tmp_path_factory, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def no_inherited_git_config(monkeypatch):
+    for name in list(os.environ):
+        if name == "GIT_CONFIG_COUNT" or name.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_")):
+            monkeypatch.delenv(name, raising=False)
+
+
+@pytest.fixture(autouse=True)
 def clean_db(tmp_path):
     get_settings.cache_clear()
     reset_droid_client_for_tests()

@@ -153,26 +153,27 @@ class TestAgentTransport:
 class TestGitCredentialTransport:
     URL = "https://github.com/jan21deepak/allowed.git"
 
-    def _urlmatch(self, env: dict[str, str], url: str) -> subprocess.CompletedProcess[str]:
+    def _urlmatch(self, env: dict[str, str], url: str, cwd: Path) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             ["git", "config", "--get-urlmatch", "http.extraheader", url],
+            cwd=cwd,
             env=env,
             capture_output=True,
             text=True,
             check=False,
         )
 
-    def test_credential_header_is_scoped_to_one_repository_url(self, secret_env):
+    def test_credential_header_is_scoped_to_one_repository_url(self, secret_env, tmp_path):
         env = git_environment(token=GITHUB_SENTINEL, credential_url=self.URL)
-        matched = self._urlmatch(env, self.URL)
+        matched = self._urlmatch(env, self.URL, tmp_path)
         assert matched.returncode == 0
         assert matched.stdout.strip() == f"AUTHORIZATION: basic {git_basic_auth_value(GITHUB_SENTINEL)}"
-        assert self._urlmatch(env, "https://github.com/someone/else.git").returncode != 0
-        assert self._urlmatch(env, "https://attacker.example/jan21deepak/allowed.git").returncode != 0
+        assert self._urlmatch(env, "https://github.com/someone/else.git", tmp_path).returncode != 0
+        assert self._urlmatch(env, "https://attacker.example/jan21deepak/allowed.git", tmp_path).returncode != 0
 
-    def test_without_credential_url_no_header_and_no_inherited_secrets(self, secret_env):
+    def test_without_credential_url_no_header_and_no_inherited_secrets(self, secret_env, tmp_path):
         env = git_environment()
-        assert self._urlmatch(env, self.URL).returncode != 0
+        assert self._urlmatch(env, self.URL, tmp_path).returncode != 0
         assert not any(secret in value for value in env.values() for secret in SENTINELS)
 
     def test_hooks_and_fsmonitor_are_disabled_for_app_git(self):

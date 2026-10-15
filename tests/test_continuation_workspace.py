@@ -8,7 +8,6 @@ no setup, clone, fetch or clean runs. All secrets are fake sentinels.
 """
 
 import asyncio
-import os
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -27,13 +26,6 @@ REPO = "jan21deepak/allowed"
 CANONICAL = f"https://github.com/{REPO}.git"
 GITHUB_SENTINEL = "fake-gh-legacy-sentinel-Vb73Qa"
 FORBIDDEN_GIT = {"clone", "fetch", "pull", "push", "checkout", "reset", "clean", "stash", "restore", "switch"}
-
-
-@pytest.fixture(autouse=True)
-def no_inherited_git_config(monkeypatch):
-    for name in list(os.environ):
-        if name == "GIT_CONFIG_COUNT" or name.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_")):
-            monkeypatch.delenv(name, raising=False)
 
 
 def git(ws: Path, *args: str) -> str:

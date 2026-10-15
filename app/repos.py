@@ -1,11 +1,9 @@
 """Helpers for parsing GitHub repository URLs / slugs and Droid launch config."""
 
-import re
-
 from app.database import db_session
 from app.models import Repository
 
-_GITHUB_REPO_RE = re.compile(r"^(?:https?://)?(?:www\.)?github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?/?$")
+_REPOSITORY_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-")
 
 
 def parse_repository_ref(value: str) -> str | None:
@@ -13,12 +11,28 @@ def parse_repository_ref(value: str) -> str | None:
     raw = (value or "").strip().rstrip("/")
     if not raw:
         return None
-    match = _GITHUB_REPO_RE.match(raw)
-    if match:
-        return f"{match.group(1)}/{match.group(2)}"
-    if re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", raw):
-        return raw
+    slug = raw
+    for prefix in ("https://", "http://"):
+        if raw.startswith(prefix):
+            raw = raw[len(prefix) :]
+            break
+    if raw.startswith("www."):
+        raw = raw[4:]
+    if raw.startswith("github.com/"):
+        owner, separator, name = raw[len("github.com/") :].partition("/")
+        if separator and len(name) > 4 and name.endswith(".git"):
+            name = name[:-4]
+        if separator and _valid_repository_part(owner) and _valid_repository_part(name):
+            return f"{owner}/{name}"
+        return None
+    owner, separator, name = slug.partition("/")
+    if separator and _valid_repository_part(owner) and _valid_repository_part(name):
+        return slug
     return None
+
+
+def _valid_repository_part(value: str) -> bool:
+    return bool(value) and _REPOSITORY_CHARS.issuperset(value)
 
 
 def resolve_agent_launch_config(

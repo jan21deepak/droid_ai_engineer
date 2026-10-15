@@ -37,9 +37,9 @@ SECRET_PATTERNS = [
 ]
 # key=value / key: value contexts whose value is always sensitive. Matches
 # compound field names like GITHUB_TOKEN or api_key but not "tokens=1234".
-SECRET_KV = re.compile(
-    r"(?i)(?<![\w.-])((?:[\w.-]+_)*(?:api_?key|token|secret|password)(?:_[\w-]+)*)(\s*[=:]\s*)(\"?)([^\s\",;]+)"
-)
+_KV_HEAD = re.compile(r'(?<![\w.-])([\w.-]+)(\s*[=:]\s*)("?)')
+_KV_VALUE = re.compile(r'[^\s",;]+')
+_KV_MARKER = re.compile(r"(?i)api_?key|token|secret|password")
 _URL_USERINFO = re.compile(r"(?i)\b((?:https?|ssh|git)://)[^/\s@]+@")
 _AUTH_HEADER = re.compile(r"(?i)\b(authorization\s*:\s*(?:basic|bearer|token)\s+)\S+")
 _BEARER = re.compile(r"(?i)\b(bearer\s+)[A-Za-z0-9._~+/=-]{8,}")
@@ -88,6 +88,35 @@ def known_secret_values() -> list[str]:
     return sorted(expanded, key=len, reverse=True)
 
 
+def _is_secret_name(name: str) -> bool:
+    """Match the sensitive key names accepted by the former key/value regex."""
+    last_dot = name.rfind(".")
+    for marker in _KV_MARKER.finditer(name):
+        start, end = marker.start(), marker.end()
+        if start and (start < 2 or name[start - 1] != "_"):
+            continue
+        if end == len(name) or (name[end] == "_" and len(name) - end >= 2 and end > last_dot):
+            return True
+    return False
+
+
+def _redact_key_values(text: str) -> str:
+    """Redact sensitive key/value fields with linear scans instead of nested regexes."""
+    parts: list[str] = []
+    pos = 0
+    while head := _KV_HEAD.search(text, pos):
+        value = _KV_VALUE.match(text, head.end()) if _is_secret_name(head.group(1)) else None
+        if value:
+            parts.append(text[pos : head.start()])
+            parts.append(f"{head.group(1)}{head.group(2)}{head.group(3)}{MASK}")
+            pos = value.end()
+        else:
+            parts.append(text[pos : head.end(2)])
+            pos = head.end(2)
+    parts.append(text[pos:])
+    return "".join(parts)
+
+
 def redact_text(value: str, *, secrets: list[str] | None = None) -> str:
     """Mask known credentials and credential-shaped substrings in free text."""
     if not value:
@@ -101,7 +130,7 @@ def redact_text(value: str, *, secrets: list[str] | None = None) -> str:
     result = _BEARER.sub(lambda m: f"{m.group(1)}{MASK}", result)
     for pattern in SECRET_PATTERNS:
         result = pattern.sub(MASK, result)
-    return SECRET_KV.sub(lambda m: f"{m.group(1)}{m.group(2)}{m.group(3)}{MASK}", result)
+    return _redact_key_values(result)
 
 
 def is_sensitive_key(key: object) -> bool:
